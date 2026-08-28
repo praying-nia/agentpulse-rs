@@ -91,8 +91,8 @@ jobs:
         id: snapshot
         shell: bash
         run: |
-          archive="${GITHUB_REPOSITORY#*/}-${GITHUB_SHA::12}-source.tar.gz"
-          tar --exclude-vcs --exclude=target --exclude="$archive" -czf "$archive" .
+          archive="${RUNNER_TEMP}/${GITHUB_REPOSITORY#*/}-${GITHUB_SHA::12}-source.tar.gz"
+          tar --exclude-vcs --exclude=target -czf "$archive" .
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
 
       - name: Upload CI source artifact
