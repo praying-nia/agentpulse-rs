@@ -21,6 +21,7 @@
 //! # Ok::<(), agentpulse_core::DomainError>(())
 //! ```
 
+mod aggregate;
 mod capability;
 mod command;
 mod endpoint;
@@ -33,6 +34,10 @@ mod progress;
 mod session;
 mod value;
 
+pub use aggregate::{
+    ActiveToolCall, ApplyOutcome, ReduceError, SessionAggregate, SessionAggregateConfig,
+    SnapshotKind,
+};
 pub use capability::{ChannelCapabilities, ProviderCapabilities};
 pub use command::{AgentCommand, AgentCommandPayload};
 pub use endpoint::{ChannelDescriptor, ProviderDescriptor};
