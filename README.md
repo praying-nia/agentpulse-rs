@@ -28,4 +28,3 @@ Initial adapter targets are Codex, Claude Code, OpenCode, and DeepSeek Harness.
 The repository currently contains the planned component layout only. No Rust workspace or runtime implementation has been initialized yet.
 
 当前仓库仅包含计划中的组件结构，尚未初始化 Rust workspace 或运行时代码。
-
