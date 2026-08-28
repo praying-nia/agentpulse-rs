@@ -37,7 +37,31 @@ jobs:
           test -d agentpulse-core
           test -d agentpulse-protocol
           test -d agentpulse-transport
-          test -d agentpulse-adapters
+          test -d agentpulse-providers
+          test -d agentpulse-channels
+          test ! -e agentpulse-adapters
+
+          providers=(
+            codex
+            claude-code
+            opencode
+            deepseek-harness
+          )
+
+          channels=(
+            native
+            feishu
+            qq
+            webhook
+          )
+
+          for provider in "${providers[@]}"; do
+            test -d "agentpulse-providers/${provider}"
+          done
+
+          for channel in "${channels[@]}"; do
+            test -d "agentpulse-channels/${channel}"
+          done
 
       - name: Detect Rust workspace
         id: workspace
