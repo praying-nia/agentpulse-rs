@@ -31,6 +31,7 @@ mod id;
 mod interaction;
 mod plan;
 mod progress;
+mod routing;
 mod session;
 mod value;
 
@@ -57,6 +58,7 @@ pub use interaction::{
 };
 pub use plan::{PlanItem, PlanItemStatus, PlanSnapshot};
 pub use progress::{DeterminateProgress, ProgressSnapshot, ProgressValue};
+pub use routing::{CapabilityRouteError, CapabilityRouter, ChannelEventRoute, InteractionRoute};
 pub use session::{AgentSession, AgentSessionBuilder, AgentState, ConnectionState};
 pub use value::{
     ChannelKind, EventSequence, ExternalId, NonEmptyText, ProviderKind, Revision, Timestamp,

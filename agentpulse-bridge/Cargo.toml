@@ -1,0 +1,13 @@
+[package]
+name = "agentpulse-bridge"
+description = "Runtime-neutral Provider and Channel ports for AgentPulse"
+edition.workspace = true
+publish.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+agentpulse-core = { path = "../agentpulse-core" }

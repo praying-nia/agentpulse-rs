@@ -3,7 +3,7 @@
 use crate::{
     AgentCommand, AgentSession, AgentState, ConnectionState, DomainError, EventId, EventSequence,
     InteractionRequest, InteractionResponse, NonEmptyText, PlanSnapshot, ProgressSnapshot,
-    SessionId, Timestamp, ToolCallId,
+    ProviderCapabilities, SessionId, Timestamp, ToolCallId,
 };
 
 /// Severity of a normalized user-facing agent message.
@@ -130,6 +130,29 @@ pub enum AgentEventPayload {
     SessionEnded(SessionOutcome),
 }
 
+impl AgentEventPayload {
+    /// Returns the Provider capability required to publish this event.
+    ///
+    /// User-facing messages are part of the baseline normalized event stream
+    /// and therefore require no additional declared capability.
+    #[must_use]
+    pub const fn required_provider_capability(&self) -> ProviderCapabilities {
+        match self {
+            Self::SessionStarted(_)
+            | Self::StateChanged(_)
+            | Self::ConnectionChanged(_)
+            | Self::SessionEnded(_) => ProviderCapabilities::SESSION_STATE,
+            Self::Message(_) => ProviderCapabilities::NONE,
+            Self::ToolActivity(_) => ProviderCapabilities::TOOL_EVENTS,
+            Self::PlanUpdated(_) => ProviderCapabilities::PLAN,
+            Self::ProgressUpdated(_) => ProviderCapabilities::PROGRESS,
+            Self::InteractionRequested(request) => request.required_provider_request_capability(),
+            Self::InteractionResponded(response) => response.required_provider_capability(),
+            Self::CommandIssued(command) => command.required_provider_capability(),
+        }
+    }
+}
+
 /// A normalized event ordered within one AgentPulse session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentEvent {
@@ -204,5 +227,11 @@ impl AgentEvent {
     #[must_use]
     pub const fn payload(&self) -> &AgentEventPayload {
         &self.payload
+    }
+
+    /// Returns the Provider capability required to publish this event.
+    #[must_use]
+    pub const fn required_provider_capability(&self) -> ProviderCapabilities {
+        self.payload.required_provider_capability()
     }
 }

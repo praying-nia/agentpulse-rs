@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "agentpulse-bridge"
+version = "0.1.0"
+dependencies = [
+ "agentpulse-core",
+]
+
+[[package]]
 name = "agentpulse-core"
 version = "0.1.0"
 dependencies = [

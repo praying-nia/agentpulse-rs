@@ -1,5 +1,5 @@
 [workspace]
-members = ["agentpulse-core", "agentpulse-protocol"]
+members = ["agentpulse-bridge", "agentpulse-core", "agentpulse-protocol"]
 resolver = "3"
 
 [workspace.package]

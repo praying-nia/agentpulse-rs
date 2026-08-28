@@ -446,6 +446,27 @@ pub enum InteractionResponsePayload {
     Text(NonEmptyText),
 }
 
+impl InteractionResponsePayload {
+    /// Returns the Provider capability needed to accept this response.
+    #[must_use]
+    pub const fn required_provider_capability(&self) -> ProviderCapabilities {
+        match self {
+            Self::Approval(_) => ProviderCapabilities::APPROVAL_RESPONSE,
+            Self::Choice(_) | Self::Text(_) => ProviderCapabilities::USER_INPUT_RESPONSE,
+        }
+    }
+
+    /// Returns the Channel capability needed to originate this response.
+    #[must_use]
+    pub const fn required_channel_capability(&self) -> ChannelCapabilities {
+        match self {
+            Self::Approval(_) => ChannelCapabilities::APPROVAL,
+            Self::Choice(_) => ChannelCapabilities::CHOICE_INPUT,
+            Self::Text(_) => ChannelCapabilities::TEXT_INPUT,
+        }
+    }
+}
+
 /// A Channel-originated response to one interaction request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InteractionResponse {
@@ -503,5 +524,17 @@ impl InteractionResponse {
     #[must_use]
     pub const fn payload(&self) -> &InteractionResponsePayload {
         &self.payload
+    }
+
+    /// Returns the Provider capability needed to accept this response.
+    #[must_use]
+    pub const fn required_provider_capability(&self) -> ProviderCapabilities {
+        self.payload.required_provider_capability()
+    }
+
+    /// Returns the Channel capability needed to originate this response.
+    #[must_use]
+    pub const fn required_channel_capability(&self) -> ChannelCapabilities {
+        self.payload.required_channel_capability()
     }
 }
