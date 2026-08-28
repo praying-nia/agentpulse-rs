@@ -75,6 +75,6 @@ Every Provider and Channel declares its capabilities. A remote operation is expo
 
 ## Status / 状态
 
-The repository currently contains the planned component layout only. No Rust workspace or runtime implementation has been initialized yet.
+The Rust workspace and the initial `agentpulse-core` domain model have been initialized. Bridge, Relay, transport, protocol-codec, Provider, and Channel runtime implementations remain planned scaffolds.
 
-当前仓库仅包含计划中的组件结构，尚未初始化 Rust workspace 或运行时代码。
+Rust workspace 与首版 `agentpulse-core` 统一领域模型已经初始化。Bridge、Relay、Transport、协议编解码、Provider 与 Channel 运行时实现仍处于脚手架阶段。

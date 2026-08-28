@@ -42,7 +42,7 @@ jobs:
 
       - name: Build release workspace
         if: steps.workspace.outputs.exists == 'true'
-        run: cargo build --release --workspace --all-targets --all-features
+        run: cargo build --release --workspace --all-targets --all-features --locked
 
       - name: Package source
         shell: bash

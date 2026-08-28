@@ -63,42 +63,30 @@ jobs:
             test -d "agentpulse-channels/${channel}"
           done
 
-      - name: Detect Rust workspace
-        id: workspace
-        shell: bash
-        run: |
-          if [[ -f Cargo.toml ]]; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "Cargo.toml is not present yet; repository checks only."
-          fi
-
       - name: Install stable Rust toolchain
-        if: steps.workspace.outputs.exists == 'true'
         shell: bash
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
 
       - name: Check formatting
-        if: steps.workspace.outputs.exists == 'true'
         run: cargo fmt --all --check
 
       - name: Run Clippy
-        if: steps.workspace.outputs.exists == 'true'
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Run tests
-        if: steps.workspace.outputs.exists == 'true'
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features --locked
+
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --all-features --no-deps --locked
 
       - name: Build workspace
-        if: steps.workspace.outputs.exists == 'true'
-        run: cargo build --release --workspace --all-targets --all-features
+        run: cargo build --release --workspace --all-targets --all-features --locked
 
       - name: Upload Rust build artifacts
-        if: steps.workspace.outputs.exists == 'true'
         uses: actions/upload-artifact@v6
         with:
           name: ${{ github.event.repository.name }}-rust-${{ github.sha }}
