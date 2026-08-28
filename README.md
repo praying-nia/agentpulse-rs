@@ -36,7 +36,7 @@ Provider 与 Channel 不直接依赖。Core 只路由与展示方式无关的事
 | Component | Responsibility / 职责 |
 | --- | --- |
 | `agentpulse-core` | Shared domain models and task/session state / 共享领域模型及任务、会话状态 |
-| `agentpulse-bridge` | Runtime-neutral Provider/Channel ports and future local orchestration / 运行时中立的 Provider/Channel 端口及后续本地编排 |
+| `agentpulse-bridge` | Runtime-neutral Provider/Channel ports and minimal local orchestration / 运行时中立的 Provider/Channel 端口及最小本地编排 |
 | `agentpulse-relay` | Optional self-hosted synchronization and message-routing service / 可选的自托管同步与消息路由服务 |
 | `agentpulse-protocol` | Rust types and codecs implementing the canonical protocol / 协议规范的 Rust 类型与编解码实现 |
 | `agentpulse-transport` | Connection, delivery, and reconnection abstractions / 连接、投递与重连抽象 |
@@ -75,6 +75,6 @@ Every Provider and Channel declares its capabilities. A remote operation is expo
 
 ## Status / 状态
 
-The Rust workspace, channel-neutral domain model, deterministic Session event reduction, strict JSON protocol v1, independent Provider/Channel ports, and centralized capability routing have been implemented. Bridge orchestration, Relay, transport, and concrete Provider and Channel runtimes remain planned scaffolds.
+The Rust workspace, channel-neutral domain model, deterministic Session event reduction, strict JSON protocol v1, independent Provider/Channel ports, centralized capability routing, and the minimal Bridge closed loop have been implemented. Multi-endpoint Bridge fan-out, Relay, transport, and concrete Provider and Channel runtimes remain planned scaffolds.
 
-Rust workspace、与 Channel 无关的统一领域模型、确定性 Session 事件归约、严格 JSON 协议 v1、Provider/Channel 独立端口及集中 Capability 路由已经实现。Bridge 编排、Relay、Transport 及具体 Provider/Channel 运行时实现仍处于脚手架阶段。
+Rust workspace、与 Channel 无关的统一领域模型、确定性 Session 事件归约、严格 JSON 协议 v1、Provider/Channel 独立端口、集中 Capability 路由及 Bridge 最小闭环已经实现。Bridge 多端点扇出、Relay、Transport 及具体 Provider/Channel 运行时实现仍处于脚手架阶段。
