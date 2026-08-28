@@ -75,6 +75,6 @@ Every Provider and Channel declares its capabilities. A remote operation is expo
 
 ## Status / 状态
 
-The Rust workspace and the initial `agentpulse-core` domain model have been initialized. Bridge, Relay, transport, protocol-codec, Provider, and Channel runtime implementations remain planned scaffolds.
+The Rust workspace, the initial `agentpulse-core` domain model, deterministic Session event reduction, and strict JSON protocol v1 codec have been implemented. Bridge, Relay, transport, Provider, and Channel runtime implementations remain planned scaffolds.
 
-Rust workspace 与首版 `agentpulse-core` 统一领域模型已经初始化。Bridge、Relay、Transport、协议编解码、Provider 与 Channel 运行时实现仍处于脚手架阶段。
+Rust workspace、首版 `agentpulse-core` 统一领域模型、确定性的 Session 事件归约及严格 JSON 协议 v1 编解码已经实现。Bridge、Relay、Transport、Provider 与 Channel 运行时实现仍处于脚手架阶段。

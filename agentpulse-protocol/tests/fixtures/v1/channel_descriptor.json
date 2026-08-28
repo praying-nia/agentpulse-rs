@@ -1,0 +1,26 @@
+{
+  "protocol_version": 1,
+  "message": {
+    "type": "channel_descriptor",
+    "payload": {
+      "id": "01890f47-7c00-7000-8000-000000000002",
+      "kind": "native",
+      "display_name": "Native Channel",
+      "version": "1.0.0",
+      "capabilities": [
+        "notification",
+        "session_view",
+        "tool_view",
+        "plan_view",
+        "progress_view",
+        "rich_message",
+        "approval",
+        "choice_input",
+        "text_input",
+        "form_input",
+        "realtime_sync",
+        "remote_command"
+      ]
+    }
+  }
+}

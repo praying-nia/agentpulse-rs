@@ -1,0 +1,17 @@
+[package]
+name = "agentpulse-protocol"
+description = "Versioned wire protocol and JSON codecs for AgentPulse"
+edition.workspace = true
+publish.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+agentpulse-core = { path = "../agentpulse-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time = { workspace = true, features = ["formatting", "parsing"] }

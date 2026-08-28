@@ -1,0 +1,24 @@
+{
+  "protocol_version": 1,
+  "message": {
+    "type": "provider_descriptor",
+    "payload": {
+      "id": "01890f47-7c00-7000-8000-000000000001",
+      "kind": "codex",
+      "display_name": "Codex Provider",
+      "version": "1.0.0",
+      "capabilities": [
+        "session_state",
+        "tool_events",
+        "plan",
+        "progress",
+        "approval_request",
+        "approval_response",
+        "user_input_request",
+        "user_input_response",
+        "prompt_submit",
+        "cancel"
+      ]
+    }
+  }
+}

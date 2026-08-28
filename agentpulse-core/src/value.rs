@@ -207,6 +207,12 @@ macro_rules! define_positive_counter {
             pub const fn get(self) -> u64 {
                 self.0.get()
             }
+
+            /// Returns the next counter value, or `None` when the counter is exhausted.
+            #[must_use]
+            pub fn checked_next(self) -> Option<Self> {
+                self.0.checked_add(1).map(Self)
+            }
         }
 
         impl TryFrom<u64> for $name {

@@ -131,6 +131,32 @@ impl AgentSession {
     pub const fn updated_at(&self) -> Timestamp {
         self.updated_at
     }
+
+    pub(crate) fn observe_state(
+        &mut self,
+        state: AgentState,
+        revision: Revision,
+        observed_at: Timestamp,
+    ) {
+        self.state = state;
+        self.revision = revision;
+        if observed_at > self.updated_at {
+            self.updated_at = observed_at;
+        }
+    }
+
+    pub(crate) fn observe_connection_state(
+        &mut self,
+        connection_state: ConnectionState,
+        revision: Revision,
+        observed_at: Timestamp,
+    ) {
+        self.connection_state = connection_state;
+        self.revision = revision;
+        if observed_at > self.updated_at {
+            self.updated_at = observed_at;
+        }
+    }
 }
 
 /// A builder that validates an [`AgentSession`] snapshot before construction.

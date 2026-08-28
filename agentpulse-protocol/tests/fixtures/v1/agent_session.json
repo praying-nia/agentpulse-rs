@@ -1,0 +1,21 @@
+{
+  "protocol_version": 1,
+  "message": {
+    "type": "agent_session",
+    "payload": {
+      "id": "01890f47-7c00-7000-8000-000000000003",
+      "provider_id": "01890f47-7c00-7000-8000-000000000001",
+      "external_id": "codex-session-42",
+      "title": "Implement JSON protocol",
+      "workspace": {
+        "path": "/workspace/agentpulse",
+        "display_name": "AgentPulse"
+      },
+      "state": "running",
+      "connection_state": "connected",
+      "revision": "3",
+      "created_at": "2026-08-29T00:00:00Z",
+      "updated_at": "2026-08-29T00:02:00Z"
+    }
+  }
+}
