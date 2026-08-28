@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Check repository hygiene
+        shell: bash
+        run: |
+          test -s README.md
+          git show --check --format= HEAD
+
+      - name: Verify planned component layout
+        shell: bash
+        run: |
+          test -d agentpulse-bridge
+          test -d agentpulse-relay
+          test -d agentpulse-core
+          test -d agentpulse-protocol
+          test -d agentpulse-transport
+          test -d agentpulse-adapters
+
+      - name: Detect Rust workspace
+        id: workspace
+        shell: bash
+        run: |
+          if [[ -f Cargo.toml ]]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Cargo.toml is not present yet; repository checks only."
+          fi
+
+      - name: Install stable Rust toolchain
+        if: steps.workspace.outputs.exists == 'true'
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+
+      - name: Check formatting
+        if: steps.workspace.outputs.exists == 'true'
+        run: cargo fmt --all --check
+
+      - name: Run Clippy
+        if: steps.workspace.outputs.exists == 'true'
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        if: steps.workspace.outputs.exists == 'true'
+        run: cargo test --workspace --all-features
+
+      - name: Build workspace
+        if: steps.workspace.outputs.exists == 'true'
+        run: cargo build --release --workspace --all-targets --all-features
+
+      - name: Upload Rust build artifacts
+        if: steps.workspace.outputs.exists == 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ github.event.repository.name }}-rust-${{ github.sha }}
+          path: |
+            target/release/*
+            !target/release/build/**
+            !target/release/deps/**
+            !target/release/examples/**
+            !target/release/incremental/**
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Create CI source snapshot
+        id: snapshot
+        shell: bash
+        run: |
+          archive="${GITHUB_REPOSITORY#*/}-${GITHUB_SHA::12}-source.tar.gz"
+          tar --exclude-vcs --exclude=target --exclude="$archive" -czf "$archive" .
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Upload CI source artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ github.event.repository.name }}-source-${{ github.sha }}
+          path: ${{ steps.snapshot.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

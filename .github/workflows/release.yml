@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Publish Rust release
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect Rust workspace
+        id: workspace
+        shell: bash
+        run: |
+          if [[ -f Cargo.toml ]]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install stable Rust toolchain
+        if: steps.workspace.outputs.exists == 'true'
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Build release workspace
+        if: steps.workspace.outputs.exists == 'true'
+        run: cargo build --release --workspace --all-targets --all-features
+
+      - name: Package source
+        shell: bash
+        run: |
+          mkdir -p dist
+          repository="${GITHUB_REPOSITORY#*/}"
+          archive="dist/${repository}-${GITHUB_REF_NAME}-source.tar.gz"
+          tar --exclude='.git' --exclude='.git/*' --exclude='./dist' --exclude='*/build' --exclude=target -czf "$archive" .
+          shasum -a 256 "$archive" > "${archive}.sha256"
+
+      - name: Package Rust outputs
+        if: steps.workspace.outputs.exists == 'true'
+        shell: bash
+        run: |
+          repository="${GITHUB_REPOSITORY#*/}"
+          tar -C target/release \
+            --exclude=build \
+            --exclude=deps \
+            --exclude=examples \
+            --exclude=incremental \
+            -czf "../../dist/${repository}-${GITHUB_REF_NAME}-rust.tar.gz" .
+          shasum -a 256 "dist/${repository}-${GITHUB_REF_NAME}-rust.tar.gz" > \
+            "dist/${repository}-${GITHUB_REF_NAME}-rust.tar.gz.sha256"
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --verify-tag \
+              --generate-notes \
+              --title "$GITHUB_REF_NAME"
+          fi
