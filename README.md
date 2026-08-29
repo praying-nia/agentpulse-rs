@@ -47,6 +47,10 @@ Initial Provider targets are Codex, Claude Code, OpenCode, and DeepSeek Harness.
 
 首批 Provider 目标为 Codex、Claude Code、OpenCode 与 DeepSeek Harness。Provider 集成应优先使用官方 RPC 或 SDK，其次为 Plugin API、可回写 Hook、只读 Hook，最后才考虑 PTY/TUI 技术。
 
+The first production Provider is [`agentpulse-provider-codex`](agentpulse-providers/codex). It manages a shared Unix-socket Codex App Server, strictly validates the pinned `0.150.1` schema, resumes explicit threads, and publishes live read-only session events.
+
+首个正式 Provider 是 [`agentpulse-provider-codex`](agentpulse-providers/codex)。它托管共享 Unix Socket Codex App Server，严格校验固定的 `0.150.1` Schema，恢复显式 Thread，并发布实时只读 Session Event。
+
 Initial Channel targets are Native, Feishu, QQ, and Webhook. The Native Channel implements the protocol and transport between the Rust Bridge and the separately maintained Android, iOS, and HarmonyOS apps; it does not reimplement those clients.
 
 首批 Channel 目标为 Native、飞书、QQ 与 Webhook。Native Channel 实现 Rust Bridge 与独立维护的 Android、iOS、HarmonyOS App 之间的协议和传输，不会重新实现这些客户端。
@@ -75,6 +79,6 @@ Every Provider and Channel declares its capabilities. A remote operation is expo
 
 ## Status / 状态
 
-The Rust workspace, channel-neutral domain model, deterministic Session event reduction, strict JSON protocol v1, independent Provider/Channel ports, centralized capability routing, multi-endpoint Bridge orchestration, and runtime-neutral Adapter lifecycle hosting have been implemented. The next target is a minimal read-only Codex Provider; Relay, transport, and concrete Channel runtimes remain planned scaffolds.
+The Rust workspace, shared domain and protocol foundations, multi-endpoint Bridge, RuntimeHost, and the complete read-only Codex Provider have been implemented. The next target is the first complete local read-only Native Channel path; Relay, persistence, and other concrete integrations remain undecided or planned.
 
-Rust workspace、与 Channel 无关的统一领域模型、确定性 Session 事件归约、严格 JSON 协议 v1、Provider/Channel 独立端口、集中 Capability 路由、Bridge 多端点编排与运行时中立的 Adapter 生命周期托管已经实现。下一目标是最小只读 Codex Provider；Relay、Transport 及具体 Channel 运行时实现仍处于脚手架阶段。
+Rust workspace、统一领域与协议基础、Bridge 多端点编排、RuntimeHost 和完整只读 Codex Provider 已经实现。下一目标是形成首个完整的 Native Channel 本地只读链路；Relay、持久化及其他具体集成仍待决策或实现。

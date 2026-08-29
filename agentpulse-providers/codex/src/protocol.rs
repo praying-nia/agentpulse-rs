@@ -1,0 +1,415 @@
+//! Strict, version-pinned Codex App Server protocol processing.
+
+use std::collections::BTreeMap;
+
+use jsonschema::{Draft, Validator};
+use serde_json::{Value, json};
+
+use crate::{CodexProviderBuildError, CodexProviderSourceError};
+
+pub(crate) const BUNDLED_SCHEMA: &str =
+    include_str!("../schemas/codex_app_server_protocol.schemas.json");
+
+#[derive(Clone)]
+pub(crate) struct ProtocolSchema {
+    client_request: Validator,
+    client_notification: Validator,
+    server_notification: Validator,
+    server_request: Validator,
+    jsonrpc_response: Validator,
+    jsonrpc_error: Validator,
+    initialize_response: Validator,
+    thread_resume_response: Validator,
+}
+
+impl ProtocolSchema {
+    pub(crate) fn compile() -> Result<Self, CodexProviderBuildError> {
+        let schema: Value = serde_json::from_str(BUNDLED_SCHEMA).map_err(|error| {
+            CodexProviderBuildError::Schema {
+                message: error.to_string(),
+            }
+        })?;
+
+        Ok(Self {
+            client_request: compile_ref(&schema, "#/definitions/ClientRequest")?,
+            client_notification: compile_ref(&schema, "#/definitions/ClientNotification")?,
+            server_notification: compile_ref(&schema, "#/definitions/ServerNotification")?,
+            server_request: compile_ref(&schema, "#/definitions/ServerRequest")?,
+            jsonrpc_response: compile_ref(&schema, "#/definitions/JSONRPCResponse")?,
+            jsonrpc_error: compile_ref(&schema, "#/definitions/JSONRPCError")?,
+            initialize_response: compile_ref(&schema, "#/definitions/InitializeResponse")?,
+            thread_resume_response: compile_ref(&schema, "#/definitions/v2/ThreadResumeResponse")?,
+        })
+    }
+}
+
+fn compile_ref(
+    schema: &Value,
+    reference: &'static str,
+) -> Result<Validator, CodexProviderBuildError> {
+    let definitions =
+        schema
+            .get("definitions")
+            .cloned()
+            .ok_or_else(|| CodexProviderBuildError::Schema {
+                message: "bundle has no definitions object".to_owned(),
+            })?;
+    let root = json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "$ref": reference,
+        "definitions": definitions,
+    });
+    jsonschema::options()
+        .with_draft(Draft::Draft7)
+        .build(&root)
+        .map_err(|error| CodexProviderBuildError::Schema {
+            message: format!("{reference}: {error}"),
+        })
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum RequestId {
+    Number(i64),
+    String(String),
+}
+
+impl RequestId {
+    fn from_value(value: &Value) -> Result<Self, CodexProviderSourceError> {
+        if let Some(value) = value.as_i64() {
+            Ok(Self::Number(value))
+        } else if let Some(value) = value.as_str() {
+            Ok(Self::String(value.to_owned()))
+        } else {
+            Err(CodexProviderSourceError::protocol(
+                "request ID is neither an int64 nor a string",
+            ))
+        }
+    }
+
+    pub(crate) fn into_value(self) -> Value {
+        match self {
+            Self::Number(value) => Value::from(value),
+            Self::String(value) => Value::from(value),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExpectedResponse {
+    Initialize,
+    ThreadResume,
+}
+
+impl ExpectedResponse {
+    pub(crate) fn method(self) -> &'static str {
+        match self {
+            Self::Initialize => "initialize",
+            Self::ThreadResume => "thread/resume",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ServerFrame {
+    Notification {
+        method: String,
+        params: Value,
+    },
+    Request {
+        id: RequestId,
+        method: String,
+    },
+    Response {
+        id: RequestId,
+        expected: ExpectedResponse,
+        result: Value,
+    },
+    Error {
+        id: RequestId,
+        expected: ExpectedResponse,
+        code: i64,
+        message: String,
+    },
+}
+
+#[derive(Clone)]
+pub(crate) struct ProtocolEngine {
+    schema: ProtocolSchema,
+    pending: BTreeMap<RequestId, ExpectedResponse>,
+    next_request_id: i64,
+}
+
+impl ProtocolEngine {
+    pub(crate) fn new(schema: ProtocolSchema) -> Self {
+        Self {
+            schema,
+            pending: BTreeMap::new(),
+            next_request_id: 1,
+        }
+    }
+
+    pub(crate) fn initialize_request(
+        &mut self,
+    ) -> Result<(RequestId, String), CodexProviderSourceError> {
+        let id = self.allocate(ExpectedResponse::Initialize);
+        let value = json!({
+            "id": id.clone().into_value(),
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "agentpulse",
+                    "title": "AgentPulse Codex Provider",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }
+        });
+        self.validate_client_request(&value)?;
+        Ok((id, serialize(&value)?))
+    }
+
+    pub(crate) fn initialized_notification(&self) -> Result<String, CodexProviderSourceError> {
+        let value = json!({"method": "initialized"});
+        validate(
+            &self.schema.client_notification,
+            &value,
+            "client notification",
+        )?;
+        serialize(&value)
+    }
+
+    pub(crate) fn thread_resume_request(
+        &mut self,
+        thread_id: &str,
+    ) -> Result<(RequestId, String), CodexProviderSourceError> {
+        let id = self.allocate(ExpectedResponse::ThreadResume);
+        let value = json!({
+            "id": id.clone().into_value(),
+            "method": "thread/resume",
+            "params": {"threadId": thread_id}
+        });
+        self.validate_client_request(&value)?;
+        Ok((id, serialize(&value)?))
+    }
+
+    pub(crate) fn unsupported_request_response(
+        &self,
+        id: RequestId,
+        method: &str,
+    ) -> Result<String, CodexProviderSourceError> {
+        let value = json!({
+            "id": id.into_value(),
+            "error": {
+                "code": -32601,
+                "message": format!("AgentPulse read-only client does not implement {method}")
+            }
+        });
+        validate(&self.schema.jsonrpc_error, &value, "client error response")?;
+        serialize(&value)
+    }
+
+    pub(crate) fn parse_server_text(
+        &mut self,
+        text: &str,
+    ) -> Result<ServerFrame, CodexProviderSourceError> {
+        let value: Value = serde_json::from_str(text).map_err(|error| {
+            CodexProviderSourceError::protocol(format!(
+                "invalid JSON at line {}, column {}",
+                error.line(),
+                error.column()
+            ))
+        })?;
+        self.parse_server_value(value)
+    }
+
+    fn parse_server_value(
+        &mut self,
+        value: Value,
+    ) -> Result<ServerFrame, CodexProviderSourceError> {
+        let object = value.as_object().ok_or_else(|| {
+            CodexProviderSourceError::protocol("protocol frame must be a JSON object")
+        })?;
+        let has_method = object.contains_key("method");
+        let has_id = object.contains_key("id");
+        let has_result = object.contains_key("result");
+        let has_error = object.contains_key("error");
+
+        if has_method {
+            if has_result || has_error {
+                return Err(CodexProviderSourceError::protocol(
+                    "method frame cannot also contain result or error",
+                ));
+            }
+            let method = object
+                .get("method")
+                .and_then(Value::as_str)
+                .ok_or_else(|| CodexProviderSourceError::protocol("method must be a string"))?
+                .to_owned();
+            if has_id {
+                validate(&self.schema.server_request, &value, "server request")?;
+                let id = RequestId::from_value(&value["id"])?;
+                Ok(ServerFrame::Request { id, method })
+            } else {
+                validate(
+                    &self.schema.server_notification,
+                    &value,
+                    "server notification",
+                )?;
+                Ok(ServerFrame::Notification {
+                    method,
+                    params: value.get("params").cloned().unwrap_or(Value::Null),
+                })
+            }
+        } else if has_id && has_result != has_error {
+            let id = RequestId::from_value(&value["id"])?;
+            let expected = self.pending.remove(&id).ok_or_else(|| {
+                CodexProviderSourceError::protocol("response ID does not match a pending request")
+            })?;
+            if has_result {
+                validate(&self.schema.jsonrpc_response, &value, "server response")?;
+                let result = value.get("result").cloned().ok_or_else(|| {
+                    CodexProviderSourceError::protocol("successful response has no result")
+                })?;
+                let validator = match expected {
+                    ExpectedResponse::Initialize => &self.schema.initialize_response,
+                    ExpectedResponse::ThreadResume => &self.schema.thread_resume_response,
+                };
+                validate(validator, &result, expected.method())?;
+                Ok(ServerFrame::Response {
+                    id,
+                    expected,
+                    result,
+                })
+            } else {
+                validate(&self.schema.jsonrpc_error, &value, "server error response")?;
+                let error = value
+                    .get("error")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        CodexProviderSourceError::protocol("error response has no error object")
+                    })?;
+                let code = error.get("code").and_then(Value::as_i64).ok_or_else(|| {
+                    CodexProviderSourceError::protocol("error response code must be an int64")
+                })?;
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        CodexProviderSourceError::protocol(
+                            "error response message must be a string",
+                        )
+                    })?
+                    .chars()
+                    .take(512)
+                    .collect();
+                Ok(ServerFrame::Error {
+                    id,
+                    expected,
+                    code,
+                    message,
+                })
+            }
+        } else {
+            Err(CodexProviderSourceError::protocol(
+                "frame is not one unambiguous request, notification, response, or error",
+            ))
+        }
+    }
+
+    fn validate_client_request(&self, value: &Value) -> Result<(), CodexProviderSourceError> {
+        validate(&self.schema.client_request, value, "client request")
+    }
+
+    fn allocate(&mut self, expected: ExpectedResponse) -> RequestId {
+        let id = RequestId::Number(self.next_request_id);
+        self.next_request_id += 1;
+        self.pending.insert(id.clone(), expected);
+        id
+    }
+
+    pub(crate) fn cancel_pending(&mut self, id: &RequestId) {
+        self.pending.remove(id);
+    }
+}
+
+fn validate(
+    validator: &Validator,
+    value: &Value,
+    category: &'static str,
+) -> Result<(), CodexProviderSourceError> {
+    if let Err(error) = validator.validate(value) {
+        Err(CodexProviderSourceError::protocol(format!(
+            "schema rejected {category} at {}",
+            error.instance_path()
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn serialize(value: &Value) -> Result<String, CodexProviderSourceError> {
+    serde_json::to_string(value).map_err(|error| {
+        CodexProviderSourceError::protocol(format!("JSON encoding failed: {error}"))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use super::*;
+
+    type TestResult = Result<(), Box<dyn Error>>;
+
+    fn engine() -> Result<ProtocolEngine, CodexProviderBuildError> {
+        ProtocolSchema::compile().map(ProtocolEngine::new)
+    }
+
+    #[test]
+    fn validates_outbound_handshake_and_correlates_initialize() -> TestResult {
+        let mut engine = engine()?;
+        let (_, request) = engine.initialize_request()?;
+        assert!(request.contains("\"method\":\"initialize\""));
+
+        let frame = engine
+            .parse_server_text(
+                r#"{"id":1,"result":{"codexHome":"/tmp/codex","platformFamily":"unix","platformOs":"linux","userAgent":"codex_cli_rs/0.150.1"}}"#,
+            )?;
+        assert!(matches!(
+            frame,
+            ServerFrame::Response {
+                expected: ExpectedResponse::Initialize,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unknown_response_and_invalid_notification() -> TestResult {
+        let mut engine = engine()?;
+        let unknown = engine.parse_server_text(r#"{"id":99,"result":{}}"#);
+        assert!(unknown.is_err());
+
+        let invalid = engine
+            .parse_server_text(r#"{"method":"thread/status/changed","params":{"threadId":"x"}}"#);
+        assert!(invalid.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn validates_and_rejects_supported_server_requests_explicitly() -> TestResult {
+        let mut engine = engine()?;
+        let request = engine
+            .parse_server_text(
+                r#"{"id":"approval-1","method":"item/commandExecution/requestApproval","params":{"threadId":"019976a4-00f0-7312-b36c-d01f9c5c06f6","turnId":"019976a4-00f1-76c0-b845-e1509dc4e3de","itemId":"019976a4-00f2-741b-870f-21b4fb983746","startedAtMs":1000,"reason":null}}"#,
+            )?;
+        let id = match request {
+            ServerFrame::Request { id, .. } => id,
+            _ => return Err("expected server request".into()),
+        };
+        let response =
+            engine.unsupported_request_response(id, "item/commandExecution/requestApproval")?;
+        assert!(response.contains("-32601"));
+        Ok(())
+    }
+}
