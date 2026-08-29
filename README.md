@@ -36,7 +36,7 @@ Provider 与 Channel 不直接依赖。Core 只路由与展示方式无关的事
 | Component | Responsibility / 职责 |
 | --- | --- |
 | `agentpulse-core` | Shared domain models and task/session state / 共享领域模型及任务、会话状态 |
-| `agentpulse-bridge` | Runtime-neutral heterogeneous endpoint registration, explicit subscriptions, and local fan-out / 运行时中立的异构端点注册、显式订阅与本地扇出 |
+| `agentpulse-bridge` | Runtime-neutral endpoint orchestration, subscriptions, fan-out, and Adapter lifecycle hosting / 运行时中立的端点编排、订阅、扇出与 Adapter 生命周期托管 |
 | `agentpulse-relay` | Optional self-hosted synchronization and message-routing service / 可选的自托管同步与消息路由服务 |
 | `agentpulse-protocol` | Rust types and codecs implementing the canonical protocol / 协议规范的 Rust 类型与编解码实现 |
 | `agentpulse-transport` | Connection, delivery, and reconnection abstractions / 连接、投递与重连抽象 |
@@ -75,6 +75,6 @@ Every Provider and Channel declares its capabilities. A remote operation is expo
 
 ## Status / 状态
 
-The Rust workspace, channel-neutral domain model, deterministic Session event reduction, strict JSON protocol v1, independent Provider/Channel ports, centralized capability routing, and multi-endpoint Bridge orchestration with explicit Session subscriptions have been implemented. The next foundation target is a Runtime Host and Adapter lifecycle contract; Relay, transport, and concrete Provider and Channel runtimes remain planned scaffolds.
+The Rust workspace, channel-neutral domain model, deterministic Session event reduction, strict JSON protocol v1, independent Provider/Channel ports, centralized capability routing, multi-endpoint Bridge orchestration, and runtime-neutral Adapter lifecycle hosting have been implemented. The next target is a minimal read-only Codex Provider; Relay, transport, and concrete Channel runtimes remain planned scaffolds.
 
-Rust workspace、与 Channel 无关的统一领域模型、确定性 Session 事件归约、严格 JSON 协议 v1、Provider/Channel 独立端口、集中 Capability 路由，以及带显式 Session 订阅的 Bridge 多端点编排已经实现。下一项基础目标是 Runtime Host 与 Adapter 生命周期契约；Relay、Transport 及具体 Provider/Channel 运行时实现仍处于脚手架阶段。
+Rust workspace、与 Channel 无关的统一领域模型、确定性 Session 事件归约、严格 JSON 协议 v1、Provider/Channel 独立端口、集中 Capability 路由、Bridge 多端点编排与运行时中立的 Adapter 生命周期托管已经实现。下一目标是最小只读 Codex Provider；Relay、Transport 及具体 Channel 运行时实现仍处于脚手架阶段。
