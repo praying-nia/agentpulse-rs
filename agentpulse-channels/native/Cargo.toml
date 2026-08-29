@@ -1,6 +1,6 @@
 [package]
-name = "agentpulse-provider-codex"
-description = "Read-only Codex App Server provider for AgentPulse"
+name = "agentpulse-channel-native"
+description = "Local read-only Native Channel for AgentPulse"
 edition.workspace = true
 publish.workspace = true
 repository.workspace = true
@@ -9,14 +9,13 @@ version.workspace = true
 [dependencies]
 agentpulse-bridge = { path = "../../agentpulse-bridge" }
 agentpulse-core = { path = "../../agentpulse-core" }
-jsonschema.workspace = true
+agentpulse-protocol = { path = "../../agentpulse-protocol" }
+agentpulse-transport = { path = "../../agentpulse-transport" }
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tungstenite.workspace = true
-
-[dev-dependencies]
-agentpulse-channel-native = { path = "../../agentpulse-channels/native" }
-agentpulse-protocol = { path = "../../agentpulse-protocol" }
+uuid.workspace = true
 
 [lints]
 workspace = true

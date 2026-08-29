@@ -1,9 +1,11 @@
 [workspace]
 members = [
     "agentpulse-bridge",
+    "agentpulse-channels/native",
     "agentpulse-core",
     "agentpulse-protocol",
     "agentpulse-providers/codex",
+    "agentpulse-transport",
 ]
 resolver = "3"
 

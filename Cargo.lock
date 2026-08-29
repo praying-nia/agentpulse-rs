@@ -10,6 +10,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentpulse-channel-native"
+version = "0.1.0"
+dependencies = [
+ "agentpulse-bridge",
+ "agentpulse-core",
+ "agentpulse-protocol",
+ "agentpulse-transport",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tungstenite",
+ "uuid",
+]
+
+[[package]]
 name = "agentpulse-core"
 version = "0.1.0"
 dependencies = [
@@ -35,9 +50,19 @@ name = "agentpulse-provider-codex"
 version = "0.1.0"
 dependencies = [
  "agentpulse-bridge",
+ "agentpulse-channel-native",
  "agentpulse-core",
+ "agentpulse-protocol",
  "jsonschema",
  "serde_json",
+ "thiserror",
+ "tungstenite",
+]
+
+[[package]]
+name = "agentpulse-transport"
+version = "0.1.0"
+dependencies = [
  "thiserror",
  "tungstenite",
 ]

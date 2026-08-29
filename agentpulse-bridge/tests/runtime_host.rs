@@ -8,11 +8,11 @@ use std::{
 
 use agentpulse_bridge::{
     AdapterLifecyclePhase, AdapterLifecycleState, ChannelActionHandle, ChannelActionIngressError,
-    ChannelActionSink, ChannelActionSource, ChannelPort, EndpointRegistrationError,
-    ProviderEventHandle, ProviderEventIngressError, ProviderEventOutcome, ProviderEventSink,
-    ProviderEventSource, ProviderPort, RuntimeEndpointId, RuntimeHost, RuntimeHostState,
-    RuntimeLifecycleError, RuntimeLifecycleOperation, RuntimeLifecycleOutcome,
-    RuntimeRegistrationError, SubscribeOutcome,
+    ChannelActionSink, ChannelActionSource, ChannelPort, ChannelSubscriptionScope,
+    EndpointRegistrationError, ProviderEventHandle, ProviderEventIngressError,
+    ProviderEventOutcome, ProviderEventSink, ProviderEventSource, ProviderPort, RuntimeEndpointId,
+    RuntimeHost, RuntimeHostState, RuntimeLifecycleError, RuntimeLifecycleOperation,
+    RuntimeLifecycleOutcome, RuntimeRegistrationError, SubscribeOutcome,
 };
 use agentpulse_core::{
     AgentCommand, AgentCommandPayload, AgentEvent, AgentEventPayload, AgentMessage,
@@ -335,6 +335,7 @@ struct ChannelSourceState {
 struct FakeChannelSource {
     state: Arc<Mutex<ChannelSourceState>>,
     log: LifecycleLog,
+    scope: ChannelSubscriptionScope,
 }
 
 impl ChannelActionSource for FakeChannelSource {
@@ -381,6 +382,10 @@ impl ChannelActionSource for FakeChannelSource {
             Ok(())
         }
     }
+
+    fn subscription_scope(&self) -> ChannelSubscriptionScope {
+        self.scope
+    }
 }
 
 impl Drop for FakeChannelSource {
@@ -424,6 +429,7 @@ fn fake_channel(channel_id: ChannelId, log: &LifecycleLog) -> Result<ChannelFixt
         FakeChannelSource {
             state: Arc::clone(&source_state),
             log: Arc::clone(log),
+            scope: ChannelSubscriptionScope::Persistent,
         },
         source_state,
     ))
@@ -500,6 +506,7 @@ fn controlled_ingress_drives_bridge_and_survives_restart_without_stale_handles()
         host.subscribe(channel_id, session_id)?,
         SubscribeOutcome::Subscribed {
             session_view_delivered: true,
+            baseline_sequence: EventSequence::FIRST,
         }
     );
     old_channel_handle.submit_command(cancel_command(session_id, channel_id)?)?;
@@ -783,6 +790,54 @@ fn registration_identity_and_drop_cleanup_remain_controlled() -> TestResult {
     assert!(matches!(
         channel_handle.submit_command(cancel_command(session_id, channel_id)?),
         Err(ChannelActionIngressError::HostDropped { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn channel_handle_discovers_sessions_and_source_generation_stop_clears_subscriptions() -> TestResult
+{
+    let provider_id = ProviderId::new();
+    let channel_id = ChannelId::new();
+    let session_id = SessionId::new();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (provider, _, provider_source, provider_runtime) = fake_provider(provider_id, &log)?;
+    let (channel, channel_port, mut channel_source, channel_runtime) =
+        fake_channel(channel_id, &log)?;
+    channel_source.scope = ChannelSubscriptionScope::SourceGeneration;
+
+    let mut host = RuntimeHost::new();
+    host.register_provider(provider, provider_source)?;
+    host.register_channel(channel, channel_source)?;
+    let _ = host.start()?;
+    let provider_handle = last_provider_handle(&provider_runtime)?;
+    let _ = provider_handle.publish_event(initial_event(session(provider_id, session_id)?)?)?;
+    let channel_handle = last_channel_handle(&channel_runtime)?;
+
+    let discovery = channel_handle.discovery_snapshot()?;
+    assert_eq!(discovery.providers().len(), 1);
+    assert_eq!(discovery.providers()[0].id(), provider_id);
+    assert_eq!(discovery.sessions().len(), 1);
+    assert_eq!(discovery.sessions()[0].session().id(), session_id);
+    assert_eq!(
+        discovery.sessions()[0].last_sequence(),
+        EventSequence::FIRST
+    );
+    assert_eq!(
+        channel_handle.subscribe(session_id)?,
+        SubscribeOutcome::Subscribed {
+            session_view_delivered: true,
+            baseline_sequence: EventSequence::FIRST,
+        }
+    );
+    assert_eq!(locked(&channel_port).sessions.len(), 1);
+    assert!(host.inspect_bridge(|bridge| bridge.is_subscribed(channel_id, session_id))?);
+
+    let _ = host.stop()?;
+    assert!(!host.inspect_bridge(|bridge| bridge.is_subscribed(channel_id, session_id))?);
+    assert!(matches!(
+        channel_handle.discovery_snapshot(),
+        Err(ChannelActionIngressError::Inactive { .. })
     ));
     Ok(())
 }

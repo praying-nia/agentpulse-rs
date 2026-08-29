@@ -823,6 +823,7 @@ mod tests {
         collections::VecDeque,
         error::Error,
         fmt,
+        net::TcpStream,
         str::FromStr,
         sync::{Arc, Mutex},
         thread,
@@ -837,12 +838,19 @@ mod tests {
     };
 
     use agentpulse_bridge::{ChannelActionHandle, ChannelActionSource, ChannelPort, RuntimeHost};
-    use agentpulse_core::{
-        AgentEvent, AgentSession, AgentState, ChannelCapabilities, ChannelDescriptor,
-        ChannelEventRoute, ChannelId, ChannelKind, ConnectionState, NonEmptyText,
-        ProviderCapabilities, ProviderDescriptor, ProviderId, ProviderKind, SessionId,
-        SessionOutcome,
+    use agentpulse_channel_native::{
+        NATIVE_WEBSOCKET_PATH, NATIVE_WEBSOCKET_SUBPROTOCOL, NativeChannel, NativeChannelConfig,
+        NativeClientMessage, NativeDeliveryContext, NativeServerMessage, NativeSubscriptionStatus,
+        decode_server_message, encode_client_message,
     };
+    use agentpulse_core::{
+        AgentEvent, AgentEventPayload, AgentSession, AgentState, ChannelCapabilities,
+        ChannelDescriptor, ChannelEventRoute, ChannelId, ChannelKind, ConnectionState,
+        EventSequence, NonEmptyText, ProviderCapabilities, ProviderDescriptor, ProviderId,
+        ProviderKind, SessionId, SessionOutcome,
+    };
+    use agentpulse_protocol::{ProtocolMessage, V1_PROTOCOL_VERSION};
+    use tungstenite::{ClientRequestBuilder, Message, WebSocket, client, http::Uri};
 
     use super::*;
     use crate::{CodexProviderPort, status::snapshot};
@@ -1004,6 +1012,172 @@ mod tests {
             io::ErrorKind::TimedOut,
             "condition was not reached",
         ))
+    }
+
+    fn native_connect(
+        address: std::net::SocketAddr,
+    ) -> Result<WebSocket<TcpStream>, Box<dyn Error>> {
+        let uri: Uri = format!("ws://{address}{NATIVE_WEBSOCKET_PATH}").parse()?;
+        let request =
+            ClientRequestBuilder::new(uri).with_sub_protocol(NATIVE_WEBSOCKET_SUBPROTOCOL);
+        let stream = TcpStream::connect(address)?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        let (socket, _) = client(request, stream)?;
+        Ok(socket)
+    }
+
+    fn native_send(socket: &mut WebSocket<TcpStream>, message: &NativeClientMessage) -> TestResult {
+        let text = String::from_utf8(encode_client_message(message)?)?;
+        socket.send(Message::text(text))?;
+        Ok(())
+    }
+
+    fn native_read(
+        socket: &mut WebSocket<TcpStream>,
+    ) -> Result<NativeServerMessage, Box<dyn Error>> {
+        loop {
+            match socket.read()? {
+                Message::Text(text) => return Ok(decode_server_message(text.as_bytes())?),
+                Message::Ping(_) | Message::Pong(_) => socket.flush()?,
+                Message::Close(_) => return Err("Native server closed unexpectedly".into()),
+                Message::Binary(_) | Message::Frame(_) => {
+                    return Err("Native server emitted a non-text application frame".into());
+                }
+            }
+        }
+    }
+
+    fn native_handshake_and_subscribe(
+        socket: &mut WebSocket<TcpStream>,
+        provider_id: ProviderId,
+        session_id: SessionId,
+    ) -> TestResult {
+        native_send(
+            socket,
+            &NativeClientMessage::Hello {
+                client_id: ChannelId::new().to_string(),
+                display_name: "Codex Fixture Native Client".to_owned(),
+                version: Some("1.0.0-test".to_owned()),
+                supported_protocol_versions: vec![V1_PROTOCOL_VERSION],
+            },
+        )?;
+        assert!(matches!(
+            native_read(socket)?,
+            NativeServerMessage::Hello { .. }
+        ));
+        let discovery_id = ChannelId::new().to_string();
+        native_send(
+            socket,
+            &NativeClientMessage::Discover {
+                request_id: discovery_id.clone(),
+            },
+        )?;
+        assert!(matches!(
+            native_read(socket)?,
+            NativeServerMessage::SyncStarted {
+                provider_count: 1,
+                session_count: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            native_read(socket)?,
+            NativeServerMessage::Domain {
+                context: NativeDeliveryContext::DiscoveryProvider { .. },
+                message: ProtocolMessage::ProviderDescriptor(ref descriptor),
+            } if descriptor.id() == provider_id
+        ));
+        assert!(matches!(
+            native_read(socket)?,
+            NativeServerMessage::Domain {
+                context: NativeDeliveryContext::DiscoverySession { last_sequence, .. },
+                message: ProtocolMessage::AgentSession(ref session),
+            } if session.id() == session_id && last_sequence == EventSequence::FIRST
+        ));
+        assert!(matches!(
+            native_read(socket)?,
+            NativeServerMessage::SyncCompleted { ref request_id }
+                if request_id == &discovery_id
+        ));
+        let subscription_id = ChannelId::new().to_string();
+        native_send(
+            socket,
+            &NativeClientMessage::Subscribe {
+                request_id: subscription_id.clone(),
+                session_id,
+            },
+        )?;
+        assert!(matches!(
+            native_read(socket)?,
+            NativeServerMessage::SubscriptionResult {
+                status: NativeSubscriptionStatus::Subscribed,
+                baseline_sequence: EventSequence::FIRST,
+                ..
+            }
+        ));
+        assert!(matches!(
+            native_read(socket)?,
+            NativeServerMessage::Domain {
+                context: NativeDeliveryContext::SubscriptionSession { .. },
+                message: ProtocolMessage::AgentSession(ref session),
+            } if session.id() == session_id
+        ));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires loopback socket access"]
+    fn captured_codex_fixture_streams_through_native_transport() -> TestResult {
+        let control = Arc::new(FakeControl::default());
+        seed_lines(&control, LIVE_FIXTURE.lines().take(2));
+        let (provider_id, provider, provider_source, codex_status) =
+            test_provider(Arc::clone(&control))?;
+        let session_id = SessionId::from_str(THREAD_ID)?;
+        let channel_id = ChannelId::new();
+        let native = NativeChannel::build(NativeChannelConfig::new(channel_id))?;
+        let (channel, channel_source, native_handle) = native.into_parts();
+        let mut host = RuntimeHost::new();
+        host.register_provider(provider, provider_source)?;
+        host.register_channel(channel, channel_source)?;
+        let _ = host.start()?;
+        wait_until(|| snapshot(&codex_status).mapped_events() == 1)?;
+
+        let address = native_handle
+            .snapshot()
+            .local_address
+            .ok_or("Native listener address is unavailable")?;
+        let mut client = native_connect(address)?;
+        native_handshake_and_subscribe(&mut client, provider_id, session_id)?;
+        seed_lines(&control, LIVE_FIXTURE.lines().skip(2));
+
+        let mut event_sequences = Vec::new();
+        let mut final_message_seen = false;
+        while event_sequences.last().copied() != Some(EventSequence::new(6)?) {
+            if let NativeServerMessage::Domain {
+                context: NativeDeliveryContext::LiveEvent { .. },
+                message: ProtocolMessage::AgentEvent(event),
+            } = native_read(&mut client)?
+            {
+                if let AgentEventPayload::Message(message) = event.payload()
+                    && message.content().as_str() == "Provider fixture completed"
+                {
+                    final_message_seen = true;
+                }
+                event_sequences.push(event.sequence());
+            }
+        }
+        assert_eq!(
+            event_sequences,
+            (2_u64..=6)
+                .map(EventSequence::new)
+                .collect::<Result<Vec<_>, _>>()?
+        );
+        assert!(final_message_seen);
+        wait_until(|| snapshot(&codex_status).mapped_events() == 6)?;
+        client.close(None)?;
+        let _ = host.stop()?;
+        Ok(())
     }
 
     #[test]

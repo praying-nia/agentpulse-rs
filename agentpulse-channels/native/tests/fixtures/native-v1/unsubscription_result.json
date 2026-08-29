@@ -1,0 +1,9 @@
+{
+  "native_transport_version": 1,
+  "message": {
+    "type": "unsubscription_result",
+    "request_id": "01890f47-7c00-7000-8000-000000000005",
+    "session_id": "01890f47-7c00-7000-8000-000000000003",
+    "status": "unsubscribed"
+  }
+}

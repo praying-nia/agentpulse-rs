@@ -1,0 +1,10 @@
+{
+  "native_transport_version": 1,
+  "message": {
+    "type": "error",
+    "request_id": "01890f47-7c00-7000-8000-000000000005",
+    "code": "session_not_discovered",
+    "message": "Session was not present in the latest discovery snapshot",
+    "recoverable": true
+  }
+}

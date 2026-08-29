@@ -7,10 +7,10 @@ use std::{
 };
 
 use agentpulse_core::{
-    AgentCommand, AgentEvent, AgentEventPayload, ApplyOutcome, CapabilityRouteError,
-    CapabilityRouter, ChannelCapabilities, ChannelDescriptor, ChannelId, InteractionId,
-    InteractionResponse, ProviderDescriptor, ProviderId, ReduceError, SessionAggregate,
-    SessionAggregateConfig, SessionId,
+    AgentCommand, AgentEvent, AgentEventPayload, AgentSession, ApplyOutcome, CapabilityRouteError,
+    CapabilityRouter, ChannelCapabilities, ChannelDescriptor, ChannelId, EventSequence,
+    InteractionId, InteractionResponse, ProviderDescriptor, ProviderId, ReduceError,
+    SessionAggregate, SessionAggregateConfig, SessionId,
 };
 
 use crate::{
@@ -232,9 +232,70 @@ pub enum SubscribeOutcome {
     Subscribed {
         /// Whether the Channel first accepted the current Session view.
         session_view_delivered: bool,
+        /// The last Event already represented by the synchronized baseline.
+        baseline_sequence: EventSequence,
     },
     /// The exact subscription was already active; no view was redelivered.
-    AlreadySubscribed,
+    AlreadySubscribed {
+        /// The current Aggregate cursor at the time of the repeated request.
+        current_sequence: EventSequence,
+    },
+}
+
+/// One current Session entry exposed to a Channel during discovery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscoveredSession {
+    session: AgentSession,
+    last_sequence: EventSequence,
+}
+
+impl DiscoveredSession {
+    fn new(session: AgentSession, last_sequence: EventSequence) -> Self {
+        Self {
+            session,
+            last_sequence,
+        }
+    }
+
+    /// Borrows the current complete Session view.
+    #[must_use]
+    pub const fn session(&self) -> &AgentSession {
+        &self.session
+    }
+
+    /// Returns the last Event represented by the current Aggregate.
+    #[must_use]
+    pub const fn last_sequence(&self) -> EventSequence {
+        self.last_sequence
+    }
+}
+
+/// A stable point-in-time discovery snapshot for a registered Channel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChannelDiscoverySnapshot {
+    providers: Vec<ProviderDescriptor>,
+    sessions: Vec<DiscoveredSession>,
+}
+
+impl ChannelDiscoverySnapshot {
+    fn new(providers: Vec<ProviderDescriptor>, sessions: Vec<DiscoveredSession>) -> Self {
+        Self {
+            providers,
+            sessions,
+        }
+    }
+
+    /// Borrows Provider descriptors in stable Provider-ID order.
+    #[must_use]
+    pub fn providers(&self) -> &[ProviderDescriptor] {
+        &self.providers
+    }
+
+    /// Borrows current Sessions in stable Session-ID order.
+    #[must_use]
+    pub fn sessions(&self) -> &[DiscoveredSession] {
+        &self.sessions
+    }
 }
 
 /// The result of cancelling one Session-to-Channel subscription.
@@ -612,6 +673,19 @@ impl Bridge {
         self.sessions.values()
     }
 
+    /// Captures registered Providers and current Sessions in stable ID order.
+    #[must_use]
+    pub fn discovery_snapshot(&self) -> ChannelDiscoverySnapshot {
+        ChannelDiscoverySnapshot::new(
+            self.provider_descriptors().cloned().collect(),
+            self.session_aggregates()
+                .map(|aggregate| {
+                    DiscoveredSession::new(aggregate.session().clone(), aggregate.last_sequence())
+                })
+                .collect(),
+        )
+    }
+
     /// Returns whether a Channel currently subscribes to a Session.
     #[must_use]
     pub fn is_subscribed(&self, channel_id: ChannelId, session_id: SessionId) -> bool {
@@ -643,15 +717,17 @@ impl Bridge {
         if !self.channels.contains_key(&channel_id) {
             return Err(SubscriptionError::ChannelNotFound { channel_id });
         }
-        let session = self
+        let aggregate = self
             .sessions
             .get(&session_id)
-            .ok_or(SubscriptionError::SessionNotFound { session_id })?
-            .session()
-            .clone();
+            .ok_or(SubscriptionError::SessionNotFound { session_id })?;
+        let session = aggregate.session().clone();
+        let baseline_sequence = aggregate.last_sequence();
 
         if self.is_subscribed(channel_id, session_id) {
-            return Ok(SubscribeOutcome::AlreadySubscribed);
+            return Ok(SubscribeOutcome::AlreadySubscribed {
+                current_sequence: baseline_sequence,
+            });
         }
 
         let channel = self
@@ -679,6 +755,7 @@ impl Bridge {
             .insert(channel_id);
         Ok(SubscribeOutcome::Subscribed {
             session_view_delivered,
+            baseline_sequence,
         })
     }
 
@@ -712,6 +789,27 @@ impl Bridge {
         } else {
             UnsubscribeOutcome::NotSubscribed
         })
+    }
+
+    /// Removes every active subscription owned by one registered Channel.
+    ///
+    /// Returns the number of Session subscriptions that were removed.
+    pub fn unsubscribe_channel(
+        &mut self,
+        channel_id: ChannelId,
+    ) -> Result<usize, SubscriptionError> {
+        if !self.channels.contains_key(&channel_id) {
+            return Err(SubscriptionError::ChannelNotFound { channel_id });
+        }
+
+        let mut removed = 0_usize;
+        self.subscriptions.retain(|_, channels| {
+            if channels.remove(&channel_id) {
+                removed += 1;
+            }
+            !channels.is_empty()
+        });
+        Ok(removed)
     }
 
     /// Processes one normalized Event from a registered Provider.

@@ -1,0 +1,24 @@
+{
+  "native_transport_version": 1,
+  "message": {
+    "type": "server_hello",
+    "connection_id": "01890f47-7c00-7000-8000-000000000006",
+    "channel": {
+      "protocol_version": 1,
+      "message": {
+        "type": "channel_descriptor",
+        "payload": {
+          "id": "01890f47-7c00-7000-8000-000000000002",
+          "kind": "native",
+          "display_name": "Native Local",
+          "version": "0.1.0",
+          "capabilities": ["notification", "session_view", "realtime_sync"]
+        }
+      }
+    },
+    "protocol_version": 1,
+    "max_frame_bytes": 1048576,
+    "ping_interval_seconds": 15,
+    "idle_timeout_seconds": 45
+  }
+}

@@ -14,9 +14,10 @@ use agentpulse_core::{
 };
 
 use crate::{
-    Bridge, ChannelActionError, ChannelActionSink, ChannelPort, EndpointRegistrationError,
-    ProviderEventError, ProviderEventReport, ProviderEventSink, ProviderPort, SubscribeOutcome,
-    SubscriptionError, UnsubscribeOutcome, registry::BoxAdapterError,
+    Bridge, ChannelActionError, ChannelActionSink, ChannelDiscoverySnapshot, ChannelPort,
+    EndpointRegistrationError, ProviderEventError, ProviderEventReport, ProviderEventSink,
+    ProviderPort, SubscribeOutcome, SubscriptionError, UnsubscribeOutcome,
+    registry::BoxAdapterError,
 };
 
 /// A Provider-side execution source that publishes normalized Events.
@@ -51,6 +52,22 @@ pub trait ChannelActionSource: Send {
 
     /// Stops the Source and releases its execution resources.
     fn stop(&mut self) -> Result<(), Self::Error>;
+
+    /// Chooses whether Host stop retains or clears this Channel's subscriptions.
+    fn subscription_scope(&self) -> ChannelSubscriptionScope {
+        ChannelSubscriptionScope::Persistent
+    }
+}
+
+/// Controls how a Channel's subscriptions cross RuntimeHost generations.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ChannelSubscriptionScope {
+    /// Preserve subscriptions across explicit stop/start cycles.
+    #[default]
+    Persistent,
+    /// Clear subscriptions whenever the Channel Source generation stops.
+    SourceGeneration,
 }
 
 /// Identifies one Host-owned runtime endpoint.
@@ -325,6 +342,8 @@ impl RuntimeLifecycleReport {
 pub enum RuntimeLifecycleError {
     /// A prior stop failure must be cleaned up before another start.
     CleanupRequired,
+    /// Subscription cleanup could not access the Bridge safely.
+    BridgeAccess(RuntimeAccessError),
     /// One or more Adapter callbacks failed; the report includes every attempt.
     AdapterFailures {
         /// The complete ordered lifecycle report.
@@ -338,7 +357,7 @@ impl RuntimeLifecycleError {
     pub const fn report(&self) -> Option<&RuntimeLifecycleReport> {
         match self {
             Self::AdapterFailures { report } => Some(report),
-            Self::CleanupRequired => None,
+            Self::CleanupRequired | Self::BridgeAccess(_) => None,
         }
     }
 }
@@ -359,6 +378,7 @@ impl fmt::Display for RuntimeLifecycleError {
                     .count(),
                 report.adapters().len()
             ),
+            Self::BridgeAccess(source) => source.fmt(formatter),
         }
     }
 }
@@ -370,6 +390,7 @@ impl Error for RuntimeLifecycleError {
                 .first_failure()
                 .map(|source| source as &(dyn Error + 'static)),
             Self::CleanupRequired => None,
+            Self::BridgeAccess(source) => Some(source),
         }
     }
 }
@@ -572,6 +593,8 @@ pub enum ChannelActionIngressError {
     BridgeAccess(RuntimeAccessError),
     /// The Bridge rejected the normalized Channel Action.
     Bridge(ChannelActionError),
+    /// The Bridge rejected a Channel-owned subscription operation.
+    Subscription(SubscriptionError),
 }
 
 impl fmt::Display for ChannelActionIngressError {
@@ -592,6 +615,7 @@ impl fmt::Display for ChannelActionIngressError {
             }
             Self::BridgeAccess(source) => source.fmt(formatter),
             Self::Bridge(source) => source.fmt(formatter),
+            Self::Subscription(source) => source.fmt(formatter),
         }
     }
 }
@@ -601,6 +625,7 @@ impl Error for ChannelActionIngressError {
         match self {
             Self::BridgeAccess(source) => Some(source),
             Self::Bridge(source) => Some(source),
+            Self::Subscription(source) => Some(source),
             Self::ChannelMismatch { .. } | Self::Inactive { .. } | Self::HostDropped { .. } => None,
         }
     }
@@ -716,6 +741,37 @@ impl ChannelActionHandle {
         self.channel_id
     }
 
+    /// Captures the registered Providers and current Sessions for discovery.
+    pub fn discovery_snapshot(
+        &self,
+    ) -> Result<ChannelDiscoverySnapshot, ChannelActionIngressError> {
+        self.with_bridge_access(|bridge| Ok(bridge.discovery_snapshot()))
+    }
+
+    /// Subscribes this Channel to one current Session.
+    pub fn subscribe(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SubscribeOutcome, ChannelActionIngressError> {
+        self.with_bridge_access(|bridge| {
+            bridge
+                .subscribe(self.channel_id, session_id)
+                .map_err(ChannelActionIngressError::Subscription)
+        })
+    }
+
+    /// Cancels this Channel's subscription to one current Session.
+    pub fn unsubscribe(
+        &self,
+        session_id: SessionId,
+    ) -> Result<UnsubscribeOutcome, ChannelActionIngressError> {
+        self.with_bridge_access(|bridge| {
+            bridge
+                .unsubscribe(self.channel_id, session_id)
+                .map_err(ChannelActionIngressError::Subscription)
+        })
+    }
+
     /// Submits one normalized Interaction Response synchronously.
     pub fn submit_interaction_response(
         &self,
@@ -733,6 +789,15 @@ impl ChannelActionHandle {
         &self,
         operation: impl FnOnce(&mut Bridge) -> Result<(), ChannelActionError>,
     ) -> Result<(), ChannelActionIngressError> {
+        self.with_bridge_access(|bridge| {
+            operation(bridge).map_err(ChannelActionIngressError::Bridge)
+        })
+    }
+
+    fn with_bridge_access<R>(
+        &self,
+        operation: impl FnOnce(&mut Bridge) -> Result<R, ChannelActionIngressError>,
+    ) -> Result<R, ChannelActionIngressError> {
         let bridge = self
             .bridge
             .upgrade()
@@ -748,7 +813,7 @@ impl ChannelActionHandle {
         let mut bridge = bridge
             .access()
             .map_err(ChannelActionIngressError::BridgeAccess)?;
-        operation(&mut bridge).map_err(ChannelActionIngressError::Bridge)
+        operation(&mut bridge)
     }
 }
 
@@ -972,6 +1037,8 @@ impl RuntimeHost {
         }
 
         self.revoke_all_ingress();
+        self.clear_source_generation_subscriptions()
+            .map_err(RuntimeLifecycleError::BridgeAccess)?;
         let mut results = Vec::with_capacity(self.adapters.len());
         for adapter in self.adapters.iter_mut().rev() {
             let endpoint = adapter.endpoint();
@@ -1020,6 +1087,23 @@ impl RuntimeHost {
             adapter.revoke_ingress();
         }
     }
+
+    fn clear_source_generation_subscriptions(&self) -> Result<(), RuntimeAccessError> {
+        let channel_ids = self
+            .adapters
+            .iter()
+            .filter_map(RegisteredAdapter::source_generation_channel)
+            .collect::<Vec<_>>();
+        if channel_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut bridge = self.bridge.access()?;
+        for channel_id in channel_ids {
+            let _ = bridge.unsubscribe_channel(channel_id);
+        }
+        Ok(())
+    }
 }
 
 impl Default for RuntimeHost {
@@ -1031,6 +1115,7 @@ impl Default for RuntimeHost {
 impl Drop for RuntimeHost {
     fn drop(&mut self) {
         self.revoke_all_ingress();
+        let _ = self.clear_source_generation_subscriptions();
         for adapter in self.adapters.iter_mut().rev() {
             if adapter.state() != AdapterLifecycleState::Stopped {
                 let _ = adapter.stop();
@@ -1183,6 +1268,7 @@ enum RegisteredSource {
     Channel {
         channel_id: ChannelId,
         source: Box<dyn ErasedChannelActionSource>,
+        subscription_scope: ChannelSubscriptionScope,
     },
 }
 
@@ -1204,9 +1290,9 @@ impl RegisteredSource {
                 provider_id,
                 source,
             } => source.start(ProviderEventHandle::new(*provider_id, bridge, permit)),
-            Self::Channel { channel_id, source } => {
-                source.start(ChannelActionHandle::new(*channel_id, bridge, permit))
-            }
+            Self::Channel {
+                channel_id, source, ..
+            } => source.start(ChannelActionHandle::new(*channel_id, bridge, permit)),
         }
     }
 
@@ -1214,6 +1300,21 @@ impl RegisteredSource {
         match self {
             Self::Provider { source, .. } => source.stop(),
             Self::Channel { source, .. } => source.stop(),
+        }
+    }
+
+    fn source_generation_channel(&self) -> Option<ChannelId> {
+        match self {
+            Self::Channel {
+                channel_id,
+                subscription_scope: ChannelSubscriptionScope::SourceGeneration,
+                ..
+            } => Some(*channel_id),
+            Self::Provider { .. }
+            | Self::Channel {
+                subscription_scope: ChannelSubscriptionScope::Persistent,
+                ..
+            } => None,
         }
     }
 }
@@ -1243,10 +1344,12 @@ impl RegisteredAdapter {
     where
         S: ChannelActionSource + 'static,
     {
+        let subscription_scope = source.subscription_scope();
         Self {
             source: RegisteredSource::Channel {
                 channel_id,
                 source: Box::new(source),
+                subscription_scope,
             },
             state: AdapterLifecycleState::Stopped,
             permit: None,
@@ -1302,6 +1405,10 @@ impl RegisteredAdapter {
         if let Some(permit) = self.permit.as_ref() {
             permit.revoke();
         }
+    }
+
+    fn source_generation_channel(&self) -> Option<ChannelId> {
+        self.source.source_generation_channel()
     }
 }
 

@@ -17,15 +17,16 @@ mod runtime;
 
 pub use bridge::{
     Bridge, ChannelActionError, ChannelDeliveryError, ChannelDeliveryKind, ChannelDeliveryResult,
-    EndpointRegistrationError, ProviderEventError, ProviderEventOutcome, ProviderEventReport,
-    ProviderHandoffKind, SubscribeOutcome, SubscriptionError, UnsubscribeOutcome,
+    ChannelDiscoverySnapshot, DiscoveredSession, EndpointRegistrationError, ProviderEventError,
+    ProviderEventOutcome, ProviderEventReport, ProviderHandoffKind, SubscribeOutcome,
+    SubscriptionError, UnsubscribeOutcome,
 };
 pub use port::{ChannelActionSink, ChannelPort, ProviderEventSink, ProviderPort};
 pub use runtime::{
     AdapterLifecycleError, AdapterLifecyclePhase, AdapterLifecycleResult, AdapterLifecycleState,
-    ChannelActionHandle, ChannelActionIngressError, ChannelActionSource, ProviderEventHandle,
-    ProviderEventIngressError, ProviderEventSource, RuntimeAccessError, RuntimeEndpointId,
-    RuntimeHost, RuntimeHostState, RuntimeLifecycleError, RuntimeLifecycleOperation,
-    RuntimeLifecycleOutcome, RuntimeLifecycleReport, RuntimeRegistrationError,
-    RuntimeSubscriptionError,
+    ChannelActionHandle, ChannelActionIngressError, ChannelActionSource, ChannelSubscriptionScope,
+    ProviderEventHandle, ProviderEventIngressError, ProviderEventSource, RuntimeAccessError,
+    RuntimeEndpointId, RuntimeHost, RuntimeHostState, RuntimeLifecycleError,
+    RuntimeLifecycleOperation, RuntimeLifecycleOutcome, RuntimeLifecycleReport,
+    RuntimeRegistrationError, RuntimeSubscriptionError,
 };

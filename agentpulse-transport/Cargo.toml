@@ -1,0 +1,14 @@
+[package]
+name = "agentpulse-transport"
+description = "Bounded local transport primitives for AgentPulse"
+edition.workspace = true
+publish.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tungstenite.workspace = true
+
+[lints]
+workspace = true
