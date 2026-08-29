@@ -1,6 +1,6 @@
 [package]
 name = "agentpulse-bridge"
-description = "Runtime-neutral Provider and Channel ports for AgentPulse"
+description = "Runtime-neutral multi-endpoint Provider and Channel orchestration for AgentPulse"
 edition.workspace = true
 publish.workspace = true
 repository.workspace = true

@@ -1,6 +1,10 @@
-//! Minimal runtime-neutral Bridge orchestration.
+//! Runtime-neutral multi-endpoint Bridge orchestration.
 
-use std::{collections::BTreeMap, error::Error, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+};
 
 use agentpulse_core::{
     AgentCommand, AgentEvent, AgentEventPayload, ApplyOutcome, CapabilityRouteError,
@@ -9,19 +13,22 @@ use agentpulse_core::{
     SessionAggregateConfig, SessionId,
 };
 
-use crate::{ChannelActionSink, ChannelPort, ProviderEventSink, ProviderPort};
+use crate::{
+    ChannelActionSink, ChannelPort, ProviderEventSink, ProviderPort,
+    registry::{BoxAdapterError, RegisteredChannel, RegisteredProvider},
+};
 
-/// The result of accepting one Provider Event into the Bridge.
+/// The result of accepting one Provider Event into the Bridge state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ProviderEventOutcome {
-    /// The Event advanced the Session Aggregate and was accepted by the Channel.
+    /// The Event advanced the Session Aggregate.
     Applied,
     /// The Event was an exact retry of the current Aggregate cursor.
     AlreadyApplied,
 }
 
-/// Identifies the Channel handoff that rejected an applied Event.
+/// Identifies one Channel handoff phase.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ChannelDeliveryKind {
@@ -37,6 +44,133 @@ impl fmt::Display for ChannelDeliveryKind {
             Self::Event => formatter.write_str("event"),
             Self::Session => formatter.write_str("session view"),
         }
+    }
+}
+
+/// A failed Event or Session-view handoff to one Channel.
+#[derive(Debug)]
+pub struct ChannelDeliveryError {
+    channel_id: ChannelId,
+    delivery: ChannelDeliveryKind,
+    source: BoxAdapterError,
+}
+
+impl ChannelDeliveryError {
+    fn new(channel_id: ChannelId, delivery: ChannelDeliveryKind, source: BoxAdapterError) -> Self {
+        Self {
+            channel_id,
+            delivery,
+            source,
+        }
+    }
+
+    /// Returns the target Channel.
+    #[must_use]
+    pub const fn channel_id(&self) -> ChannelId {
+        self.channel_id
+    }
+
+    /// Returns the handoff phase that failed.
+    #[must_use]
+    pub const fn delivery(&self) -> ChannelDeliveryKind {
+        self.delivery
+    }
+}
+
+impl fmt::Display for ChannelDeliveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Channel {} rejected {} handoff: {}",
+            self.channel_id, self.delivery, self.source
+        )
+    }
+}
+
+impl Error for ChannelDeliveryError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+/// The result of delivering one applied Event to one subscribed Channel.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ChannelDeliveryResult {
+    /// Every handoff required for this Channel was accepted.
+    Delivered {
+        /// The target Channel.
+        channel_id: ChannelId,
+    },
+    /// One handoff for this Channel failed.
+    Failed(ChannelDeliveryError),
+}
+
+impl ChannelDeliveryResult {
+    /// Returns the target Channel.
+    #[must_use]
+    pub const fn channel_id(&self) -> ChannelId {
+        match self {
+            Self::Delivered { channel_id } => *channel_id,
+            Self::Failed(error) => error.channel_id(),
+        }
+    }
+
+    /// Returns whether every required handoff was accepted.
+    #[must_use]
+    pub const fn is_delivered(&self) -> bool {
+        matches!(self, Self::Delivered { .. })
+    }
+
+    /// Borrows the handoff error, when this target failed.
+    #[must_use]
+    pub const fn error(&self) -> Option<&ChannelDeliveryError> {
+        match self {
+            Self::Delivered { .. } => None,
+            Self::Failed(error) => Some(error),
+        }
+    }
+}
+
+/// The complete result of processing one Provider Event.
+#[derive(Debug)]
+pub struct ProviderEventReport {
+    outcome: ProviderEventOutcome,
+    deliveries: Vec<ChannelDeliveryResult>,
+}
+
+impl ProviderEventReport {
+    fn new(outcome: ProviderEventOutcome, deliveries: Vec<ChannelDeliveryResult>) -> Self {
+        Self {
+            outcome,
+            deliveries,
+        }
+    }
+
+    /// Returns whether the Event advanced state or was already applied.
+    #[must_use]
+    pub const fn outcome(&self) -> ProviderEventOutcome {
+        self.outcome
+    }
+
+    /// Borrows per-Channel results in stable Channel-ID order.
+    #[must_use]
+    pub fn deliveries(&self) -> &[ChannelDeliveryResult] {
+        &self.deliveries
+    }
+
+    /// Returns whether at least one subscribed Channel handoff failed.
+    #[must_use]
+    pub fn has_failures(&self) -> bool {
+        self.deliveries
+            .iter()
+            .any(|delivery| !delivery.is_delivered())
+    }
+
+    fn first_failure(&self) -> Option<&ChannelDeliveryError> {
+        self.deliveries
+            .iter()
+            .find_map(ChannelDeliveryResult::error)
     }
 }
 
@@ -59,84 +193,204 @@ impl fmt::Display for ProviderHandoffKind {
     }
 }
 
+/// An error raised while registering an endpoint with the Bridge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum EndpointRegistrationError {
+    /// A Provider with the same strongly typed ID is already registered.
+    ProviderAlreadyRegistered {
+        /// The duplicate Provider ID.
+        provider_id: ProviderId,
+    },
+    /// A Channel with the same strongly typed ID is already registered.
+    ChannelAlreadyRegistered {
+        /// The duplicate Channel ID.
+        channel_id: ChannelId,
+    },
+}
+
+impl fmt::Display for EndpointRegistrationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ProviderAlreadyRegistered { provider_id } => {
+                write!(formatter, "Provider {provider_id} is already registered")
+            }
+            Self::ChannelAlreadyRegistered { channel_id } => {
+                write!(formatter, "Channel {channel_id} is already registered")
+            }
+        }
+    }
+}
+
+impl Error for EndpointRegistrationError {}
+
+/// The result of subscribing one Channel to one existing Session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum SubscribeOutcome {
+    /// A new subscription became active.
+    Subscribed {
+        /// Whether the Channel first accepted the current Session view.
+        session_view_delivered: bool,
+    },
+    /// The exact subscription was already active; no view was redelivered.
+    AlreadySubscribed,
+}
+
+/// The result of cancelling one Session-to-Channel subscription.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum UnsubscribeOutcome {
+    /// The active subscription was removed.
+    Unsubscribed,
+    /// The requested subscription was not active.
+    NotSubscribed,
+}
+
+/// An error raised while changing a Session-to-Channel subscription.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SubscriptionError {
+    /// The requested Channel is not registered.
+    ChannelNotFound {
+        /// The unknown Channel.
+        channel_id: ChannelId,
+    },
+    /// The requested Session has not been started.
+    SessionNotFound {
+        /// The unknown Session.
+        session_id: SessionId,
+    },
+    /// The Channel rejected the initial current Session view.
+    InitialSessionHandoff(ChannelDeliveryError),
+}
+
+impl fmt::Display for SubscriptionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ChannelNotFound { channel_id } => {
+                write!(formatter, "Channel {channel_id} is not registered")
+            }
+            Self::SessionNotFound { session_id } => {
+                write!(
+                    formatter,
+                    "session {session_id} is not registered with the Bridge"
+                )
+            }
+            Self::InitialSessionHandoff(source) => {
+                write!(
+                    formatter,
+                    "initial subscription synchronization failed: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for SubscriptionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InitialSessionHandoff(source) => Some(source),
+            Self::ChannelNotFound { .. } | Self::SessionNotFound { .. } => None,
+        }
+    }
+}
+
 /// An error raised while processing a Provider Event through the Bridge.
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum ProviderEventError<E> {
-    /// The publishing adapter is not the Provider registered with this Bridge.
-    SourceProviderMismatch {
-        /// The registered Provider.
-        expected: ProviderId,
-        /// The Provider named by the publication.
-        actual: ProviderId,
+pub enum ProviderEventError {
+    /// The publishing Provider is not registered.
+    ProviderNotFound {
+        /// The unknown Provider.
+        provider_id: ProviderId,
     },
-
+    /// A subscribed Channel disappeared before route computation.
+    ChannelNotFound {
+        /// The unavailable Channel.
+        channel_id: ChannelId,
+    },
     /// An Event for an unknown Session was not a valid initial Event.
     SessionNotStarted {
         /// The unknown Session.
         session_id: SessionId,
     },
-
     /// Centralized endpoint or capability validation rejected the Event.
     CapabilityRoute(CapabilityRouteError),
-
     /// The Session Reducer rejected the Event.
     Reduce(ReduceError),
-
-    /// The Channel rejected an Event or Session-view handoff.
-    ChannelHandoff {
-        /// The selected Channel.
-        channel_id: ChannelId,
-        /// The handoff that failed.
-        delivery: ChannelDeliveryKind,
-        /// The adapter-defined handoff error.
-        source: E,
+    /// At least one Channel handoff failed after state was advanced.
+    ChannelHandoffs {
+        /// All attempted deliveries, including successful targets.
+        report: ProviderEventReport,
     },
 }
 
-impl<E: Error> fmt::Display for ProviderEventError<E> {
+impl ProviderEventError {
+    /// Borrows the complete fan-out report for a partial handoff failure.
+    #[must_use]
+    pub const fn report(&self) -> Option<&ProviderEventReport> {
+        match self {
+            Self::ChannelHandoffs { report } => Some(report),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ProviderEventError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::SourceProviderMismatch { expected, actual } => write!(
-                formatter,
-                "event source Provider mismatch: expected {expected}, got {actual}"
-            ),
+            Self::ProviderNotFound { provider_id } => {
+                write!(formatter, "Provider {provider_id} is not registered")
+            }
+            Self::ChannelNotFound { channel_id } => {
+                write!(
+                    formatter,
+                    "subscribed Channel {channel_id} is not registered"
+                )
+            }
             Self::SessionNotStarted { session_id } => write!(
                 formatter,
                 "session {session_id} has not been started by a sequence-one SessionStarted event"
             ),
             Self::CapabilityRoute(source) => source.fmt(formatter),
             Self::Reduce(source) => source.fmt(formatter),
-            Self::ChannelHandoff {
-                channel_id,
-                delivery,
-                source,
-            } => write!(
+            Self::ChannelHandoffs { report } => write!(
                 formatter,
-                "Channel {channel_id} rejected {delivery} handoff: {source}"
+                "{} of {} Channel handoffs failed",
+                report
+                    .deliveries()
+                    .iter()
+                    .filter(|delivery| !delivery.is_delivered())
+                    .count(),
+                report.deliveries().len()
             ),
         }
     }
 }
 
-impl<E: Error + 'static> Error for ProviderEventError<E> {
+impl Error for ProviderEventError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::CapabilityRoute(source) => Some(source),
             Self::Reduce(source) => Some(source),
-            Self::ChannelHandoff { source, .. } => Some(source),
-            Self::SourceProviderMismatch { .. } | Self::SessionNotStarted { .. } => None,
+            Self::ChannelHandoffs { report } => report
+                .first_failure()
+                .map(|source| source as &(dyn Error + 'static)),
+            Self::ProviderNotFound { .. }
+            | Self::ChannelNotFound { .. }
+            | Self::SessionNotStarted { .. } => None,
         }
     }
 }
 
-impl<E> From<CapabilityRouteError> for ProviderEventError<E> {
+impl From<CapabilityRouteError> for ProviderEventError {
     fn from(source: CapabilityRouteError) -> Self {
         Self::CapabilityRoute(source)
     }
 }
 
-impl<E> From<ReduceError> for ProviderEventError<E> {
+impl From<ReduceError> for ProviderEventError {
     fn from(source: ReduceError) -> Self {
         Self::Reduce(source)
     }
@@ -145,21 +399,29 @@ impl<E> From<ReduceError> for ProviderEventError<E> {
 /// An error raised while processing a Channel Action through the Bridge.
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum ChannelActionError<E> {
-    /// The submitting adapter is not the Channel registered with this Bridge.
-    SourceChannelMismatch {
-        /// The registered Channel.
-        expected: ChannelId,
-        /// The Channel named by the submission.
-        actual: ChannelId,
+pub enum ChannelActionError {
+    /// The submitting Channel is not registered.
+    ChannelNotFound {
+        /// The unknown Channel.
+        channel_id: ChannelId,
     },
-
     /// The Action targets a Session unknown to this Bridge.
     SessionNotFound {
         /// The unknown Session.
         session_id: SessionId,
     },
-
+    /// The submitting Channel is not subscribed to the target Session.
+    ChannelNotSubscribed {
+        /// The source Channel.
+        channel_id: ChannelId,
+        /// The target Session.
+        session_id: SessionId,
+    },
+    /// The Provider owning the target Session is not registered.
+    ProviderNotFound {
+        /// The unavailable Provider.
+        provider_id: ProviderId,
+    },
     /// An Interaction Response does not name a currently pending request.
     InteractionNotPending {
         /// The owning Session.
@@ -167,10 +429,8 @@ pub enum ChannelActionError<E> {
         /// The missing pending Interaction.
         interaction_id: InteractionId,
     },
-
     /// Centralized endpoint, correlation, or capability validation rejected the Action.
     CapabilityRoute(CapabilityRouteError),
-
     /// The Provider rejected a validated Action handoff.
     ProviderHandoff {
         /// The selected Provider.
@@ -178,22 +438,31 @@ pub enum ChannelActionError<E> {
         /// The handoff that failed.
         handoff: ProviderHandoffKind,
         /// The adapter-defined handoff error.
-        source: E,
+        source: Box<dyn Error + Send + Sync + 'static>,
     },
 }
 
-impl<E: Error> fmt::Display for ChannelActionError<E> {
+impl fmt::Display for ChannelActionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::SourceChannelMismatch { expected, actual } => write!(
-                formatter,
-                "action source Channel mismatch: expected {expected}, got {actual}"
-            ),
+            Self::ChannelNotFound { channel_id } => {
+                write!(formatter, "Channel {channel_id} is not registered")
+            }
             Self::SessionNotFound { session_id } => {
                 write!(
                     formatter,
                     "session {session_id} is not registered with the Bridge"
                 )
+            }
+            Self::ChannelNotSubscribed {
+                channel_id,
+                session_id,
+            } => write!(
+                formatter,
+                "Channel {channel_id} is not subscribed to session {session_id}"
+            ),
+            Self::ProviderNotFound { provider_id } => {
+                write!(formatter, "Provider {provider_id} is not registered")
             }
             Self::InteractionNotPending {
                 session_id,
@@ -215,78 +484,115 @@ impl<E: Error> fmt::Display for ChannelActionError<E> {
     }
 }
 
-impl<E: Error + 'static> Error for ChannelActionError<E> {
+impl Error for ChannelActionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::CapabilityRoute(source) => Some(source),
-            Self::ProviderHandoff { source, .. } => Some(source),
-            Self::SourceChannelMismatch { .. }
+            Self::ProviderHandoff { source, .. } => Some(source.as_ref()),
+            Self::ChannelNotFound { .. }
             | Self::SessionNotFound { .. }
+            | Self::ChannelNotSubscribed { .. }
+            | Self::ProviderNotFound { .. }
             | Self::InteractionNotPending { .. } => None,
         }
     }
 }
 
-impl<E> From<CapabilityRouteError> for ChannelActionError<E> {
+impl From<CapabilityRouteError> for ChannelActionError {
     fn from(source: CapabilityRouteError) -> Self {
         Self::CapabilityRoute(source)
     }
 }
 
-/// A synchronous, in-memory Provider-to-Channel orchestration loop.
+/// A synchronous, in-memory multi-endpoint orchestration service.
 ///
-/// One Bridge instance owns one Provider Port and one Channel Port while
-/// maintaining any number of Session Aggregates for that route. Descriptor
-/// snapshots and capabilities are fixed when the Bridge is constructed.
-pub struct Bridge<P, C> {
-    provider: P,
-    channel: C,
-    provider_descriptor: ProviderDescriptor,
-    channel_descriptor: ChannelDescriptor,
+/// A Bridge owns heterogeneous Provider and Channel Ports, snapshots their
+/// descriptors at explicit registration, and maintains any number of Session
+/// Aggregates. Channel delivery and reverse Actions require an active explicit
+/// Session-to-Channel subscription.
+pub struct Bridge {
+    providers: BTreeMap<ProviderId, RegisteredProvider>,
+    channels: BTreeMap<ChannelId, RegisteredChannel>,
     session_config: SessionAggregateConfig,
     sessions: BTreeMap<SessionId, SessionAggregate>,
+    subscriptions: BTreeMap<SessionId, BTreeSet<ChannelId>>,
 }
 
-impl<P, C> Bridge<P, C>
-where
-    P: ProviderPort,
-    C: ChannelPort,
-{
-    /// Registers one Provider and one Channel using default Aggregate settings.
+impl Bridge {
+    /// Creates an empty Bridge using default Aggregate settings.
     #[must_use]
-    pub fn new(provider: P, channel: C) -> Self {
-        Self::with_session_config(provider, channel, SessionAggregateConfig::default())
+    pub fn new() -> Self {
+        Self::with_session_config(SessionAggregateConfig::default())
     }
 
-    /// Registers one Provider and one Channel using explicit Aggregate settings.
+    /// Creates an empty Bridge using explicit Aggregate settings.
     #[must_use]
-    pub fn with_session_config(
-        provider: P,
-        channel: C,
-        session_config: SessionAggregateConfig,
-    ) -> Self {
-        let provider_descriptor = provider.descriptor().clone();
-        let channel_descriptor = channel.descriptor().clone();
+    pub fn with_session_config(session_config: SessionAggregateConfig) -> Self {
         Self {
-            provider,
-            channel,
-            provider_descriptor,
-            channel_descriptor,
+            providers: BTreeMap::new(),
+            channels: BTreeMap::new(),
             session_config,
             sessions: BTreeMap::new(),
+            subscriptions: BTreeMap::new(),
         }
     }
 
-    /// Borrows the registered Provider Descriptor snapshot.
-    #[must_use]
-    pub const fn provider_descriptor(&self) -> &ProviderDescriptor {
-        &self.provider_descriptor
+    /// Registers one Provider and snapshots its Descriptor.
+    pub fn register_provider<P>(&mut self, provider: P) -> Result<(), EndpointRegistrationError>
+    where
+        P: ProviderPort + 'static,
+    {
+        let descriptor = provider.descriptor().clone();
+        let provider_id = descriptor.id();
+        if self.providers.contains_key(&provider_id) {
+            return Err(EndpointRegistrationError::ProviderAlreadyRegistered { provider_id });
+        }
+        let _ = self
+            .providers
+            .insert(provider_id, RegisteredProvider::new(provider, descriptor));
+        Ok(())
     }
 
-    /// Borrows the registered Channel Descriptor snapshot.
+    /// Registers one Channel and snapshots its Descriptor.
+    pub fn register_channel<C>(&mut self, channel: C) -> Result<(), EndpointRegistrationError>
+    where
+        C: ChannelPort + 'static,
+    {
+        let descriptor = channel.descriptor().clone();
+        let channel_id = descriptor.id();
+        if self.channels.contains_key(&channel_id) {
+            return Err(EndpointRegistrationError::ChannelAlreadyRegistered { channel_id });
+        }
+        let _ = self
+            .channels
+            .insert(channel_id, RegisteredChannel::new(channel, descriptor));
+        Ok(())
+    }
+
+    /// Borrows a registered Provider Descriptor snapshot by strongly typed ID.
     #[must_use]
-    pub const fn channel_descriptor(&self) -> &ChannelDescriptor {
-        &self.channel_descriptor
+    pub fn provider_descriptor(&self, provider_id: ProviderId) -> Option<&ProviderDescriptor> {
+        self.providers
+            .get(&provider_id)
+            .map(RegisteredProvider::descriptor)
+    }
+
+    /// Iterates over Provider Descriptor snapshots in stable Provider-ID order.
+    pub fn provider_descriptors(&self) -> impl ExactSizeIterator<Item = &ProviderDescriptor> {
+        self.providers.values().map(RegisteredProvider::descriptor)
+    }
+
+    /// Borrows a registered Channel Descriptor snapshot by strongly typed ID.
+    #[must_use]
+    pub fn channel_descriptor(&self, channel_id: ChannelId) -> Option<&ChannelDescriptor> {
+        self.channels
+            .get(&channel_id)
+            .map(RegisteredChannel::descriptor)
+    }
+
+    /// Iterates over Channel Descriptor snapshots in stable Channel-ID order.
+    pub fn channel_descriptors(&self) -> impl ExactSizeIterator<Item = &ChannelDescriptor> {
+        self.channels.values().map(RegisteredChannel::descriptor)
     }
 
     /// Returns the Aggregate settings used for newly observed Sessions.
@@ -306,112 +612,238 @@ where
         self.sessions.values()
     }
 
-    /// Borrows the registered Provider Port.
+    /// Returns whether a Channel currently subscribes to a Session.
     #[must_use]
-    pub const fn provider(&self) -> &P {
-        &self.provider
+    pub fn is_subscribed(&self, channel_id: ChannelId, session_id: SessionId) -> bool {
+        self.subscriptions
+            .get(&session_id)
+            .is_some_and(|channels| channels.contains(&channel_id))
     }
 
-    /// Borrows the registered Channel Port.
-    #[must_use]
-    pub const fn channel(&self) -> &C {
-        &self.channel
+    /// Iterates over a Session's subscribers in stable Channel-ID order.
+    pub fn session_subscribers(
+        &self,
+        session_id: SessionId,
+    ) -> impl Iterator<Item = ChannelId> + '_ {
+        self.subscriptions
+            .get(&session_id)
+            .into_iter()
+            .flat_map(|channels| channels.iter().copied())
     }
 
-    /// Consumes the Bridge and returns its registered Ports.
-    #[must_use]
-    pub fn into_ports(self) -> (P, C) {
-        (self.provider, self.channel)
-    }
-
-    /// Processes one normalized Event from the registered Provider.
+    /// Subscribes a Channel to an existing Session.
     ///
-    /// Successful reduction is retained before Channel handoff. Therefore a
-    /// Channel error does not roll back the current Aggregate.
+    /// A Channel declaring `SESSION_VIEW` must first accept the current Session
+    /// view. If that initial handoff fails, the subscription is not activated.
+    pub fn subscribe(
+        &mut self,
+        channel_id: ChannelId,
+        session_id: SessionId,
+    ) -> Result<SubscribeOutcome, SubscriptionError> {
+        if !self.channels.contains_key(&channel_id) {
+            return Err(SubscriptionError::ChannelNotFound { channel_id });
+        }
+        let session = self
+            .sessions
+            .get(&session_id)
+            .ok_or(SubscriptionError::SessionNotFound { session_id })?
+            .session()
+            .clone();
+
+        if self.is_subscribed(channel_id, session_id) {
+            return Ok(SubscribeOutcome::AlreadySubscribed);
+        }
+
+        let channel = self
+            .channels
+            .get_mut(&channel_id)
+            .ok_or(SubscriptionError::ChannelNotFound { channel_id })?;
+        let session_view_delivered = channel
+            .descriptor()
+            .capabilities()
+            .contains(ChannelCapabilities::SESSION_VIEW);
+        if session_view_delivered {
+            channel.deliver_session(session).map_err(|source| {
+                SubscriptionError::InitialSessionHandoff(ChannelDeliveryError::new(
+                    channel_id,
+                    ChannelDeliveryKind::Session,
+                    source,
+                ))
+            })?;
+        }
+
+        let _ = self
+            .subscriptions
+            .entry(session_id)
+            .or_default()
+            .insert(channel_id);
+        Ok(SubscribeOutcome::Subscribed {
+            session_view_delivered,
+        })
+    }
+
+    /// Cancels a Channel's subscription to an existing Session.
+    pub fn unsubscribe(
+        &mut self,
+        channel_id: ChannelId,
+        session_id: SessionId,
+    ) -> Result<UnsubscribeOutcome, SubscriptionError> {
+        if !self.channels.contains_key(&channel_id) {
+            return Err(SubscriptionError::ChannelNotFound { channel_id });
+        }
+        if !self.sessions.contains_key(&session_id) {
+            return Err(SubscriptionError::SessionNotFound { session_id });
+        }
+
+        let removed = self
+            .subscriptions
+            .get_mut(&session_id)
+            .is_some_and(|channels| channels.remove(&channel_id));
+        let remove_empty_set = self
+            .subscriptions
+            .get(&session_id)
+            .is_some_and(BTreeSet::is_empty);
+        if remove_empty_set {
+            let _ = self.subscriptions.remove(&session_id);
+        }
+
+        Ok(if removed {
+            UnsubscribeOutcome::Unsubscribed
+        } else {
+            UnsubscribeOutcome::NotSubscribed
+        })
+    }
+
+    /// Processes one normalized Event from a registered Provider.
+    ///
+    /// All routes are computed before reduction. Successful reduction is
+    /// retained before Channel fan-out, and every subscribed target is
+    /// attempted even when another target rejects its handoff.
     pub fn handle_provider_event(
         &mut self,
         provider_id: ProviderId,
         event: AgentEvent,
-    ) -> Result<ProviderEventOutcome, ProviderEventError<C::Error>> {
-        if provider_id != self.provider_descriptor.id() {
-            return Err(ProviderEventError::SourceProviderMismatch {
-                expected: self.provider_descriptor.id(),
-                actual: provider_id,
-            });
-        }
-
+    ) -> Result<ProviderEventReport, ProviderEventError> {
+        let provider_descriptor = self
+            .providers
+            .get(&provider_id)
+            .ok_or(ProviderEventError::ProviderNotFound { provider_id })?
+            .descriptor()
+            .clone();
         let session_id = event.session_id();
-        let route = if let Some(aggregate) = self.sessions.get(&session_id) {
-            CapabilityRouter::channel_event_route(
-                &self.provider_descriptor,
-                &self.channel_descriptor,
-                aggregate.session(),
-                &event,
-            )?
+        let routing_session = if let Some(aggregate) = self.sessions.get(&session_id) {
+            aggregate.session().clone()
         } else {
             let AgentEventPayload::SessionStarted(session) = event.payload() else {
                 return Err(ProviderEventError::SessionNotStarted { session_id });
             };
-            CapabilityRouter::channel_event_route(
-                &self.provider_descriptor,
-                &self.channel_descriptor,
-                session,
-                &event,
-            )?
+            session.clone()
         };
+
+        CapabilityRouter::validate_provider_event(&provider_descriptor, &routing_session, &event)?;
+
+        let subscriber_ids: Vec<_> = self.session_subscribers(session_id).collect();
+        let mut routes = Vec::with_capacity(subscriber_ids.len());
+        for channel_id in subscriber_ids {
+            let channel_descriptor = self
+                .channels
+                .get(&channel_id)
+                .ok_or(ProviderEventError::ChannelNotFound { channel_id })?
+                .descriptor();
+            let route = CapabilityRouter::channel_event_route(
+                &provider_descriptor,
+                channel_descriptor,
+                &routing_session,
+                &event,
+            )?;
+            let deliver_session = channel_descriptor
+                .capabilities()
+                .contains(ChannelCapabilities::SESSION_VIEW)
+                && event_updates_session_view(&event);
+            routes.push((channel_id, route, deliver_session));
+        }
 
         let session_view = if let Some(aggregate) = self.sessions.get_mut(&session_id) {
             let outcome = aggregate.apply(event.clone())?;
             if matches!(outcome, ApplyOutcome::AlreadyApplied) {
-                return Ok(ProviderEventOutcome::AlreadyApplied);
+                return Ok(ProviderEventReport::new(
+                    ProviderEventOutcome::AlreadyApplied,
+                    Vec::new(),
+                ));
             }
-            session_view_for_event(&self.channel_descriptor, &event)
+            routes
+                .iter()
+                .any(|(_, _, deliver_session)| *deliver_session)
                 .then(|| aggregate.session().clone())
         } else {
             let aggregate = SessionAggregate::from_initial_event_with_config(
                 event.clone(),
                 self.session_config,
             )?;
-            let session_view = session_view_for_event(&self.channel_descriptor, &event)
+            let session_view = routes
+                .iter()
+                .any(|(_, _, deliver_session)| *deliver_session)
                 .then(|| aggregate.session().clone());
             let _ = self.sessions.insert(session_id, aggregate);
             session_view
         };
 
-        self.channel.deliver_event(event, route).map_err(|source| {
-            ProviderEventError::ChannelHandoff {
-                channel_id: self.channel_descriptor.id(),
-                delivery: ChannelDeliveryKind::Event,
-                source,
-            }
-        })?;
-
-        if let Some(session) = session_view {
-            self.channel.deliver_session(session).map_err(|source| {
-                ProviderEventError::ChannelHandoff {
-                    channel_id: self.channel_descriptor.id(),
-                    delivery: ChannelDeliveryKind::Session,
+        let mut deliveries = Vec::with_capacity(routes.len());
+        for (channel_id, route, deliver_session) in routes {
+            let Some(channel) = self.channels.get_mut(&channel_id) else {
+                return Err(ProviderEventError::ChannelNotFound { channel_id });
+            };
+            if let Err(source) = channel.deliver_event(event.clone(), route) {
+                deliveries.push(ChannelDeliveryResult::Failed(ChannelDeliveryError::new(
+                    channel_id,
+                    ChannelDeliveryKind::Event,
                     source,
-                }
-            })?;
+                )));
+                continue;
+            }
+
+            if deliver_session
+                && let Some(session) = session_view.as_ref()
+                && let Err(source) = channel.deliver_session(session.clone())
+            {
+                deliveries.push(ChannelDeliveryResult::Failed(ChannelDeliveryError::new(
+                    channel_id,
+                    ChannelDeliveryKind::Session,
+                    source,
+                )));
+                continue;
+            }
+            deliveries.push(ChannelDeliveryResult::Delivered { channel_id });
         }
 
-        Ok(ProviderEventOutcome::Applied)
+        let report = ProviderEventReport::new(ProviderEventOutcome::Applied, deliveries);
+        if report.has_failures() {
+            Err(ProviderEventError::ChannelHandoffs { report })
+        } else {
+            Ok(report)
+        }
     }
 
-    /// Validates and hands one Interaction Response to the registered Provider.
+    /// Validates and hands one Interaction Response to its Session's Provider.
     pub fn handle_interaction_response(
         &mut self,
         channel_id: ChannelId,
         response: InteractionResponse,
-    ) -> Result<(), ChannelActionError<P::Error>> {
-        self.validate_source_channel(channel_id)?;
-
+    ) -> Result<(), ChannelActionError> {
+        let channel_descriptor = self.action_channel_descriptor(channel_id)?;
         let session_id = response.session_id();
+        self.validate_action_subscription(channel_id, session_id)?;
         let aggregate = self
             .sessions
             .get(&session_id)
             .ok_or(ChannelActionError::SessionNotFound { session_id })?;
+        let provider_id = aggregate.session().provider_id();
+        let provider_descriptor = self
+            .providers
+            .get(&provider_id)
+            .ok_or(ChannelActionError::ProviderNotFound { provider_id })?
+            .descriptor()
+            .clone();
         let interaction_id = response.request_id();
         let request = aggregate.pending_interaction(interaction_id).ok_or(
             ChannelActionError::InteractionNotPending {
@@ -421,72 +853,99 @@ where
         )?;
 
         CapabilityRouter::validate_interaction_response(
-            &self.provider_descriptor,
-            &self.channel_descriptor,
+            &provider_descriptor,
+            &channel_descriptor,
             aggregate.session(),
             request,
             &response,
         )?;
 
-        self.provider
+        self.providers
+            .get_mut(&provider_id)
+            .ok_or(ChannelActionError::ProviderNotFound { provider_id })?
             .accept_interaction_response(response)
             .map_err(|source| ChannelActionError::ProviderHandoff {
-                provider_id: self.provider_descriptor.id(),
+                provider_id,
                 handoff: ProviderHandoffKind::InteractionResponse,
                 source,
             })
     }
 
-    /// Validates and hands one Agent Command to the registered Provider.
+    /// Validates and hands one Agent Command to its Session's Provider.
     pub fn handle_command(
         &mut self,
         channel_id: ChannelId,
         command: AgentCommand,
-    ) -> Result<(), ChannelActionError<P::Error>> {
-        self.validate_source_channel(channel_id)?;
-
+    ) -> Result<(), ChannelActionError> {
+        let channel_descriptor = self.action_channel_descriptor(channel_id)?;
         let session_id = command.session_id();
+        self.validate_action_subscription(channel_id, session_id)?;
         let aggregate = self
             .sessions
             .get(&session_id)
             .ok_or(ChannelActionError::SessionNotFound { session_id })?;
+        let provider_id = aggregate.session().provider_id();
+        let provider_descriptor = self
+            .providers
+            .get(&provider_id)
+            .ok_or(ChannelActionError::ProviderNotFound { provider_id })?
+            .descriptor()
+            .clone();
 
         CapabilityRouter::validate_command(
-            &self.provider_descriptor,
-            &self.channel_descriptor,
+            &provider_descriptor,
+            &channel_descriptor,
             aggregate.session(),
             &command,
         )?;
 
-        self.provider.accept_command(command).map_err(|source| {
-            ChannelActionError::ProviderHandoff {
-                provider_id: self.provider_descriptor.id(),
+        self.providers
+            .get_mut(&provider_id)
+            .ok_or(ChannelActionError::ProviderNotFound { provider_id })?
+            .accept_command(command)
+            .map_err(|source| ChannelActionError::ProviderHandoff {
+                provider_id,
                 handoff: ProviderHandoffKind::Command,
                 source,
-            }
-        })
+            })
     }
 
-    fn validate_source_channel(
+    fn action_channel_descriptor(
         &self,
         channel_id: ChannelId,
-    ) -> Result<(), ChannelActionError<P::Error>> {
-        if channel_id != self.channel_descriptor.id() {
-            return Err(ChannelActionError::SourceChannelMismatch {
-                expected: self.channel_descriptor.id(),
-                actual: channel_id,
+    ) -> Result<ChannelDescriptor, ChannelActionError> {
+        self.channels
+            .get(&channel_id)
+            .ok_or(ChannelActionError::ChannelNotFound { channel_id })
+            .map(|channel| channel.descriptor().clone())
+    }
+
+    fn validate_action_subscription(
+        &self,
+        channel_id: ChannelId,
+        session_id: SessionId,
+    ) -> Result<(), ChannelActionError> {
+        if !self.sessions.contains_key(&session_id) {
+            return Err(ChannelActionError::SessionNotFound { session_id });
+        }
+        if !self.is_subscribed(channel_id, session_id) {
+            return Err(ChannelActionError::ChannelNotSubscribed {
+                channel_id,
+                session_id,
             });
         }
         Ok(())
     }
 }
 
-impl<P, C> ProviderEventSink for Bridge<P, C>
-where
-    P: ProviderPort,
-    C: ChannelPort,
-{
-    type Error = ProviderEventError<C::Error>;
+impl Default for Bridge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProviderEventSink for Bridge {
+    type Error = ProviderEventError;
 
     fn publish_event(
         &mut self,
@@ -498,12 +957,8 @@ where
     }
 }
 
-impl<P, C> ChannelActionSink for Bridge<P, C>
-where
-    P: ProviderPort,
-    C: ChannelPort,
-{
-    type Error = ChannelActionError<P::Error>;
+impl ChannelActionSink for Bridge {
+    type Error = ChannelActionError;
 
     fn submit_interaction_response(
         &mut self,
@@ -522,15 +977,12 @@ where
     }
 }
 
-fn session_view_for_event(channel: &ChannelDescriptor, event: &AgentEvent) -> bool {
-    channel
-        .capabilities()
-        .contains(ChannelCapabilities::SESSION_VIEW)
-        && matches!(
-            event.payload(),
-            AgentEventPayload::SessionStarted(_)
-                | AgentEventPayload::StateChanged(_)
-                | AgentEventPayload::ConnectionChanged(_)
-                | AgentEventPayload::SessionEnded(_)
-        )
+fn event_updates_session_view(event: &AgentEvent) -> bool {
+    matches!(
+        event.payload(),
+        AgentEventPayload::SessionStarted(_)
+            | AgentEventPayload::StateChanged(_)
+            | AgentEventPayload::ConnectionChanged(_)
+            | AgentEventPayload::SessionEnded(_)
+    )
 }

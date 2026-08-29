@@ -30,8 +30,8 @@ pub trait ProviderPort: Send {
 
 /// Bridge-facing publication boundary used by a Provider adapter.
 ///
-/// The explicit Provider identifier lets the Bridge reject events emitted by
-/// an adapter other than the Provider selected for the Session.
+/// The explicit Provider identifier lets the Bridge resolve the registered
+/// endpoint and reject events for a Session owned by another Provider.
 pub trait ProviderEventSink: Send {
     /// The event handoff error.
     type Error: Error + Send + Sync + 'static;
@@ -68,8 +68,9 @@ pub trait ChannelPort: Send {
 
 /// Bridge-facing submission boundary used by a Channel adapter.
 ///
-/// The Bridge must revalidate every submitted action before forwarding it to
-/// a Provider, even when an earlier delivery was marked interactive.
+/// The Bridge must require an active Session subscription and revalidate every
+/// submitted action before forwarding it to the Session's owning Provider,
+/// even when an earlier delivery was marked interactive.
 pub trait ChannelActionSink: Send {
     /// The action handoff error.
     type Error: Error + Send + Sync + 'static;

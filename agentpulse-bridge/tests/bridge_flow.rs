@@ -1,10 +1,15 @@
-//! End-to-end contract tests for the minimal Bridge closed loop.
+//! End-to-end contracts for multi-endpoint Bridge orchestration.
 
-use std::{error::Error, fmt};
+use std::{
+    error::Error,
+    fmt,
+    sync::{Arc, Mutex, MutexGuard},
+};
 
 use agentpulse_bridge::{
-    Bridge, ChannelActionError, ChannelDeliveryKind, ChannelPort, ProviderEventError,
-    ProviderEventOutcome, ProviderHandoffKind, ProviderPort,
+    Bridge, ChannelActionError, ChannelDeliveryKind, ChannelDeliveryResult, ChannelPort,
+    EndpointRegistrationError, ProviderEventError, ProviderEventOutcome, ProviderHandoffKind,
+    ProviderPort, SubscribeOutcome, SubscriptionError, UnsubscribeOutcome,
 };
 use agentpulse_core::{
     AgentCommand, AgentCommandPayload, AgentEvent, AgentEventPayload, AgentMessage,
@@ -28,24 +33,28 @@ fn timestamp(value: i128) -> Result<Timestamp, DomainError> {
 
 fn provider_descriptor(
     provider_id: ProviderId,
+    kind: &str,
+    name: &str,
     capabilities: ProviderCapabilities,
 ) -> Result<ProviderDescriptor, DomainError> {
     Ok(ProviderDescriptor::new(
         provider_id,
-        ProviderKind::new("fake")?,
-        text("Fake Provider")?,
+        ProviderKind::new(kind)?,
+        text(name)?,
         capabilities,
     ))
 }
 
 fn channel_descriptor(
     channel_id: ChannelId,
+    kind: &str,
+    name: &str,
     capabilities: ChannelCapabilities,
 ) -> Result<ChannelDescriptor, DomainError> {
     Ok(ChannelDescriptor::new(
         channel_id,
-        ChannelKind::new("test")?,
-        text("Test Channel")?,
+        ChannelKind::new(kind)?,
+        text(name)?,
         capabilities,
     ))
 }
@@ -120,6 +129,19 @@ fn submit_prompt(
     ))
 }
 
+fn message_event(
+    session_id: SessionId,
+    sequence: u64,
+    message: &str,
+) -> Result<AgentEvent, DomainError> {
+    event(
+        session_id,
+        sequence,
+        100 + i128::from(sequence),
+        AgentEventPayload::Message(AgentMessage::new(AgentMessageLevel::Info, text(message)?)),
+    )
+}
+
 fn full_provider_capabilities() -> ProviderCapabilities {
     ProviderCapabilities::SESSION_STATE
         | ProviderCapabilities::USER_INPUT_REQUEST
@@ -135,25 +157,53 @@ fn full_channel_capabilities() -> ChannelCapabilities {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct HandoffRejected(&'static str);
+struct PrimaryRejected(&'static str);
 
-impl fmt::Display for HandoffRejected {
+impl fmt::Display for PrimaryRejected {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.0)
     }
 }
 
-impl Error for HandoffRejected {}
+impl Error for PrimaryRejected {}
 
-struct FakeProvider {
-    descriptor: ProviderDescriptor,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SecondaryRejected(&'static str);
+
+impl fmt::Display for SecondaryRejected {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl Error for SecondaryRejected {}
+
+#[derive(Default)]
+struct ProviderState {
     responses: Vec<InteractionResponse>,
     commands: Vec<AgentCommand>,
+    response_attempts: usize,
+    command_attempts: usize,
     reject_actions: bool,
 }
 
-impl ProviderPort for FakeProvider {
-    type Error = HandoffRejected;
+type ProviderStateHandle = Arc<Mutex<ProviderState>>;
+
+fn provider_state(
+    handle: &ProviderStateHandle,
+) -> Result<MutexGuard<'_, ProviderState>, PrimaryRejected> {
+    handle
+        .lock()
+        .map_err(|_| PrimaryRejected("Provider state lock poisoned"))
+}
+
+struct PrimaryProvider {
+    descriptor: ProviderDescriptor,
+    state: ProviderStateHandle,
+}
+
+impl ProviderPort for PrimaryProvider {
+    type Error = PrimaryRejected;
 
     fn descriptor(&self) -> &ProviderDescriptor {
         &self.descriptor
@@ -163,24 +213,70 @@ impl ProviderPort for FakeProvider {
         &mut self,
         response: InteractionResponse,
     ) -> Result<(), Self::Error> {
-        if self.reject_actions {
-            return Err(HandoffRejected("provider rejected action"));
+        let mut state = provider_state(&self.state)?;
+        state.response_attempts += 1;
+        if state.reject_actions {
+            return Err(PrimaryRejected("primary Provider rejected action"));
         }
-        self.responses.push(response);
+        state.responses.push(response);
         Ok(())
     }
 
     fn accept_command(&mut self, command: AgentCommand) -> Result<(), Self::Error> {
-        if self.reject_actions {
-            return Err(HandoffRejected("provider rejected action"));
+        let mut state = provider_state(&self.state)?;
+        state.command_attempts += 1;
+        if state.reject_actions {
+            return Err(PrimaryRejected("primary Provider rejected action"));
         }
-        self.commands.push(command);
+        state.commands.push(command);
         Ok(())
     }
 }
 
-struct TestChannel {
-    descriptor: ChannelDescriptor,
+struct SecondaryProvider {
+    descriptor: ProviderDescriptor,
+    state: ProviderStateHandle,
+}
+
+impl ProviderPort for SecondaryProvider {
+    type Error = SecondaryRejected;
+
+    fn descriptor(&self) -> &ProviderDescriptor {
+        &self.descriptor
+    }
+
+    fn accept_interaction_response(
+        &mut self,
+        response: InteractionResponse,
+    ) -> Result<(), Self::Error> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SecondaryRejected("Provider state lock poisoned"))?;
+        state.response_attempts += 1;
+        if state.reject_actions {
+            return Err(SecondaryRejected("secondary Provider rejected action"));
+        }
+        state.responses.push(response);
+        Ok(())
+    }
+
+    fn accept_command(&mut self, command: AgentCommand) -> Result<(), Self::Error> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SecondaryRejected("Provider state lock poisoned"))?;
+        state.command_attempts += 1;
+        if state.reject_actions {
+            return Err(SecondaryRejected("secondary Provider rejected action"));
+        }
+        state.commands.push(command);
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct ChannelState {
     events: Vec<(AgentEvent, ChannelEventRoute)>,
     sessions: Vec<AgentSession>,
     event_attempts: usize,
@@ -189,8 +285,23 @@ struct TestChannel {
     reject_session: bool,
 }
 
-impl ChannelPort for TestChannel {
-    type Error = HandoffRejected;
+type ChannelStateHandle = Arc<Mutex<ChannelState>>;
+
+fn channel_state(
+    handle: &ChannelStateHandle,
+) -> Result<MutexGuard<'_, ChannelState>, PrimaryRejected> {
+    handle
+        .lock()
+        .map_err(|_| PrimaryRejected("Channel state lock poisoned"))
+}
+
+struct PrimaryChannel {
+    descriptor: ChannelDescriptor,
+    state: ChannelStateHandle,
+}
+
+impl ChannelPort for PrimaryChannel {
+    type Error = PrimaryRejected;
 
     fn descriptor(&self) -> &ChannelDescriptor {
         &self.descriptor
@@ -201,204 +312,411 @@ impl ChannelPort for TestChannel {
         event: AgentEvent,
         route: ChannelEventRoute,
     ) -> Result<(), Self::Error> {
-        self.event_attempts += 1;
-        if self.reject_event {
-            return Err(HandoffRejected("channel rejected event"));
+        let mut state = channel_state(&self.state)?;
+        state.event_attempts += 1;
+        if state.reject_event {
+            return Err(PrimaryRejected("primary Channel rejected event"));
         }
-        self.events.push((event, route));
+        state.events.push((event, route));
         Ok(())
     }
 
     fn deliver_session(&mut self, session: AgentSession) -> Result<(), Self::Error> {
-        self.session_attempts += 1;
-        if self.reject_session {
-            return Err(HandoffRejected("channel rejected session"));
+        let mut state = channel_state(&self.state)?;
+        state.session_attempts += 1;
+        if state.reject_session {
+            return Err(PrimaryRejected("primary Channel rejected session"));
         }
-        self.sessions.push(session);
+        state.sessions.push(session);
         Ok(())
     }
 }
 
-fn bridge(
-    provider_id: ProviderId,
-    provider_capabilities: ProviderCapabilities,
-    channel_id: ChannelId,
-    channel_capabilities: ChannelCapabilities,
-) -> Result<Bridge<FakeProvider, TestChannel>, DomainError> {
-    bridge_with_rejections(
-        provider_id,
-        provider_capabilities,
-        channel_id,
-        channel_capabilities,
-        false,
-        false,
-        false,
-    )
+struct SecondaryChannel {
+    descriptor: ChannelDescriptor,
+    state: ChannelStateHandle,
 }
 
-fn bridge_with_rejections(
+impl ChannelPort for SecondaryChannel {
+    type Error = SecondaryRejected;
+
+    fn descriptor(&self) -> &ChannelDescriptor {
+        &self.descriptor
+    }
+
+    fn deliver_event(
+        &mut self,
+        event: AgentEvent,
+        route: ChannelEventRoute,
+    ) -> Result<(), Self::Error> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SecondaryRejected("Channel state lock poisoned"))?;
+        state.event_attempts += 1;
+        if state.reject_event {
+            return Err(SecondaryRejected("secondary Channel rejected event"));
+        }
+        state.events.push((event, route));
+        Ok(())
+    }
+
+    fn deliver_session(&mut self, session: AgentSession) -> Result<(), Self::Error> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SecondaryRejected("Channel state lock poisoned"))?;
+        state.session_attempts += 1;
+        if state.reject_session {
+            return Err(SecondaryRejected("secondary Channel rejected session"));
+        }
+        state.sessions.push(session);
+        Ok(())
+    }
+}
+
+fn primary_provider(
     provider_id: ProviderId,
-    provider_capabilities: ProviderCapabilities,
-    channel_id: ChannelId,
-    channel_capabilities: ChannelCapabilities,
-    reject_actions: bool,
-    reject_event: bool,
-    reject_session: bool,
-) -> Result<Bridge<FakeProvider, TestChannel>, DomainError> {
-    Ok(Bridge::new(
-        FakeProvider {
-            descriptor: provider_descriptor(provider_id, provider_capabilities)?,
-            responses: Vec::new(),
-            commands: Vec::new(),
-            reject_actions,
+    name: &str,
+    capabilities: ProviderCapabilities,
+) -> Result<(PrimaryProvider, ProviderStateHandle), DomainError> {
+    let state = Arc::new(Mutex::new(ProviderState::default()));
+    Ok((
+        PrimaryProvider {
+            descriptor: provider_descriptor(provider_id, "primary", name, capabilities)?,
+            state: Arc::clone(&state),
         },
-        TestChannel {
-            descriptor: channel_descriptor(channel_id, channel_capabilities)?,
-            events: Vec::new(),
-            sessions: Vec::new(),
-            event_attempts: 0,
-            session_attempts: 0,
-            reject_event,
-            reject_session,
-        },
+        state,
     ))
 }
 
-#[test]
-fn provider_events_reduce_and_deliver_current_session_views() -> TestResult {
-    let provider_id = ProviderId::new();
-    let channel_id = ChannelId::new();
-    let session_id = SessionId::new();
-    let start = initial_event(session(provider_id, session_id)?)?;
-    let state_changed = event(
-        session_id,
-        2,
-        110,
-        AgentEventPayload::StateChanged(AgentState::Running),
-    )?;
-    let message = event(
-        session_id,
-        3,
-        115,
-        AgentEventPayload::Message(AgentMessage::new(AgentMessageLevel::Info, text("Working")?)),
-    )?;
-    let mut bridge = bridge(
+fn secondary_provider(
+    provider_id: ProviderId,
+    name: &str,
+    capabilities: ProviderCapabilities,
+) -> Result<(SecondaryProvider, ProviderStateHandle), DomainError> {
+    let state = Arc::new(Mutex::new(ProviderState::default()));
+    Ok((
+        SecondaryProvider {
+            descriptor: provider_descriptor(provider_id, "secondary", name, capabilities)?,
+            state: Arc::clone(&state),
+        },
+        state,
+    ))
+}
+
+fn primary_channel(
+    channel_id: ChannelId,
+    name: &str,
+    capabilities: ChannelCapabilities,
+) -> Result<(PrimaryChannel, ChannelStateHandle), DomainError> {
+    let state = Arc::new(Mutex::new(ChannelState::default()));
+    Ok((
+        PrimaryChannel {
+            descriptor: channel_descriptor(channel_id, "primary", name, capabilities)?,
+            state: Arc::clone(&state),
+        },
+        state,
+    ))
+}
+
+fn secondary_channel(
+    channel_id: ChannelId,
+    name: &str,
+    capabilities: ChannelCapabilities,
+) -> Result<(SecondaryChannel, ChannelStateHandle), DomainError> {
+    let state = Arc::new(Mutex::new(ChannelState::default()));
+    Ok((
+        SecondaryChannel {
+            descriptor: channel_descriptor(channel_id, "secondary", name, capabilities)?,
+            state: Arc::clone(&state),
+        },
+        state,
+    ))
+}
+
+fn start_session(
+    bridge: &mut Bridge,
+    provider_id: ProviderId,
+    session_id: SessionId,
+) -> TestResult {
+    let report = bridge.handle_provider_event(
         provider_id,
-        full_provider_capabilities(),
-        channel_id,
-        full_channel_capabilities(),
+        initial_event(session(provider_id, session_id)?)?,
     )?;
+    assert_eq!(report.outcome(), ProviderEventOutcome::Applied);
+    assert!(report.deliveries().is_empty());
+    Ok(())
+}
+
+fn delivery_for(
+    deliveries: &[ChannelDeliveryResult],
+    channel_id: ChannelId,
+) -> Result<&ChannelDeliveryResult, PrimaryRejected> {
+    deliveries
+        .iter()
+        .find(|delivery| delivery.channel_id() == channel_id)
+        .ok_or(PrimaryRejected("missing Channel delivery result"))
+}
+
+#[test]
+fn heterogeneous_endpoints_register_with_stable_descriptor_lookup() -> TestResult {
+    let provider_a = ProviderId::new();
+    let provider_b = ProviderId::new();
+    let channel_a = ChannelId::new();
+    let channel_b = ChannelId::new();
+    let (primary, _) =
+        primary_provider(provider_a, "Primary Provider", full_provider_capabilities())?;
+    let (secondary, _) = secondary_provider(
+        provider_b,
+        "Secondary Provider",
+        full_provider_capabilities(),
+    )?;
+    let (primary_output, _) =
+        primary_channel(channel_a, "Primary Channel", full_channel_capabilities())?;
+    let (secondary_output, _) =
+        secondary_channel(channel_b, "Secondary Channel", full_channel_capabilities())?;
+    let mut bridge = Bridge::new();
+
+    bridge.register_provider(primary)?;
+    bridge.register_provider(secondary)?;
+    bridge.register_channel(primary_output)?;
+    bridge.register_channel(secondary_output)?;
+
+    let (duplicate_provider, _) = secondary_provider(
+        provider_a,
+        "Duplicate Provider",
+        full_provider_capabilities(),
+    )?;
+    assert!(matches!(
+        bridge.register_provider(duplicate_provider),
+        Err(EndpointRegistrationError::ProviderAlreadyRegistered { provider_id })
+            if provider_id == provider_a
+    ));
+    let (duplicate_channel, _) =
+        secondary_channel(channel_a, "Duplicate Channel", full_channel_capabilities())?;
+    assert!(matches!(
+        bridge.register_channel(duplicate_channel),
+        Err(EndpointRegistrationError::ChannelAlreadyRegistered { channel_id })
+            if channel_id == channel_a
+    ));
 
     assert_eq!(
-        bridge.handle_provider_event(provider_id, start)?,
-        ProviderEventOutcome::Applied
+        bridge
+            .provider_descriptor(provider_a)
+            .ok_or(PrimaryRejected("missing Provider Descriptor"))?
+            .display_name()
+            .as_str(),
+        "Primary Provider"
     );
     assert_eq!(
-        bridge.handle_provider_event(provider_id, state_changed)?,
-        ProviderEventOutcome::Applied
-    );
-    assert_eq!(
-        bridge.handle_provider_event(provider_id, message.clone())?,
-        ProviderEventOutcome::Applied
-    );
-    assert_eq!(
-        bridge.handle_provider_event(provider_id, message)?,
-        ProviderEventOutcome::AlreadyApplied
+        bridge
+            .channel_descriptor(channel_a)
+            .ok_or(PrimaryRejected("missing Channel Descriptor"))?
+            .display_name()
+            .as_str(),
+        "Primary Channel"
     );
 
-    let aggregate = bridge
-        .session_aggregate(session_id)
-        .ok_or(HandoffRejected("missing Session Aggregate"))?;
-    assert_eq!(aggregate.session().state(), AgentState::Running);
-    assert_eq!(aggregate.session().revision(), Revision::new(2)?);
-    assert_eq!(aggregate.last_sequence(), EventSequence::new(3)?);
-    assert_eq!(bridge.session_aggregates().len(), 1);
-    assert_eq!(bridge.channel().events.len(), 3);
-    assert_eq!(bridge.channel().sessions.len(), 2);
-    assert_eq!(bridge.channel().event_attempts, 3);
-    assert_eq!(bridge.channel().session_attempts, 2);
-    assert_eq!(bridge.channel().events[0].1, ChannelEventRoute::ObserveOnly);
+    let mut expected_providers = vec![provider_a, provider_b];
+    expected_providers.sort();
+    assert_eq!(
+        bridge
+            .provider_descriptors()
+            .map(ProviderDescriptor::id)
+            .collect::<Vec<_>>(),
+        expected_providers
+    );
+    let mut expected_channels = vec![channel_a, channel_b];
+    expected_channels.sort();
+    assert_eq!(
+        bridge
+            .channel_descriptors()
+            .map(ChannelDescriptor::id)
+            .collect::<Vec<_>>(),
+        expected_channels
+    );
     Ok(())
 }
 
 #[test]
-fn interaction_response_and_command_complete_the_action_loop() -> TestResult {
+fn subscriptions_sync_current_views_and_are_idempotent() -> TestResult {
     let provider_id = ProviderId::new();
-    let channel_id = ChannelId::new();
     let session_id = SessionId::new();
-    let interaction_id = InteractionId::new();
-    let request = text_request(session_id, interaction_id)?;
-    let response = text_response(session_id, channel_id, interaction_id)?;
-    let command = submit_prompt(session_id, channel_id)?;
-    let mut bridge = bridge(
-        provider_id,
-        full_provider_capabilities(),
-        channel_id,
-        full_channel_capabilities(),
+    let view_channel_id = ChannelId::new();
+    let event_channel_id = ChannelId::new();
+    let (provider, _) = primary_provider(provider_id, "Provider", full_provider_capabilities())?;
+    let (view_channel, view_state) =
+        primary_channel(view_channel_id, "View Channel", full_channel_capabilities())?;
+    let (event_channel, event_state) = secondary_channel(
+        event_channel_id,
+        "Event Channel",
+        ChannelCapabilities::TEXT_INPUT | ChannelCapabilities::REMOTE_COMMAND,
     )?;
-
-    let _ = bridge.handle_provider_event(
-        provider_id,
-        initial_event(session(provider_id, session_id)?)?,
-    )?;
-    let _ = bridge.handle_provider_event(
-        provider_id,
-        event(
-            session_id,
-            2,
-            120,
-            AgentEventPayload::InteractionRequested(request),
-        )?,
-    )?;
+    let mut bridge = Bridge::new();
+    bridge.register_provider(provider)?;
+    bridge.register_channel(view_channel)?;
+    bridge.register_channel(event_channel)?;
+    start_session(&mut bridge, provider_id, session_id)?;
 
     assert_eq!(
-        bridge.channel().events[1].1,
-        ChannelEventRoute::Interaction(InteractionRoute::Interactive)
+        bridge.subscribe(view_channel_id, session_id)?,
+        SubscribeOutcome::Subscribed {
+            session_view_delivered: true
+        }
     );
-    bridge.handle_interaction_response(channel_id, response.clone())?;
-    bridge.handle_command(channel_id, command.clone())?;
-    assert_eq!(bridge.provider().responses, vec![response.clone()]);
-    assert_eq!(bridge.provider().commands, vec![command]);
-    assert!(
-        bridge
-            .session_aggregate(session_id)
-            .is_some_and(|aggregate| aggregate.pending_interaction(interaction_id).is_some())
+    assert_eq!(
+        bridge.subscribe(event_channel_id, session_id)?,
+        SubscribeOutcome::Subscribed {
+            session_view_delivered: false
+        }
     );
+    assert_eq!(
+        bridge.subscribe(view_channel_id, session_id)?,
+        SubscribeOutcome::AlreadySubscribed
+    );
+    assert_eq!(channel_state(&view_state)?.sessions.len(), 1);
+    assert_eq!(channel_state(&event_state)?.session_attempts, 0);
 
-    let _ = bridge.handle_provider_event(
-        provider_id,
-        event(
-            session_id,
-            3,
-            130,
-            AgentEventPayload::InteractionResponded(response),
-        )?,
-    )?;
-    assert!(
+    let mut expected = vec![view_channel_id, event_channel_id];
+    expected.sort();
+    assert_eq!(
+        bridge.session_subscribers(session_id).collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        bridge.unsubscribe(event_channel_id, session_id)?,
+        UnsubscribeOutcome::Unsubscribed
+    );
+    assert_eq!(
+        bridge.unsubscribe(event_channel_id, session_id)?,
+        UnsubscribeOutcome::NotSubscribed
+    );
+    assert!(matches!(
+        bridge.subscribe(ChannelId::new(), session_id),
+        Err(SubscriptionError::ChannelNotFound { .. })
+    ));
+    assert!(matches!(
+        bridge.subscribe(view_channel_id, SessionId::new()),
+        Err(SubscriptionError::SessionNotFound { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn failed_initial_sync_does_not_activate_a_subscription() -> TestResult {
+    let provider_id = ProviderId::new();
+    let session_id = SessionId::new();
+    let channel_id = ChannelId::new();
+    let (provider, _) = primary_provider(provider_id, "Provider", full_provider_capabilities())?;
+    let (channel, channel_handle) =
+        primary_channel(channel_id, "Channel", full_channel_capabilities())?;
+    channel_state(&channel_handle)?.reject_session = true;
+    let mut bridge = Bridge::new();
+    bridge.register_provider(provider)?;
+    bridge.register_channel(channel)?;
+    start_session(&mut bridge, provider_id, session_id)?;
+
+    assert!(matches!(
+        bridge.subscribe(channel_id, session_id),
+        Err(SubscriptionError::InitialSessionHandoff(ref source))
+            if source.channel_id() == channel_id
+                && source.delivery() == ChannelDeliveryKind::Session
+    ));
+    assert!(!bridge.is_subscribed(channel_id, session_id));
+    assert_eq!(channel_state(&channel_handle)?.session_attempts, 1);
+
+    channel_state(&channel_handle)?.reject_session = false;
+    assert_eq!(
+        bridge.subscribe(channel_id, session_id)?,
+        SubscribeOutcome::Subscribed {
+            session_view_delivered: true
+        }
+    );
+    assert!(bridge.is_subscribed(channel_id, session_id));
+    Ok(())
+}
+
+#[test]
+fn provider_events_only_reach_subscribers_for_the_target_session() -> TestResult {
+    let provider_a = ProviderId::new();
+    let provider_b = ProviderId::new();
+    let session_a = SessionId::new();
+    let session_b = SessionId::new();
+    let channel_a = ChannelId::new();
+    let channel_b = ChannelId::new();
+    let (primary, _) = primary_provider(provider_a, "Primary", full_provider_capabilities())?;
+    let (secondary, _) = secondary_provider(provider_b, "Secondary", full_provider_capabilities())?;
+    let (primary_output, state_a) =
+        primary_channel(channel_a, "Primary Output", full_channel_capabilities())?;
+    let (secondary_output, state_b) =
+        secondary_channel(channel_b, "Secondary Output", full_channel_capabilities())?;
+    let mut bridge = Bridge::new();
+    bridge.register_provider(primary)?;
+    bridge.register_provider(secondary)?;
+    bridge.register_channel(primary_output)?;
+    bridge.register_channel(secondary_output)?;
+    start_session(&mut bridge, provider_a, session_a)?;
+    start_session(&mut bridge, provider_b, session_b)?;
+    let _ = bridge.subscribe(channel_a, session_a)?;
+    let _ = bridge.subscribe(channel_b, session_b)?;
+
+    let report_a = bridge.handle_provider_event(provider_a, message_event(session_a, 2, "A")?)?;
+    assert_eq!(report_a.deliveries().len(), 1);
+    assert_eq!(report_a.deliveries()[0].channel_id(), channel_a);
+    assert_eq!(channel_state(&state_a)?.events.len(), 1);
+    assert!(channel_state(&state_b)?.events.is_empty());
+
+    let report_b = bridge.handle_provider_event(provider_b, message_event(session_b, 2, "B")?)?;
+    assert_eq!(report_b.deliveries().len(), 1);
+    assert_eq!(report_b.deliveries()[0].channel_id(), channel_b);
+    assert_eq!(channel_state(&state_b)?.events.len(), 1);
+
+    assert_eq!(
+        bridge.unsubscribe(channel_a, session_a)?,
+        UnsubscribeOutcome::Unsubscribed
+    );
+    let report =
+        bridge.handle_provider_event(provider_a, message_event(session_a, 3, "A again")?)?;
+    assert!(report.deliveries().is_empty());
+    assert_eq!(channel_state(&state_a)?.event_attempts, 1);
+    assert_eq!(
         bridge
-            .session_aggregate(session_id)
-            .is_some_and(|aggregate| aggregate.pending_interaction(interaction_id).is_none())
+            .session_aggregate(session_a)
+            .ok_or(PrimaryRejected("missing Aggregate"))?
+            .last_sequence(),
+        EventSequence::new(3)?
     );
     Ok(())
 }
 
 #[test]
-fn read_only_interactions_and_invalid_sources_never_reach_the_provider() -> TestResult {
+fn fanout_computes_interaction_routes_per_channel() -> TestResult {
     let provider_id = ProviderId::new();
-    let channel_id = ChannelId::new();
     let session_id = SessionId::new();
+    let interactive_channel_id = ChannelId::new();
+    let read_only_channel_id = ChannelId::new();
     let interaction_id = InteractionId::new();
-    let mut bridge = bridge(
-        provider_id,
-        ProviderCapabilities::SESSION_STATE | ProviderCapabilities::USER_INPUT_REQUEST,
-        channel_id,
+    let (provider, _) = primary_provider(provider_id, "Provider", full_provider_capabilities())?;
+    let (interactive_channel, interactive_state) = primary_channel(
+        interactive_channel_id,
+        "Interactive",
         full_channel_capabilities(),
     )?;
-    let _ = bridge.handle_provider_event(
-        provider_id,
-        initial_event(session(provider_id, session_id)?)?,
+    let (read_only_channel, read_only_state) = secondary_channel(
+        read_only_channel_id,
+        "Read Only",
+        ChannelCapabilities::SESSION_VIEW,
     )?;
-    let _ = bridge.handle_provider_event(
+    let mut bridge = Bridge::new();
+    bridge.register_provider(provider)?;
+    bridge.register_channel(interactive_channel)?;
+    bridge.register_channel(read_only_channel)?;
+    start_session(&mut bridge, provider_id, session_id)?;
+    let _ = bridge.subscribe(interactive_channel_id, session_id)?;
+    let _ = bridge.subscribe(read_only_channel_id, session_id)?;
+
+    let report = bridge.handle_provider_event(
         provider_id,
         event(
             session_id,
@@ -407,80 +725,212 @@ fn read_only_interactions_and_invalid_sources_never_reach_the_provider() -> Test
             AgentEventPayload::InteractionRequested(text_request(session_id, interaction_id)?),
         )?,
     )?;
-
+    let mut expected = vec![interactive_channel_id, read_only_channel_id];
+    expected.sort();
     assert_eq!(
-        bridge.channel().events[1].1,
+        report
+            .deliveries()
+            .iter()
+            .map(ChannelDeliveryResult::channel_id)
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        channel_state(&interactive_state)?.events[0].1,
+        ChannelEventRoute::Interaction(InteractionRoute::Interactive)
+    );
+    assert_eq!(
+        channel_state(&read_only_state)?.events[0].1,
         ChannelEventRoute::Interaction(InteractionRoute::ReadOnly)
     );
-    let response = text_response(session_id, channel_id, interaction_id)?;
-    assert!(matches!(
-        bridge.handle_interaction_response(channel_id, response.clone()),
-        Err(ChannelActionError::CapabilityRoute(
-            CapabilityRouteError::MissingProviderCapabilities { .. }
-        ))
-    ));
-    assert!(matches!(
-        bridge.handle_interaction_response(ChannelId::new(), response),
-        Err(ChannelActionError::SourceChannelMismatch { .. })
-    ));
-    assert!(matches!(
-        bridge.handle_command(channel_id, submit_prompt(SessionId::new(), channel_id)?),
-        Err(ChannelActionError::SessionNotFound { .. })
-    ));
-    assert!(bridge.provider().responses.is_empty());
-    assert!(bridge.provider().commands.is_empty());
     Ok(())
 }
 
 #[test]
-fn missing_pending_interactions_are_rejected_before_capability_checks() -> TestResult {
+fn fanout_failures_are_isolated_reported_and_not_retried() -> TestResult {
     let provider_id = ProviderId::new();
-    let channel_id = ChannelId::new();
     let session_id = SessionId::new();
-    let mut bridge = bridge(
-        provider_id,
-        full_provider_capabilities(),
-        channel_id,
+    let successful_id = ChannelId::new();
+    let event_failure_id = ChannelId::new();
+    let session_failure_id = ChannelId::new();
+    let (provider, _) = primary_provider(provider_id, "Provider", full_provider_capabilities())?;
+    let (successful, successful_state) =
+        primary_channel(successful_id, "Successful", full_channel_capabilities())?;
+    let (event_failure, event_failure_state) = secondary_channel(
+        event_failure_id,
+        "Event Failure",
         full_channel_capabilities(),
     )?;
+    let (session_failure, session_failure_state) = secondary_channel(
+        session_failure_id,
+        "Session Failure",
+        full_channel_capabilities(),
+    )?;
+    let mut bridge = Bridge::new();
+    bridge.register_provider(provider)?;
+    bridge.register_channel(successful)?;
+    bridge.register_channel(event_failure)?;
+    bridge.register_channel(session_failure)?;
+    start_session(&mut bridge, provider_id, session_id)?;
+    let _ = bridge.subscribe(successful_id, session_id)?;
+    let _ = bridge.subscribe(event_failure_id, session_id)?;
+    let _ = bridge.subscribe(session_failure_id, session_id)?;
+    channel_state(&event_failure_state)?.reject_event = true;
+    channel_state(&session_failure_state)?.reject_session = true;
+
+    let state_changed = event(
+        session_id,
+        2,
+        110,
+        AgentEventPayload::StateChanged(AgentState::Running),
+    )?;
+    let error = bridge
+        .handle_provider_event(provider_id, state_changed.clone())
+        .err()
+        .ok_or(PrimaryRejected("expected partial fan-out failure"))?;
+    let report = error
+        .report()
+        .ok_or(PrimaryRejected("missing fan-out report"))?;
+    assert_eq!(report.outcome(), ProviderEventOutcome::Applied);
+    assert_eq!(report.deliveries().len(), 3);
+    assert!(delivery_for(report.deliveries(), successful_id)?.is_delivered());
+    let event_failure = delivery_for(report.deliveries(), event_failure_id)?
+        .error()
+        .ok_or(PrimaryRejected("missing Event failure"))?;
+    assert_eq!(event_failure.delivery(), ChannelDeliveryKind::Event);
+    assert!(
+        event_failure
+            .source()
+            .is_some_and(|source| source.downcast_ref::<SecondaryRejected>().is_some())
+    );
+    assert_eq!(
+        delivery_for(report.deliveries(), session_failure_id)?
+            .error()
+            .ok_or(PrimaryRejected("missing Session failure"))?
+            .delivery(),
+        ChannelDeliveryKind::Session
+    );
+    assert_eq!(channel_state(&successful_state)?.event_attempts, 1);
+    assert_eq!(channel_state(&event_failure_state)?.event_attempts, 1);
+    assert_eq!(channel_state(&event_failure_state)?.session_attempts, 1);
+    assert_eq!(channel_state(&session_failure_state)?.event_attempts, 1);
+    assert_eq!(channel_state(&session_failure_state)?.session_attempts, 2);
+    assert_eq!(
+        bridge
+            .session_aggregate(session_id)
+            .ok_or(PrimaryRejected("missing Aggregate"))?
+            .session()
+            .state(),
+        AgentState::Running
+    );
+
+    let retry = bridge.handle_provider_event(provider_id, state_changed)?;
+    assert_eq!(retry.outcome(), ProviderEventOutcome::AlreadyApplied);
+    assert!(retry.deliveries().is_empty());
+    assert_eq!(channel_state(&successful_state)?.event_attempts, 1);
+    assert_eq!(channel_state(&event_failure_state)?.event_attempts, 1);
+    assert_eq!(channel_state(&session_failure_state)?.event_attempts, 1);
+    Ok(())
+}
+
+#[test]
+fn actions_follow_the_session_owner_and_require_an_active_subscription() -> TestResult {
+    let provider_a = ProviderId::new();
+    let provider_b = ProviderId::new();
+    let session_a = SessionId::new();
+    let session_b = SessionId::new();
+    let channel_id = ChannelId::new();
+    let interaction_id = InteractionId::new();
+    let (primary, state_a) = primary_provider(provider_a, "Primary", full_provider_capabilities())?;
+    let (secondary, state_b) =
+        secondary_provider(provider_b, "Secondary", full_provider_capabilities())?;
+    let (channel, _) = primary_channel(channel_id, "Channel", full_channel_capabilities())?;
+    let mut bridge = Bridge::new();
+    bridge.register_provider(primary)?;
+    bridge.register_provider(secondary)?;
+    bridge.register_channel(channel)?;
+    start_session(&mut bridge, provider_a, session_a)?;
+    start_session(&mut bridge, provider_b, session_b)?;
+    let _ = bridge.subscribe(channel_id, session_a)?;
+    let _ = bridge.subscribe(channel_id, session_b)?;
     let _ = bridge.handle_provider_event(
-        provider_id,
-        initial_event(session(provider_id, session_id)?)?,
+        provider_b,
+        event(
+            session_b,
+            2,
+            120,
+            AgentEventPayload::InteractionRequested(text_request(session_b, interaction_id)?),
+        )?,
     )?;
 
+    let response = text_response(session_b, channel_id, interaction_id)?;
+    let command = submit_prompt(session_b, channel_id)?;
+    bridge.handle_interaction_response(channel_id, response.clone())?;
+    assert!(
+        bridge
+            .session_aggregate(session_b)
+            .is_some_and(|aggregate| aggregate.pending_interaction(interaction_id).is_some())
+    );
+    bridge.handle_command(channel_id, command.clone())?;
+    assert!(provider_state(&state_a)?.responses.is_empty());
+    assert!(provider_state(&state_a)?.commands.is_empty());
+    assert_eq!(provider_state(&state_b)?.responses, vec![response.clone()]);
+    assert_eq!(provider_state(&state_b)?.commands, vec![command]);
+
+    let _ = bridge.handle_provider_event(
+        provider_b,
+        event(
+            session_b,
+            3,
+            130,
+            AgentEventPayload::InteractionResponded(response),
+        )?,
+    )?;
+    assert!(
+        bridge
+            .session_aggregate(session_b)
+            .is_some_and(|aggregate| aggregate.pending_interaction(interaction_id).is_none())
+    );
+
+    let _ = bridge.unsubscribe(channel_id, session_b)?;
     assert!(matches!(
-        bridge.handle_interaction_response(
-            channel_id,
-            text_response(session_id, channel_id, InteractionId::new())?
-        ),
-        Err(ChannelActionError::InteractionNotPending { .. })
+        bridge.handle_command(channel_id, submit_prompt(session_b, channel_id)?),
+        Err(ChannelActionError::ChannelNotSubscribed {
+            channel_id: actual_channel,
+            session_id: actual_session
+        }) if actual_channel == channel_id && actual_session == session_b
     ));
-    assert!(bridge.provider().responses.is_empty());
+    assert_eq!(provider_state(&state_b)?.command_attempts, 1);
     Ok(())
 }
 
 #[test]
-fn invalid_provider_events_do_not_mutate_or_deliver() -> TestResult {
-    let provider_id = ProviderId::new();
+fn invalid_provider_events_do_not_mutate_or_cross_provider_boundaries() -> TestResult {
+    let provider_a = ProviderId::new();
+    let provider_b = ProviderId::new();
+    let session_b = SessionId::new();
     let channel_id = ChannelId::new();
-    let session_id = SessionId::new();
-    let mut bridge = bridge(
-        provider_id,
-        ProviderCapabilities::SESSION_STATE,
-        channel_id,
-        full_channel_capabilities(),
-    )?;
+    let (primary, _) =
+        primary_provider(provider_a, "Primary", ProviderCapabilities::SESSION_STATE)?;
+    let (secondary, _) =
+        secondary_provider(provider_b, "Secondary", ProviderCapabilities::SESSION_STATE)?;
+    let (channel, channel_handle) =
+        primary_channel(channel_id, "Channel", full_channel_capabilities())?;
+    let mut bridge = Bridge::new();
+    bridge.register_provider(primary)?;
+    bridge.register_provider(secondary)?;
+    bridge.register_channel(channel)?;
 
     assert!(matches!(
         bridge.handle_provider_event(
             ProviderId::new(),
-            initial_event(session(provider_id, session_id)?)?
+            initial_event(session(provider_a, SessionId::new())?)?
         ),
-        Err(ProviderEventError::SourceProviderMismatch { .. })
+        Err(ProviderEventError::ProviderNotFound { .. })
     ));
     assert!(matches!(
         bridge.handle_provider_event(
-            provider_id,
+            provider_a,
             event(
                 SessionId::new(),
                 1,
@@ -490,20 +940,31 @@ fn invalid_provider_events_do_not_mutate_or_deliver() -> TestResult {
         ),
         Err(ProviderEventError::SessionNotStarted { .. })
     ));
-    assert_eq!(bridge.session_aggregates().len(), 0);
-    assert_eq!(bridge.channel().event_attempts, 0);
+    start_session(&mut bridge, provider_b, session_b)?;
+    let _ = bridge.subscribe(channel_id, session_b)?;
 
-    let _ = bridge.handle_provider_event(
-        provider_id,
-        initial_event(session(provider_id, session_id)?)?,
-    )?;
+    assert!(matches!(
+        bridge.handle_provider_event(provider_a, message_event(session_b, 2, "crossed")?),
+        Err(ProviderEventError::CapabilityRoute(
+            CapabilityRouteError::ProviderMismatch { .. }
+        ))
+    ));
+    assert_eq!(
+        bridge
+            .session_aggregate(session_b)
+            .ok_or(PrimaryRejected("missing Aggregate"))?
+            .last_sequence(),
+        EventSequence::FIRST
+    );
+    assert!(channel_state(&channel_handle)?.events.is_empty());
+
     assert!(matches!(
         bridge.handle_provider_event(
-            provider_id,
+            provider_b,
             event(
-                session_id,
+                session_b,
                 2,
-                110,
+                120,
                 AgentEventPayload::ToolActivity(ToolActivity::Started {
                     call_id: ToolCallId::new(),
                     name: text("shell")?,
@@ -516,143 +977,101 @@ fn invalid_provider_events_do_not_mutate_or_deliver() -> TestResult {
         ))
     ));
     assert!(matches!(
-        bridge.handle_provider_event(
-            provider_id,
-            event(
-                session_id,
-                3,
-                120,
-                AgentEventPayload::Message(AgentMessage::new(
-                    AgentMessageLevel::Info,
-                    text("Skipped")?
-                ))
-            )?
-        ),
+        bridge.handle_provider_event(provider_b, message_event(session_b, 3, "gap")?),
         Err(ProviderEventError::Reduce(ReduceError::SequenceGap { .. }))
     ));
-
-    let aggregate = bridge
-        .session_aggregate(session_id)
-        .ok_or(HandoffRejected("missing Session Aggregate"))?;
-    assert_eq!(aggregate.last_sequence(), EventSequence::FIRST);
-    assert_eq!(bridge.channel().event_attempts, 1);
+    assert_eq!(
+        bridge
+            .session_aggregate(session_b)
+            .ok_or(PrimaryRejected("missing Aggregate"))?
+            .last_sequence(),
+        EventSequence::FIRST
+    );
+    assert!(channel_state(&channel_handle)?.events.is_empty());
     Ok(())
 }
 
 #[test]
-fn session_views_are_only_sent_to_channels_that_support_them() -> TestResult {
+fn action_validation_prevents_invalid_provider_handoffs() -> TestResult {
     let provider_id = ProviderId::new();
-    let channel_id = ChannelId::new();
     let session_id = SessionId::new();
-    let mut bridge = bridge(
+    let channel_id = ChannelId::new();
+    let interaction_id = InteractionId::new();
+    let (provider, provider_handle) = primary_provider(
         provider_id,
-        full_provider_capabilities(),
-        channel_id,
-        ChannelCapabilities::TEXT_INPUT | ChannelCapabilities::REMOTE_COMMAND,
+        "Provider",
+        ProviderCapabilities::SESSION_STATE | ProviderCapabilities::USER_INPUT_REQUEST,
     )?;
-
-    let _ = bridge.handle_provider_event(
-        provider_id,
-        initial_event(session(provider_id, session_id)?)?,
-    )?;
+    let (channel, channel_handle) =
+        primary_channel(channel_id, "Channel", full_channel_capabilities())?;
+    let mut bridge = Bridge::new();
+    bridge.register_provider(provider)?;
+    bridge.register_channel(channel)?;
+    start_session(&mut bridge, provider_id, session_id)?;
+    let _ = bridge.subscribe(channel_id, session_id)?;
     let _ = bridge.handle_provider_event(
         provider_id,
         event(
             session_id,
             2,
-            110,
-            AgentEventPayload::StateChanged(AgentState::Running),
+            120,
+            AgentEventPayload::InteractionRequested(text_request(session_id, interaction_id)?),
         )?,
     )?;
-
-    assert_eq!(bridge.channel().events.len(), 2);
-    assert_eq!(bridge.channel().session_attempts, 0);
-    assert!(bridge.channel().sessions.is_empty());
-    Ok(())
-}
-
-#[test]
-fn channel_handoff_errors_keep_reduced_state_and_report_the_phase() -> TestResult {
-    let provider_id = ProviderId::new();
-    let channel_id = ChannelId::new();
-    let event_failure_session_id = SessionId::new();
-    let mut event_failure_bridge = bridge_with_rejections(
-        provider_id,
-        full_provider_capabilities(),
-        channel_id,
-        full_channel_capabilities(),
-        false,
-        true,
-        false,
-    )?;
-    assert!(matches!(
-        event_failure_bridge.handle_provider_event(
-            provider_id,
-            initial_event(session(provider_id, event_failure_session_id)?)?
-        ),
-        Err(ProviderEventError::ChannelHandoff {
-            delivery: ChannelDeliveryKind::Event,
-            ..
-        })
-    ));
-    assert!(
-        event_failure_bridge
-            .session_aggregate(event_failure_session_id)
-            .is_some()
-    );
-    assert_eq!(event_failure_bridge.channel().event_attempts, 1);
-    assert_eq!(event_failure_bridge.channel().session_attempts, 0);
-
-    let session_id = SessionId::new();
-    let start = initial_event(session(provider_id, session_id)?)?;
-    let mut bridge = bridge_with_rejections(
-        provider_id,
-        full_provider_capabilities(),
-        channel_id,
-        full_channel_capabilities(),
-        false,
-        false,
-        true,
-    )?;
-
-    assert!(matches!(
-        bridge.handle_provider_event(provider_id, start.clone()),
-        Err(ProviderEventError::ChannelHandoff {
-            delivery: ChannelDeliveryKind::Session,
-            ..
-        })
-    ));
-    assert!(bridge.session_aggregate(session_id).is_some());
-    assert_eq!(bridge.channel().event_attempts, 1);
-    assert_eq!(bridge.channel().session_attempts, 1);
     assert_eq!(
-        bridge.handle_provider_event(provider_id, start)?,
-        ProviderEventOutcome::AlreadyApplied
+        channel_state(&channel_handle)?.events[0].1,
+        ChannelEventRoute::Interaction(InteractionRoute::ReadOnly)
     );
-    assert_eq!(bridge.channel().event_attempts, 1);
-    assert_eq!(bridge.channel().session_attempts, 1);
+
+    assert!(matches!(
+        bridge.handle_interaction_response(
+            channel_id,
+            text_response(session_id, channel_id, interaction_id)?
+        ),
+        Err(ChannelActionError::CapabilityRoute(
+            CapabilityRouteError::MissingProviderCapabilities { .. }
+        ))
+    ));
+    assert!(matches!(
+        bridge.handle_interaction_response(
+            channel_id,
+            text_response(session_id, channel_id, InteractionId::new())?
+        ),
+        Err(ChannelActionError::InteractionNotPending { .. })
+    ));
+    assert!(matches!(
+        bridge.handle_interaction_response(
+            channel_id,
+            text_response(session_id, ChannelId::new(), interaction_id)?
+        ),
+        Err(ChannelActionError::CapabilityRoute(
+            CapabilityRouteError::ChannelMismatch { .. }
+        ))
+    ));
+    assert!(matches!(
+        bridge.handle_command(ChannelId::new(), submit_prompt(session_id, channel_id)?),
+        Err(ChannelActionError::ChannelNotFound { .. })
+    ));
+    assert!(provider_state(&provider_handle)?.responses.is_empty());
+    assert!(provider_state(&provider_handle)?.commands.is_empty());
     Ok(())
 }
 
 #[test]
-fn provider_handoff_errors_remain_typed_and_pending_state_is_unchanged() -> TestResult {
+fn provider_handoff_errors_preserve_the_adapter_source_and_state() -> TestResult {
     let provider_id = ProviderId::new();
-    let channel_id = ChannelId::new();
     let session_id = SessionId::new();
+    let channel_id = ChannelId::new();
     let interaction_id = InteractionId::new();
-    let mut bridge = bridge_with_rejections(
-        provider_id,
-        full_provider_capabilities(),
-        channel_id,
-        full_channel_capabilities(),
-        true,
-        false,
-        false,
-    )?;
-    let _ = bridge.handle_provider_event(
-        provider_id,
-        initial_event(session(provider_id, session_id)?)?,
-    )?;
+    let (provider, provider_handle) =
+        primary_provider(provider_id, "Provider", full_provider_capabilities())?;
+    provider_state(&provider_handle)?.reject_actions = true;
+    let (channel, _) = primary_channel(channel_id, "Channel", full_channel_capabilities())?;
+    let mut bridge = Bridge::new();
+    bridge.register_provider(provider)?;
+    bridge.register_channel(channel)?;
+    start_session(&mut bridge, provider_id, session_id)?;
+    let _ = bridge.subscribe(channel_id, session_id)?;
     let _ = bridge.handle_provider_event(
         provider_id,
         event(
@@ -663,29 +1082,39 @@ fn provider_handoff_errors_remain_typed_and_pending_state_is_unchanged() -> Test
         )?,
     )?;
 
-    assert!(matches!(
-        bridge.handle_interaction_response(
-            channel_id,
-            text_response(session_id, channel_id, interaction_id)?
-        ),
+    match bridge.handle_interaction_response(
+        channel_id,
+        text_response(session_id, channel_id, interaction_id)?,
+    ) {
         Err(ChannelActionError::ProviderHandoff {
             handoff: ProviderHandoffKind::InteractionResponse,
+            source,
             ..
-        })
-    ));
-    assert!(matches!(
-        bridge.handle_command(channel_id, submit_prompt(session_id, channel_id)?),
+        }) => assert!(source.downcast_ref::<PrimaryRejected>().is_some()),
+        result => return Err(format!("unexpected response result: {result:?}").into()),
+    }
+    match bridge.handle_command(channel_id, submit_prompt(session_id, channel_id)?) {
         Err(ChannelActionError::ProviderHandoff {
             handoff: ProviderHandoffKind::Command,
+            source,
             ..
-        })
-    ));
+        }) => assert!(source.downcast_ref::<PrimaryRejected>().is_some()),
+        result => return Err(format!("unexpected command result: {result:?}").into()),
+    }
     assert!(
         bridge
             .session_aggregate(session_id)
             .is_some_and(|aggregate| aggregate.pending_interaction(interaction_id).is_some())
     );
-    assert!(bridge.provider().responses.is_empty());
-    assert!(bridge.provider().commands.is_empty());
+    assert_eq!(provider_state(&provider_handle)?.response_attempts, 1);
+    assert_eq!(provider_state(&provider_handle)?.command_attempts, 1);
+    assert_eq!(
+        bridge
+            .session_aggregate(session_id)
+            .ok_or(PrimaryRejected("missing Aggregate"))?
+            .session()
+            .revision(),
+        Revision::FIRST
+    );
     Ok(())
 }
