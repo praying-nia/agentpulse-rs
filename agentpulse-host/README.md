@@ -4,6 +4,12 @@ User-facing Linux/macOS Host for the local read-only AgentPulse product path.
 
 ## Setup
 
+Linux builds require the D-Bus development headers used by the BlueZ pairing backend. On Ubuntu:
+
+```bash
+sudo apt-get install libdbus-1-dev pkg-config
+```
+
 ```bash
 cargo install --path agentpulse-host
 agentpulse init --name "Studio Host"

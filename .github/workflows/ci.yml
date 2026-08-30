@@ -63,6 +63,12 @@ jobs:
             test -d "agentpulse-channels/${channel}"
           done
 
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes libdbus-1-dev pkg-config
+
       - name: Install stable Rust toolchain
         shell: bash
         run: |
