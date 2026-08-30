@@ -17,5 +17,10 @@ thiserror.workspace = true
 tungstenite.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+agentpulse-pairing = { path = "../../agentpulse-pairing" }
+if-addrs.workspace = true
+rustls.workspace = true
+
 [lints]
 workspace = true

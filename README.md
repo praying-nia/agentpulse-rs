@@ -40,6 +40,8 @@ Provider 与 Channel 不直接依赖。Core 只路由与展示方式无关的事
 | `agentpulse-relay` | Optional self-hosted synchronization and message-routing service / 可选的自托管同步与消息路由服务 |
 | `agentpulse-protocol` | Rust types and codecs implementing the canonical protocol / 协议规范的 Rust 类型与编解码实现 |
 | [`agentpulse-transport`](agentpulse-transport) | Bounded concrete transport primitives / 有界的具体传输原语 |
+| [`agentpulse-pairing`](agentpulse-pairing) | Host identity, one-shot pairing, and device credentials / Host 身份、一次性配对与设备凭证 |
+| [`agentpulse-host`](agentpulse-host) | User-facing local Host CLI / 面向用户的本地 Host CLI |
 | `agentpulse-providers` | Integrations for supported AI coding agents / 各类 AI Coding Agent 的接入实现 |
 | `agentpulse-channels` | Native, bot, and Webhook user-interaction outputs / Native、Bot 与 Webhook 用户交互出口 |
 
@@ -55,9 +57,9 @@ Initial Channel targets are Native, Feishu, QQ, and Webhook. The Native Channel 
 
 首批 Channel 目标为 Native、飞书、QQ 与 Webhook。Native Channel 实现 Rust Bridge 与独立维护的 Android、iOS、HarmonyOS App 之间的协议和传输，不会重新实现这些客户端。
 
-The first production Channel is [`agentpulse-channel-native`](agentpulse-channels/native). It serves one local client over a bounded loopback WebSocket, performs strict Hello/Discovery/Subscription control, establishes exact Session baseline cursors, and streams unchanged JSON v1 Session/Event envelopes. It is deliberately read-only and declares exactly notification, session-view, and real-time synchronization capabilities.
+The first production Channel is [`agentpulse-channel-native`](agentpulse-channels/native). It serves one client over bounded loopback WebSocket or authenticated private-LAN WSS, performs strict Hello/Discovery/Subscription control, establishes exact Session baseline cursors, and streams unchanged JSON v1 Session/Event envelopes. It is deliberately read-only and declares exactly notification, session-view, and real-time synchronization capabilities.
 
-首个正式 Channel 是 [`agentpulse-channel-native`](agentpulse-channels/native)。它通过有界 Loopback WebSocket 服务一个本地客户端，执行严格的 Hello/Discovery/Subscription 控制，建立精确 Session Baseline Cursor，并持续传输未经改写的 JSON v1 Session/Event Envelope。该版本明确保持只读，只声明通知、Session View 与实时同步能力。
+首个正式 Channel 是 [`agentpulse-channel-native`](agentpulse-channels/native)。它通过有界 Loopback WebSocket 或带认证私有 LAN WSS 服务一个客户端，执行严格的 Hello/Discovery/Subscription 控制，建立精确 Session Baseline Cursor，并持续传输未经改写的 JSON v1 Session/Event Envelope。该版本明确保持只读，只声明通知、Session View 与实时同步能力。
 
 ## Channel experience / Channel 体验
 
@@ -83,6 +85,6 @@ Every Provider and Channel declares its capabilities. A remote operation is expo
 
 ## Status / 状态
 
-The Rust workspace now contains a complete local read-only product path: strict domain and Native protocols, multi-endpoint Bridge and RuntimeHost lifecycle, the complete read-only Codex Provider, bounded loopback WebSocket transport, and the Native Channel with discovery, cursor-safe subscription, live delivery, disconnect cleanup, and explicit reconnect. A real native client UI remains the next product gap; Relay, persistence, and remote connectivity remain separate future milestones.
+The Rust workspace now powers a usable local read-only product path: the `agentpulse` Host CLI owns a stable private identity and CA, explicit Codex threads, authenticated private-LAN Native WSS, mDNS discovery, one-shot BLE/QR pairing, per-device revocation, and credential rotation. Session/Event data remains in memory. Relay, offline history, databases, and write-back remain separate future milestones.
 
-Rust workspace 现已形成完整的本地只读产品链路：严格领域与 Native 协议、Bridge 多端点编排与 RuntimeHost 生命周期、完整只读 Codex Provider、有界 Loopback WebSocket Transport，以及具备 Discovery、Cursor-safe Subscription、Live Delivery、断线清理和显式重连的 Native Channel。下一个产品缺口是真实原生客户端 UI；Relay、持久化与远程连接仍是独立的未来里程碑。
+Rust workspace 现已支撑可用的本地只读产品链路：`agentpulse` Host CLI 管理稳定私有身份与 CA、显式 Codex Thread、带认证私有 LAN Native WSS、mDNS 发现、一次性 BLE/QR 配对、逐设备撤销及凭证轮换。Session/Event 数据仍只保存在内存中；Relay、离线历史、数据库与写回属于后续独立里程碑。

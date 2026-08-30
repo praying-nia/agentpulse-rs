@@ -6,7 +6,11 @@ use std::{
 };
 
 use agentpulse_core::ChannelId;
-use agentpulse_transport::{DEFAULT_MAX_MESSAGE_BYTES, LoopbackWebSocketConfig};
+use agentpulse_transport::{
+    BearerTokenAuthorizer, DEFAULT_MAX_MESSAGE_BYTES, LoopbackWebSocketConfig, TlsServerIdentity,
+    TlsWebSocketConfig,
+};
+use std::sync::Arc;
 
 use crate::{NATIVE_WEBSOCKET_PATH, NATIVE_WEBSOCKET_SUBPROTOCOL, NativeChannelBuildError};
 
@@ -15,9 +19,20 @@ pub const DEFAULT_OUTBOUND_CAPACITY: usize = 256;
 
 /// Configuration for one local read-only Native Channel.
 #[derive(Clone, Debug)]
+pub(crate) enum NativeTransportConfig {
+    Loopback,
+    AuthenticatedLan {
+        identity: TlsServerIdentity,
+        authorizer: Arc<dyn BearerTokenAuthorizer>,
+    },
+}
+
+/// Configuration for one local or authenticated-LAN read-only Native Channel.
+#[derive(Clone, Debug)]
 pub struct NativeChannelConfig {
     pub(crate) channel_id: ChannelId,
     pub(crate) bind_address: SocketAddr,
+    pub(crate) transport: NativeTransportConfig,
     pub(crate) handshake_timeout: Duration,
     pub(crate) io_poll_interval: Duration,
     pub(crate) ping_interval: Duration,
@@ -34,6 +49,7 @@ impl NativeChannelConfig {
         Self {
             channel_id,
             bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            transport: NativeTransportConfig::Loopback,
             handshake_timeout: Duration::from_secs(5),
             io_poll_interval: Duration::from_millis(100),
             ping_interval: Duration::from_secs(15),
@@ -46,9 +62,29 @@ impl NativeChannelConfig {
 
     /// Overrides the loopback bind address; port zero requests an ephemeral port.
     #[must_use]
-    pub const fn with_bind_address(mut self, address: SocketAddr) -> Self {
+    pub fn with_bind_address(mut self, address: SocketAddr) -> Self {
         self.bind_address = address;
+        self.transport = NativeTransportConfig::Loopback;
         self
+    }
+
+    /// Creates a configuration for a bearer-authenticated TLS LAN endpoint.
+    pub fn authenticated_lan(
+        channel_id: ChannelId,
+        address: SocketAddr,
+        identity: TlsServerIdentity,
+        authorizer: Arc<dyn BearerTokenAuthorizer>,
+    ) -> Result<Self, NativeChannelBuildError> {
+        let config = Self {
+            bind_address: address,
+            transport: NativeTransportConfig::AuthenticatedLan {
+                identity,
+                authorizer,
+            },
+            ..Self::new(channel_id)
+        };
+        config.validate()?;
+        Ok(config)
     }
 
     /// Overrides the application and WebSocket handshake deadline.
@@ -125,7 +161,9 @@ impl NativeChannelConfig {
     }
 
     pub(crate) fn validate(&self) -> Result<(), NativeChannelBuildError> {
-        if !self.bind_address.ip().is_loopback() {
+        if matches!(self.transport, NativeTransportConfig::Loopback)
+            && !self.bind_address.ip().is_loopback()
+        {
             return Err(NativeChannelBuildError::NonLoopbackAddress {
                 address: self.bind_address,
             });
@@ -183,6 +221,43 @@ impl NativeChannelConfig {
         .map_err(|_| NativeChannelBuildError::InvalidSetting {
             field: "loopback WebSocket",
             reason: "transport configuration is invalid",
+        })
+    }
+
+    pub(crate) fn tls_transport_config(
+        &self,
+    ) -> Result<Option<TlsWebSocketConfig>, NativeChannelBuildError> {
+        let NativeTransportConfig::AuthenticatedLan {
+            identity,
+            authorizer,
+        } = &self.transport
+        else {
+            return Ok(None);
+        };
+        self.validate()?;
+        TlsWebSocketConfig::new(
+            self.bind_address,
+            NATIVE_WEBSOCKET_PATH,
+            NATIVE_WEBSOCKET_SUBPROTOCOL,
+            identity.clone(),
+        )
+        .map(|config| {
+            Some(
+                config
+                    .with_bearer_authorizer(Arc::clone(authorizer))
+                    .with_handshake_timeout(self.handshake_timeout)
+                    .with_io_poll_interval(self.io_poll_interval)
+                    .with_max_message_bytes(self.max_frame_bytes),
+            )
+        })
+        .map_err(|error| match error {
+            agentpulse_transport::LoopbackWebSocketError::NonPrivateAddress { address } => {
+                NativeChannelBuildError::NonPrivateLanAddress { address }
+            }
+            _ => NativeChannelBuildError::InvalidSetting {
+                field: "TLS LAN WebSocket",
+                reason: "transport configuration is invalid",
+            },
         })
     }
 }

@@ -1,0 +1,15 @@
+{
+  "pairing_version": 1,
+  "message": {
+    "type": "pairing_succeeded",
+    "host_id": "0198f142-5a00-7000-8000-000000000002",
+    "host_name": "Studio Host",
+    "ca_certificate_der": "base64-ca",
+    "server_name": "0198f142-5a00-7000-8000-000000000002.agentpulse.local",
+    "native_address": "192.168.50.4",
+    "native_port": 49320,
+    "access_token": "device-secret",
+    "native_transport_version": 1,
+    "domain_protocol_versions": [1]
+  }
+}

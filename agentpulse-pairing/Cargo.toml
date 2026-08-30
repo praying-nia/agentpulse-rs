@@ -1,0 +1,28 @@
+[package]
+name = "agentpulse-pairing"
+description = "Secure local pairing and credential lifecycle for AgentPulse"
+edition.workspace = true
+publish.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[dependencies]
+agentpulse-transport = { path = "../agentpulse-transport" }
+base64.workspace = true
+fs2.workspace = true
+qrcode.workspace = true
+rand.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tungstenite.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

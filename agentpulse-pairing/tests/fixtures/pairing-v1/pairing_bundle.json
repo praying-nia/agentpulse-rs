@@ -1,0 +1,12 @@
+{
+  "pairing_version": 1,
+  "pairing_id": "0198f142-5a00-7000-8000-000000000001",
+  "host_id": "0198f142-5a00-7000-8000-000000000002",
+  "host_name": "Studio Host",
+  "server_name": "0198f142-5a00-7000-8000-000000000002.agentpulse.local",
+  "address": "192.168.50.4",
+  "port": 49321,
+  "leaf_sha256": "abababababababababababababababababababababababababababababababab",
+  "bootstrap_token": "bootstrap-secret",
+  "expires_at_unix_seconds": 4102444800
+}

@@ -1,0 +1,8 @@
+{
+  "pairing_version": 1,
+  "message": {
+    "type": "pairing_pending",
+    "client_id": "0198f142-5a00-7000-8000-000000000003",
+    "display_name": "Fixture Android Client"
+  }
+}

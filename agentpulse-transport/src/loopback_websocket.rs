@@ -408,9 +408,30 @@ pub enum LoopbackWebSocketError {
         /// A bounded protocol diagnostic.
         message: String,
     },
+    /// TLS identity material was missing or invalid.
+    #[error("invalid TLS server identity: {message}")]
+    TlsIdentity {
+        /// A bounded identity diagnostic.
+        message: String,
+    },
+    /// The TLS handshake or encrypted stream failed.
+    #[error("TLS connection failed: {message}")]
+    Tls {
+        /// A bounded TLS diagnostic.
+        message: String,
+    },
+    /// A LAN listener was configured with a non-private address.
+    #[error("address {address} is not a private or link-local LAN address")]
+    NonPrivateAddress {
+        /// The rejected bind address.
+        address: SocketAddr,
+    },
 }
 
-fn configure_stream(stream: &TcpStream, timeout: Duration) -> Result<(), LoopbackWebSocketError> {
+pub(crate) fn configure_stream(
+    stream: &TcpStream,
+    timeout: Duration,
+) -> Result<(), LoopbackWebSocketError> {
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|source| LoopbackWebSocketError::Io {
@@ -455,13 +476,16 @@ fn validate_request(
     Ok(response)
 }
 
-fn rejection(status: StatusCode, message: &str) -> ErrorResponse {
+pub(crate) fn rejection(status: StatusCode, message: &str) -> ErrorResponse {
     let mut response = ErrorResponse::new(Some(message.to_owned()));
     *response.status_mut() = status;
     response
 }
 
-fn validate_outgoing_size(actual: usize, maximum: usize) -> Result<(), LoopbackWebSocketError> {
+pub(crate) fn validate_outgoing_size(
+    actual: usize,
+    maximum: usize,
+) -> Result<(), LoopbackWebSocketError> {
     if actual > maximum {
         Err(LoopbackWebSocketError::MessageTooLarge { actual, maximum })
     } else {
@@ -475,7 +499,7 @@ fn map_websocket_error(
     move |error| map_websocket_error_value(operation, error)
 }
 
-fn map_websocket_error_value(
+pub(crate) fn map_websocket_error_value(
     operation: &'static str,
     error: tungstenite::Error,
 ) -> LoopbackWebSocketError {
@@ -485,7 +509,7 @@ fn map_websocket_error_value(
     }
 }
 
-fn truncate_close_reason(mut reason: String) -> String {
+pub(crate) fn truncate_close_reason(mut reason: String) -> String {
     const MAX_REASON_BYTES: usize = 123;
     if reason.len() <= MAX_REASON_BYTES {
         return reason;

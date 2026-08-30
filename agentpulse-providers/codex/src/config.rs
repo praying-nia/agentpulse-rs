@@ -71,7 +71,7 @@ impl CodexProviderConfig {
             });
         }
 
-        let runtime_directory = runtime_root.join(format!("agentpulse-codex-{provider_id}"));
+        let runtime_directory = runtime_root.join(runtime_directory_key(provider_id));
         let socket_path = runtime_directory.join(SOCKET_FILE_NAME);
         let socket_text =
             socket_path
@@ -164,6 +164,26 @@ impl CodexProviderConfig {
     }
 }
 
+fn runtime_directory_key(provider_id: ProviderId) -> String {
+    let bytes = provider_id.as_uuid().as_bytes();
+    // UUIDv7 reserves the first 48 bits for time and fixes the version/variant
+    // bits. Encoding only rand_a and rand_b retains all 74 random bits while
+    // keeping the Unix socket path stable and substantially shorter.
+    format!(
+        "{:01x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[6] & 0x0f,
+        bytes[7],
+        bytes[8] & 0x3f,
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
+    )
+}
+
 fn absolute_path(path: PathBuf) -> Result<PathBuf, CodexProviderBuildError> {
     if path.is_absolute() {
         Ok(path)
@@ -173,5 +193,55 @@ fn absolute_path(path: PathBuf) -> Result<PathBuf, CodexProviderBuildError> {
             .map_err(|error| CodexProviderBuildError::CurrentDirectory {
                 message: error.to_string(),
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{error::Error, str::FromStr};
+
+    use super::*;
+
+    const PROVIDER_ID: &str = "0198f1b7-7212-7a34-9678-90abcdef1234";
+    const THREAD_ID: &str = "01a04932-b445-77f1-85aa-9e8304f16c71";
+
+    #[test]
+    fn normal_desktop_host_path_uses_stable_short_random_key() -> Result<(), Box<dyn Error>> {
+        let provider_id = ProviderId::from_str(PROVIDER_ID)?;
+        let runtime_root = "/home/desktop-user/.config/agentpulse/runtime/codex";
+
+        let first = CodexProviderConfig::new(provider_id, runtime_root, [THREAD_ID])?;
+        let second = CodexProviderConfig::new(provider_id, runtime_root, [THREAD_ID])?;
+
+        assert_eq!(
+            first
+                .runtime_directory
+                .file_name()
+                .and_then(|key| key.to_str()),
+            Some("a34167890abcdef1234")
+        );
+        assert_eq!(first.runtime_directory, second.runtime_directory);
+        assert_eq!(first.socket_path, second.socket_path);
+        assert!(first.socket_path.as_os_str().len() <= PORTABLE_UNIX_SOCKET_PATH_MAX);
+        Ok(())
+    }
+
+    #[test]
+    fn genuinely_long_runtime_root_still_rejects_socket_path() -> Result<(), Box<dyn Error>> {
+        let provider_id = ProviderId::from_str(PROVIDER_ID)?;
+        let runtime_root = PathBuf::from(format!("/{}", "x".repeat(80)));
+
+        let Err(error) = CodexProviderConfig::new(provider_id, runtime_root, [THREAD_ID]) else {
+            return Err("a genuinely long socket path must be rejected".into());
+        };
+
+        assert!(matches!(
+            error,
+            CodexProviderBuildError::SocketPathTooLong {
+                length,
+                maximum,
+            } if maximum == PORTABLE_UNIX_SOCKET_PATH_MAX && length > maximum
+        ));
+        Ok(())
     }
 }

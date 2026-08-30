@@ -17,7 +17,10 @@ use agentpulse_bridge::{
 };
 use agentpulse_core::{ChannelDescriptor, SessionId};
 use agentpulse_protocol::{ProtocolMessage, V1_PROTOCOL_VERSION};
-use agentpulse_transport::{LoopbackWebSocket, LoopbackWebSocketListener, TransportRead};
+use agentpulse_transport::{
+    LoopbackWebSocket, LoopbackWebSocketError, LoopbackWebSocketListener, TlsWebSocket,
+    TlsWebSocketListener, TransportRead,
+};
 use tungstenite::protocol::frame::coding::CloseCode;
 use uuid::Uuid;
 
@@ -104,7 +107,13 @@ impl ChannelActionSource for NativeChannelSource {
         if self.worker.is_some() {
             return Err(NativeChannelSourceError::AlreadyRunning);
         }
-        let listener = LoopbackWebSocketListener::bind(self.config.transport_config()?)?;
+        let listener = if let Some(config) = self.config.tls_transport_config()? {
+            NativeListener::Tls(TlsWebSocketListener::bind(config)?)
+        } else {
+            NativeListener::Loopback(LoopbackWebSocketListener::bind(
+                self.config.transport_config()?,
+            )?)
+        };
         let local_address = listener.local_address();
         {
             let mut status = lock_status(&self.status);
@@ -168,15 +177,94 @@ impl Drop for NativeChannelSource {
 }
 
 struct Connection {
-    socket: LoopbackWebSocket,
+    socket: NativeWebSocket,
     handshaken: bool,
     accepted_at: Instant,
     last_activity: Instant,
     last_ping: Instant,
 }
 
+enum NativeListener {
+    Loopback(LoopbackWebSocketListener),
+    Tls(TlsWebSocketListener),
+}
+
+impl NativeListener {
+    fn local_address(&self) -> std::net::SocketAddr {
+        match self {
+            Self::Loopback(listener) => listener.local_address(),
+            Self::Tls(listener) => listener.local_address(),
+        }
+    }
+
+    fn try_accept(&self) -> Result<Option<NativeWebSocket>, LoopbackWebSocketError> {
+        match self {
+            Self::Loopback(listener) => listener
+                .try_accept()
+                .map(|socket| socket.map(|socket| NativeWebSocket::Loopback(Box::new(socket)))),
+            Self::Tls(listener) => listener
+                .try_accept()
+                .map(|socket| socket.map(|socket| NativeWebSocket::Tls(Box::new(socket)))),
+        }
+    }
+}
+
+enum NativeWebSocket {
+    Loopback(Box<LoopbackWebSocket>),
+    Tls(Box<TlsWebSocket>),
+}
+
+impl NativeWebSocket {
+    fn authenticated_client_id(&self) -> Option<&str> {
+        match self {
+            Self::Loopback(_) => None,
+            Self::Tls(socket) => socket.authenticated_client_id(),
+        }
+    }
+
+    fn remains_authorized(&self) -> bool {
+        match self {
+            Self::Loopback(_) => true,
+            Self::Tls(socket) => socket.remains_authorized(),
+        }
+    }
+
+    fn read(&mut self) -> Result<TransportRead, LoopbackWebSocketError> {
+        match self {
+            Self::Loopback(socket) => socket.read(),
+            Self::Tls(socket) => socket.read(),
+        }
+    }
+
+    fn send_text(&mut self, text: String) -> Result<(), LoopbackWebSocketError> {
+        match self {
+            Self::Loopback(socket) => socket.send_text(text),
+            Self::Tls(socket) => socket.send_text(text),
+        }
+    }
+
+    fn send_ping(&mut self) -> Result<(), LoopbackWebSocketError> {
+        match self {
+            Self::Loopback(socket) => socket.send_ping(),
+            Self::Tls(socket) => socket.send_ping(),
+        }
+    }
+
+    fn close(
+        &mut self,
+        code: CloseCode,
+        reason: impl Into<String>,
+    ) -> Result<(), LoopbackWebSocketError> {
+        let reason = reason.into();
+        match self {
+            Self::Loopback(socket) => socket.close(code, reason),
+            Self::Tls(socket) => socket.close(code, reason),
+        }
+    }
+}
+
 fn run_worker(
-    listener: LoopbackWebSocketListener,
+    listener: NativeListener,
     actions: ChannelActionHandle,
     config: NativeChannelConfig,
     descriptor: ChannelDescriptor,
@@ -236,6 +324,15 @@ fn run_worker(
             thread::sleep(config.io_poll_interval);
             continue;
         };
+
+        if !active.socket.remains_authorized() {
+            let diagnostic = "Native device credential was revoked".to_owned();
+            let _ = active.socket.close(CloseCode::Policy, &diagnostic);
+            record_error(&status, diagnostic);
+            disconnect(&actions, &state, &status);
+            connection = None;
+            continue;
+        }
 
         if let Some(reason) = lock_delivery(&state).abort_reason.clone() {
             record_error(&status, reason.clone());
@@ -319,10 +416,19 @@ fn run_worker(
                         continue;
                     }
                 };
+                let authenticated_client_id =
+                    active.socket.authenticated_client_id().map(str::to_owned);
                 let result = if active.handshaken {
                     process_ready_message(message, &actions, &config, &state, &status)
                 } else {
-                    process_hello(message, &descriptor, &config, &state, &status)
+                    process_hello(
+                        message,
+                        authenticated_client_id.as_deref(),
+                        &descriptor,
+                        &config,
+                        &state,
+                        &status,
+                    )
                 };
                 match result {
                     Ok(()) => active.handshaken = true,
@@ -395,6 +501,7 @@ impl From<NativeProtocolError> for ConnectionFailure {
 
 fn process_hello(
     message: NativeClientMessage,
+    authenticated_client_id: Option<&str>,
     descriptor: &ChannelDescriptor,
     config: &NativeChannelConfig,
     state: &SharedDeliveryState,
@@ -413,6 +520,16 @@ fn process_hello(
             },
         ));
     };
+    if let Some(authenticated_client_id) = authenticated_client_id
+        && authenticated_client_id != client_id
+    {
+        return Err(ConnectionFailure::Fatal(
+            NativeProtocolError::InvalidField {
+                field: "client_id",
+                reason: "client hello identity does not match the authenticated upgrade".to_owned(),
+            },
+        ));
+    }
     if !supported_protocol_versions.contains(&V1_PROTOCOL_VERSION) {
         return Err(ConnectionFailure::Fatal(
             NativeProtocolError::InvalidField {
@@ -722,10 +839,7 @@ fn enqueue_control(
     lock_delivery(state).enqueue(text).map_err(queue_error)
 }
 
-fn send_direct(
-    socket: &mut LoopbackWebSocket,
-    message: &NativeServerMessage,
-) -> Result<(), String> {
+fn send_direct(socket: &mut NativeWebSocket, message: &NativeServerMessage) -> Result<(), String> {
     let text = server_text(message).map_err(|error| error.to_string())?;
     socket.send_text(text).map_err(|error| error.to_string())
 }

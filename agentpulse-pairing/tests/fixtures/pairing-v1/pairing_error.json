@@ -1,0 +1,9 @@
+{
+  "pairing_version": 1,
+  "message": {
+    "type": "pairing_error",
+    "code": "denied",
+    "message": "The Host user denied this device",
+    "recoverable": false
+  }
+}

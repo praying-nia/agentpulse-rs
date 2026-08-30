@@ -1,0 +1,11 @@
+{
+  "pairing_version": 1,
+  "message": {
+    "type": "pair_request",
+    "pairing_id": "0198f142-5a00-7000-8000-000000000001",
+    "bootstrap_token": "bootstrap-secret",
+    "client_id": "0198f142-5a00-7000-8000-000000000003",
+    "display_name": "Fixture Android Client",
+    "version": "0.1.0"
+  }
+}

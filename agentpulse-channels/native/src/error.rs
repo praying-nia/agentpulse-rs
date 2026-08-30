@@ -29,6 +29,12 @@ pub enum NativeChannelBuildError {
         /// The rejected address.
         address: SocketAddr,
     },
+    /// The authenticated endpoint was not bound to a private LAN address.
+    #[error("Native Channel LAN address {address} is not private or link-local")]
+    NonPrivateLanAddress {
+        /// The rejected address.
+        address: SocketAddr,
+    },
 }
 
 /// Failure while a Channel Port accepts one Bridge delivery.
