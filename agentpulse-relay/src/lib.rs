@@ -1,9 +1,9 @@
-//! Optional authenticated Relay for public-network AgentPulse Native links.
+//! Authenticated Relay for public AgentPulse Native and QR-pairing links.
 //!
-//! The Relay authenticates an outbound Host registration and one Android route,
-//! then switches to a fixed-buffer opaque byte tunnel. The existing Host-issued
-//! TLS certificate and Native bearer authorization run inside that tunnel, so
-//! the Relay never receives Session/Event plaintext or the Native bearer Token.
+//! The Relay authenticates outbound Host registrations and Android routes, then
+//! switches to a fixed-buffer opaque byte tunnel. Existing Host-issued TLS runs
+//! inside that tunnel, so the Relay never receives QR bootstrap/device Tokens,
+//! pairing messages, or Session/Event plaintext.
 
 mod client;
 mod config;
@@ -19,7 +19,7 @@ use std::time::Duration;
 
 pub use client::{
     RelayHostConnectionConfig, build_client_hello, connect_host_once,
-    connect_host_once_with_route_check, probe,
+    connect_host_once_with_route_check, connect_host_once_with_route_check_and_waiting, probe,
 };
 pub use config::{
     CertificateStatus, RELAY_CONFIG_SCHEMA_VERSION, RelayServerConfig, new_server_config,

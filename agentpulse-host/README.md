@@ -1,20 +1,16 @@
 # agentpulse-host
 
-User-facing Linux/macOS Host for the local read-only AgentPulse product path.
+User-facing Linux/macOS Host for the read-only AgentPulse product path.
 
 ## Setup
-
-Linux builds require the D-Bus development headers used by the BlueZ pairing backend. On Ubuntu:
-
-```bash
-sudo apt-get install libdbus-1-dev pkg-config
-```
 
 ```bash
 cargo install --path agentpulse-host
 agentpulse init --name "Studio Host"
 agentpulse threads add <CODEX_THREAD_UUIDV7>
-agentpulse serve --bind 192.168.1.20
+printf '%s\n' '<RELAY_ENROLLMENT_TOKEN>' | \
+  agentpulse relay configure --endpoint relay.example.com:2333 --token-stdin
+agentpulse serve --bind 127.0.0.1
 ```
 
 `serve` requires the exact supported Codex CLI version, starts the managed Codex App Server Provider, authenticated Native WSS, mDNS service, private admin socket, and foreground health loop. Omit `--bind` only when the machine has exactly one private/link-local address. Native WSS uses stable port `49320` by default so saved pairing credentials survive Host restarts even when mDNS is unavailable; use `--port` to select another stable port when necessary. In another terminal, launch Codex through the managed server:
@@ -25,13 +21,13 @@ agentpulse codex -- <additional-codex-arguments>
 
 ## Pair and operate
 
-With the Host running, open a two-minute pairing session:
+With the Relay-configured Host running, publish a two-minute QR-only pairing route:
 
 ```bash
 agentpulse pair
 ```
 
-Linux attempts secure BLE nearby pairing and always prints a QR/manual fallback. macOS uses the QR path. Both require explicit terminal approval before issuing credentials.
+`pair` waits until the ephemeral route is authenticated and publicly available, then prints exactly one QR code. Android needs only Internet access and the camera: USB, ADB, Bluetooth, a shared LAN, deep links, and manual URI entry are not pairing paths. Credential issuance still requires explicit terminal approval.
 
 ```bash
 agentpulse status

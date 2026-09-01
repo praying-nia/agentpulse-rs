@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn derivation_is_stable_and_domain_separated() -> Result<(), Box<dyn Error>> {
-        let endpoint = "ap.nonamenona.top:19191".parse::<RelayEndpoint>()?;
+        let endpoint = "relay.example.com:2333".parse::<RelayEndpoint>()?;
         let root = device_root_from_token("device-secret");
         let route = derive_route(&root, &endpoint)?;
         assert_ne!(
@@ -191,7 +191,7 @@ mod tests {
 
     #[test]
     fn canonical_cross_language_vector_is_stable() -> Result<(), Box<dyn Error>> {
-        let endpoint = "relay.example.com:19191".parse::<RelayEndpoint>()?;
+        let endpoint = "relay.example.com:2333".parse::<RelayEndpoint>()?;
         let root = device_root_from_token("fixture-device-token");
         assert_eq!(
             URL_SAFE_NO_PAD.encode(root.as_slice()),
@@ -200,11 +200,11 @@ mod tests {
         let route = derive_route(&root, &endpoint)?;
         assert_eq!(
             route.route_id(),
-            "aCqsldNQU3q4F4wpLIb_VHzyh51lR6SwzzuK9dno5Mk"
+            "zHRMqKXGm1oRWx0q8MCJ5jQggwqVtIcG1TkfyS6Oa9w"
         );
         assert_eq!(
             URL_SAFE_NO_PAD.encode(route.authentication_key()),
-            "hVBZB_Ak8IDNLGAsJuLi4G_Jhdv1WwnK7YPikP0EGhE"
+            "U3lobEe7CoJfP8q2lbSX-2TyS_XHlmM5DJX7RPS601c"
         );
         let connection_id = "018f10a1-1e20-77d2-9d90-80ab2f45a711";
         let host_id = "018f10a0-fd57-7c08-bb2a-9b61c761a62f";
@@ -224,7 +224,7 @@ mod tests {
                 host_id,
                 &[registration]
             )?,
-            "ZI8B-3lR_2n6C7kmCoImDlzr-zepmT6Qi3FpaNNBiTc"
+            "xKWOGuqyqLFn8trmRxo04xz-fUCJobk0izYiuGwzL6k"
         );
         assert_eq!(
             client_proof(
@@ -234,7 +234,7 @@ mod tests {
                 expires_at,
                 route.route_id()
             )?,
-            "5GTj5v2L17ruKW7gkNVZAlwuwo309RR8sYYF2U8FoIk"
+            "edqSJq5Swq3tbEBrgcsFnG6wlJL_8K5xBKdr8pDWvhg"
         );
         Ok(())
     }

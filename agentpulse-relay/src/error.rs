@@ -55,8 +55,8 @@ pub enum RelayError {
     /// The requested Host is not registered with the Relay.
     #[error("Relay Host is unavailable")]
     HostUnavailable,
-    /// Another Host connection currently owns the single waiting slot.
-    #[error("Relay Host slot is already occupied")]
+    /// Another Host connection already owns an overlapping route or capacity.
+    #[error("Relay Host registration is already occupied")]
     HostBusy,
     /// The paired-device route set changed while this Host was waiting.
     #[error("Relay route registration changed")]

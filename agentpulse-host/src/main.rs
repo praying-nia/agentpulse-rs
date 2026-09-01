@@ -1,7 +1,5 @@
 //! AgentPulse Host command-line application.
 
-mod ble;
-
 use std::{
     collections::{BTreeSet, HashMap},
     error::Error,
@@ -15,6 +13,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread,
     time::Duration,
@@ -34,7 +33,8 @@ use agentpulse_provider_codex::{
 };
 use agentpulse_relay::{
     RelayEndpoint, RelayError, RelayHostConnectionConfig, RouteRegistration,
-    connect_host_once_with_route_check, derive_route,
+    connect_host_once_with_route_check, connect_host_once_with_route_check_and_waiting,
+    derive_route, device_root_from_token,
 };
 use clap::{Args, Parser, Subcommand};
 use directories::ProjectDirs;
@@ -166,7 +166,7 @@ struct RelayArgs {
 enum RelayCommand {
     /// Stores one public endpoint and reads its enrollment Token from standard input.
     Configure {
-        /// Canonical Relay DNS authority, such as relay.example.com:19191.
+        /// Canonical Relay DNS authority, such as relay.example.com:2333.
         #[arg(long)]
         endpoint: RelayEndpoint,
         /// Required acknowledgement that the Token is supplied on standard input.
@@ -624,31 +624,73 @@ fn pair(paths: &HostPaths) -> AppResult<()> {
     let status = request_admin(paths, AdminRequest::Status)?
         .status
         .ok_or("running Host did not return status")?;
+    let settings = load_relay_settings(&paths.relay_config, &status.host_id)?
+        .ok_or("QR pairing requires a configured Relay; run `agentpulse relay configure` first")?;
     let session = PairingSession::bind(
         paths.store(),
-        SocketAddr::new(status.native_address.ip(), 0),
+        SocketAddr::from(([127, 0, 0, 1], 0)),
         status.native_address,
+        settings.endpoint.to_string(),
         NATIVE_TRANSPORT_VERSION,
         vec![V1_PROTOCOL_VERSION],
     )?;
+    let pairing_root = device_root_from_token(&session.bundle().bootstrap_token);
+    let route = derive_route(&pairing_root, &settings.endpoint)?.registration();
+    let relay_config = RelayHostConnectionConfig::new(
+        settings.endpoint,
+        status.host_id,
+        settings.enrollment_token.as_str(),
+        session.local_address(),
+    )?;
+    let relay_stop = Arc::new(AtomicBool::new(false));
+    let connector_stop = Arc::clone(&relay_stop);
+    let (ready_sender, ready_receiver) = mpsc::sync_channel::<Result<(), String>>(1);
+    let _connector = thread::spawn(move || {
+        let routes = [route];
+        let backoff_seconds = [1_u64, 2, 5];
+        let mut backoff_index = 0_usize;
+        let mut announced = false;
+        while !connector_stop.load(Ordering::Acquire) {
+            let signal = ready_sender.clone();
+            let became_waiting = Arc::new(AtomicBool::new(false));
+            let callback_state = Arc::clone(&became_waiting);
+            let result = connect_host_once_with_route_check_and_waiting(
+                &relay_config,
+                &routes,
+                &connector_stop,
+                || true,
+                move || {
+                    callback_state.store(true, Ordering::Release);
+                    let _ = signal.try_send(Ok(()));
+                },
+            );
+            if became_waiting.load(Ordering::Acquire) {
+                announced = true;
+                backoff_index = 0;
+            } else if !announced {
+                let _ = ready_sender.try_send(Err(result.err().map_or_else(
+                    || "Relay pairing route closed unexpectedly".to_owned(),
+                    |error| error.to_string(),
+                )));
+                break;
+            }
+            if connector_stop.load(Ordering::Acquire) {
+                break;
+            }
+            let delay = backoff_seconds[backoff_index];
+            backoff_index = (backoff_index + 1).min(backoff_seconds.len() - 1);
+            sleep_until_stopped(&connector_stop, Duration::from_secs(delay));
+        }
+    });
+    match ready_receiver.recv_timeout(Duration::from_secs(15)) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Err(format!("could not publish QR pairing route: {error}").into()),
+        Err(_) => return Err("timed out publishing QR pairing route".into()),
+    }
     println!("Pairing expires in two minutes. Scan this QR code:");
     println!("{}", terminal_qr(session.pairing_uri())?);
-    println!("Pairing URI (manual fallback): {}", session.pairing_uri());
-    let ble = match ble::BlePairingAdvertiser::start(session.pairing_uri()) {
-        Ok(advertiser) => {
-            println!(
-                "BLE nearby pairing is active on service {}.",
-                agentpulse_pairing::PAIRING_BLE_SERVICE_UUID
-            );
-            Some(advertiser)
-        }
-        Err(error) => {
-            eprintln!("warning: BLE pairing is unavailable ({error}); use the QR code.");
-            None
-        }
-    };
     let result = session.serve(|request| approve_device(&request.display_name, &request.client_id));
-    drop(ble);
+    relay_stop.store(true, Ordering::Release);
     let outcome = result?;
     println!(
         "Paired '{}' ({}) successfully.",

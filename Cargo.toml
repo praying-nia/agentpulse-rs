@@ -30,12 +30,10 @@ webpki-roots = "1"
 x509-parser = "0.16"
 jsonschema = { version = "0.52", default-features = false }
 base64 = "0.22"
-bluer = { version = "0.17.4", features = ["bluetoothd"] }
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
 directories = "6"
 fs2 = "0.4"
-futures = "0.3"
 hmac = "0.12"
 if-addrs = "0.14"
 mdns-sd = "0.17"
@@ -46,7 +44,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pemfile = "2"
 sha2 = "0.10"
 subtle = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 zeroize = { version = "1", features = ["derive"] }
 
 [workspace.lints.rust]

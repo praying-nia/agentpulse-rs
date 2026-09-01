@@ -39,7 +39,12 @@ install -d -o root -g root -m 0755 "$release_directory"
 install -o root -g root -m 0755 "$incoming" "$release_binary.new"
 mv -f "$release_binary.new" "$release_binary"
 runuser -u agentpulse-relay -- "$release_binary" --version >/dev/null
-runuser -u agentpulse-relay -- "$release_binary" check-config --config "$config"
+check_output=$(runuser -u agentpulse-relay -- "$release_binary" check-config --config "$config")
+printf '%s\n' "$check_output"
+health_port=$(printf '%s\n' "$check_output" | sed -n 's/^Bind address: .*:\([0-9][0-9]*\)$/\1/p')
+case "$health_port" in
+    ''|*[!0-9]*) echo "Relay bind port was not reported by check-config" >&2; exit 1 ;;
+esac
 
 previous=
 if [ -L "$current_link" ]; then
@@ -53,7 +58,7 @@ if systemctl restart agentpulse-relay.service; then
     attempts=0
     while [ "$attempts" -lt 20 ]; do
         if systemctl is-active --quiet agentpulse-relay.service &&
-            timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/19191' 2>/dev/null; then
+            timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$health_port" 2>/dev/null; then
             healthy=true
             break
         fi

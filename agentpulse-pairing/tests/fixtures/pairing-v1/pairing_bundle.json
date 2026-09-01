@@ -8,5 +8,6 @@
   "port": 49321,
   "leaf_sha256": "abababababababababababababababababababababababababababababababab",
   "bootstrap_token": "bootstrap-secret",
+  "relay_endpoint": "relay.example.com:2333",
   "expires_at_unix_seconds": 4102444800
 }

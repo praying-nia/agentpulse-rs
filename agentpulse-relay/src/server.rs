@@ -35,6 +35,7 @@ const HOST_PONG_TIMEOUT: Duration = Duration::from_secs(5);
 const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const TUNNEL_STALLED_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_OUTER_CONNECTIONS: usize = 32;
+const MAX_WAITING_HOSTS: usize = 4;
 
 type OuterStream = StreamOwned<ServerConnection, TcpStream>;
 
@@ -45,7 +46,7 @@ pub struct RelayServer {
     tls: Arc<ServerConfig>,
     config: RelayServerConfig,
     certificate: CertificateStatus,
-    state: Arc<Mutex<Option<WaitingHost>>>,
+    state: Arc<Mutex<BTreeMap<String, WaitingHost>>>,
     active_connections: Arc<AtomicUsize>,
 }
 
@@ -67,7 +68,7 @@ impl RelayServer {
             tls,
             config,
             certificate,
-            state: Arc::new(Mutex::new(None)),
+            state: Arc::new(Mutex::new(BTreeMap::new())),
             active_connections: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -125,7 +126,7 @@ impl RelayServer {
             }
         }
         if let Ok(mut waiting) = self.state.lock() {
-            waiting.take();
+            waiting.clear();
         }
         for worker in workers {
             let _ = worker.join();
@@ -160,7 +161,7 @@ struct WaitingHost {
 }
 
 struct WaitingHostGuard {
-    state: Arc<Mutex<Option<WaitingHost>>>,
+    state: Arc<Mutex<BTreeMap<String, WaitingHost>>>,
     connection_id: String,
 }
 
@@ -179,7 +180,7 @@ fn handle_outer(
     tcp: TcpStream,
     tls: Arc<ServerConfig>,
     config: RelayServerConfig,
-    state: Arc<Mutex<Option<WaitingHost>>>,
+    state: Arc<Mutex<BTreeMap<String, WaitingHost>>>,
     stop: &AtomicBool,
 ) -> Result<(), RelayError> {
     tcp.set_read_timeout(Some(TLS_TIMEOUT))
@@ -252,7 +253,7 @@ fn handle_outer(
 fn handle_host(
     mut stream: OuterStream,
     config: &RelayServerConfig,
-    state: Arc<Mutex<Option<WaitingHost>>>,
+    state: Arc<Mutex<BTreeMap<String, WaitingHost>>>,
     stop: &AtomicBool,
     connection_id: String,
     nonce: [u8; 32],
@@ -284,20 +285,32 @@ fn handle_host(
         let mut waiting = state.lock().map_err(|_| RelayError::Protocol {
             message: "Relay waiting state is unavailable".to_owned(),
         })?;
-        if waiting.is_some() {
+        if waiting.len() >= MAX_WAITING_HOSTS {
             send_error(
                 &mut stream,
-                RelayErrorCode::HostBusy,
-                "another Host is already waiting",
+                RelayErrorCode::ResourceLimit,
+                "Relay waiting registration capacity is full",
                 true,
             )?;
             return Err(RelayError::HostBusy);
         }
-        *waiting = Some(WaitingHost {
-            connection_id: connection_id.clone(),
-            routes: route_keys,
-            client_sender,
-        });
+        if routes_overlap(&waiting, &route_keys) {
+            send_error(
+                &mut stream,
+                RelayErrorCode::HostBusy,
+                "a matching Host route is already waiting",
+                true,
+            )?;
+            return Err(RelayError::HostBusy);
+        }
+        waiting.insert(
+            connection_id.clone(),
+            WaitingHost {
+                connection_id: connection_id.clone(),
+                routes: route_keys,
+                client_sender,
+            },
+        );
     }
     let _waiting_guard = WaitingHostGuard {
         state: Arc::clone(&state),
@@ -376,7 +389,7 @@ fn handle_host(
 
 fn handle_client(
     mut stream: OuterStream,
-    state: Arc<Mutex<Option<WaitingHost>>>,
+    state: Arc<Mutex<BTreeMap<String, WaitingHost>>>,
     connection_id: String,
     nonce: [u8; 32],
     expires_at: i64,
@@ -387,7 +400,7 @@ fn handle_client(
         let waiting = state.lock().map_err(|_| RelayError::Protocol {
             message: "Relay waiting state is unavailable".to_owned(),
         })?;
-        let Some(waiting) = waiting.as_ref() else {
+        if waiting.is_empty() {
             send_error(
                 &mut stream,
                 RelayErrorCode::HostUnavailable,
@@ -395,8 +408,11 @@ fn handle_client(
                 true,
             )?;
             return Err(RelayError::HostUnavailable);
-        };
-        let Some(key) = waiting.routes.get(&route_id) else {
+        }
+        let Some((waiting, key)) = waiting
+            .values()
+            .find_map(|waiting| waiting.routes.get(&route_id).map(|key| (waiting, key)))
+        else {
             send_error(
                 &mut stream,
                 RelayErrorCode::AuthenticationFailed,
@@ -425,10 +441,7 @@ fn handle_client(
         let mut waiting = state.lock().map_err(|_| RelayError::Protocol {
             message: "Relay waiting state is unavailable".to_owned(),
         })?;
-        if waiting
-            .as_ref()
-            .is_none_or(|candidate| candidate.connection_id != claim.0)
-        {
+        if !waiting.contains_key(&claim.0) {
             send_error(
                 &mut stream,
                 RelayErrorCode::HostUnavailable,
@@ -437,7 +450,7 @@ fn handle_client(
             )?;
             return Err(RelayError::HostUnavailable);
         }
-        waiting.take();
+        waiting.remove(&claim.0);
     }
     claim
         .1
@@ -448,14 +461,21 @@ fn handle_client(
         .map_err(|_| RelayError::HostUnavailable)
 }
 
-fn remove_waiting_host(state: &Mutex<Option<WaitingHost>>, connection_id: &str) {
-    if let Ok(mut waiting) = state.lock()
-        && waiting
-            .as_ref()
-            .is_some_and(|candidate| candidate.connection_id == connection_id)
-    {
-        waiting.take();
+fn remove_waiting_host(state: &Mutex<BTreeMap<String, WaitingHost>>, connection_id: &str) {
+    if let Ok(mut waiting) = state.lock() {
+        waiting.remove(connection_id);
     }
+}
+
+fn routes_overlap(
+    waiting: &BTreeMap<String, WaitingHost>,
+    candidate: &BTreeMap<String, Zeroizing<[u8; 32]>>,
+) -> bool {
+    candidate.keys().any(|route_id| {
+        waiting
+            .values()
+            .any(|host| host.routes.contains_key(route_id))
+    })
 }
 
 fn write_relay(stream: &mut OuterStream, message: &RelayMessage) -> Result<(), RelayError> {
@@ -484,40 +504,42 @@ mod tests {
 
     use super::*;
 
-    fn waiting_host(connection_id: &str) -> WaitingHost {
+    fn waiting_host(connection_id: &str, route_id: &str) -> WaitingHost {
         let (client_sender, _) = mpsc::sync_channel(1);
         WaitingHost {
             connection_id: connection_id.to_owned(),
-            routes: BTreeMap::new(),
+            routes: BTreeMap::from([(route_id.to_owned(), Zeroizing::new([7_u8; 32]))]),
             client_sender,
         }
     }
 
     #[test]
-    fn waiting_guard_releases_only_its_own_slot_on_every_return_path() -> Result<(), Box<dyn Error>>
-    {
+    fn waiting_guard_releases_only_its_registration_and_detects_route_overlap()
+    -> Result<(), Box<dyn Error>> {
         let first = Uuid::now_v7().to_string();
         let second = Uuid::now_v7().to_string();
-        let state = Arc::new(Mutex::new(Some(waiting_host(&first))));
+        let state = Arc::new(Mutex::new(BTreeMap::from([
+            (first.clone(), waiting_host(&first, "first-route")),
+            (second.clone(), waiting_host(&second, "second-route")),
+        ])));
         drop(WaitingHostGuard {
             state: Arc::clone(&state),
             connection_id: first.clone(),
-        });
-        assert!(state.lock().map_err(|_| "state lock poisoned")?.is_none());
-
-        *state.lock().map_err(|_| "state lock poisoned")? = Some(waiting_host(&second));
-        drop(WaitingHostGuard {
-            state: Arc::clone(&state),
-            connection_id: first,
         });
         assert_eq!(
             state
                 .lock()
                 .map_err(|_| "state lock poisoned")?
-                .as_ref()
+                .get(&second)
                 .map(|waiting| waiting.connection_id.as_str()),
             Some(second.as_str())
         );
+
+        let overlapping = BTreeMap::from([("second-route".to_owned(), Zeroizing::new([9_u8; 32]))]);
+        let distinct = BTreeMap::from([("third-route".to_owned(), Zeroizing::new([9_u8; 32]))]);
+        let waiting = state.lock().map_err(|_| "state lock poisoned")?;
+        assert!(routes_overlap(&waiting, &overlapping));
+        assert!(!routes_overlap(&waiting, &distinct));
         Ok(())
     }
 }

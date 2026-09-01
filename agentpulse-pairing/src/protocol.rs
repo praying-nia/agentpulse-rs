@@ -2,6 +2,7 @@
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 use time::OffsetDateTime;
 
 use crate::PairingError;
@@ -14,7 +15,7 @@ pub const PAIRING_WEBSOCKET_PATH: &str = "/agentpulse/pair/v1";
 pub const PAIRING_WEBSOCKET_SUBPROTOCOL: &str = "agentpulse.pair.v1";
 const PAIRING_URI_PREFIX: &str = "agentpulse://pair/v1/";
 
-/// Opaque proximity bundle carried by BLE or a QR code.
+/// Opaque bootstrap bundle carried only by a QR code.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PairingBundle {
@@ -36,6 +37,8 @@ pub struct PairingBundle {
     pub leaf_sha256: String,
     /// Single-use 256-bit bootstrap secret.
     pub bootstrap_token: String,
+    /// Public Relay authority used for QR-only bootstrap.
+    pub relay_endpoint: String,
     /// UTC Unix expiry in seconds.
     pub expires_at_unix_seconds: i64,
 }
@@ -356,11 +359,52 @@ fn validate_bundle(bundle: &PairingBundle) -> Result<(), PairingError> {
         ));
     }
     nonblank("bootstrap_token", &bundle.bootstrap_token, 128)?;
+    validate_relay_endpoint(&bundle.relay_endpoint)?;
     if bundle.port == 0 {
         return Err(invalid("port", "must be non-zero"));
     }
     if bundle.expires_at_unix_seconds <= 0 {
         return Err(invalid("expires_at_unix_seconds", "must be positive"));
+    }
+    Ok(())
+}
+
+fn validate_relay_endpoint(endpoint: &str) -> Result<(), PairingError> {
+    if endpoint.trim() != endpoint
+        || endpoint.contains("//")
+        || endpoint.chars().any(|character| "/?#@".contains(character))
+    {
+        return Err(invalid(
+            "relay_endpoint",
+            "must be a canonical DNS host:port authority",
+        ));
+    }
+    let Some((host, port)) = endpoint.rsplit_once(':') else {
+        return Err(invalid("relay_endpoint", "must contain one port"));
+    };
+    if host.contains(':')
+        || host.len() > 253
+        || !host.contains('.')
+        || host != host.to_ascii_lowercase()
+        || !host.is_ascii()
+        || host.parse::<IpAddr>().is_ok()
+        || host.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+    {
+        return Err(invalid(
+            "relay_endpoint",
+            "must use a canonical public ASCII DNS name",
+        ));
+    }
+    if port.parse::<u16>().ok().is_none_or(|port| port == 0) {
+        return Err(invalid("relay_endpoint", "port must be 1..65535"));
     }
     Ok(())
 }
@@ -499,6 +543,7 @@ mod tests {
             port: 49_321,
             leaf_sha256: "ab".repeat(32),
             bootstrap_token: "bootstrap-secret".to_owned(),
+            relay_endpoint: "relay.example.com:2333".to_owned(),
             expires_at_unix_seconds: 4_102_444_800,
         }
     }
@@ -531,6 +576,10 @@ mod tests {
 
         let mut invalid = bundle();
         invalid.leaf_sha256 = "AB".repeat(32);
+        assert!(invalid.to_uri().is_err());
+
+        let mut invalid = bundle();
+        invalid.relay_endpoint = "https://relay.example.com:2333".to_owned();
         assert!(invalid.to_uri().is_err());
         Ok(())
     }

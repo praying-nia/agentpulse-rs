@@ -112,12 +112,12 @@ mod tests {
 
     #[test]
     fn endpoint_is_strict_and_canonical() -> Result<(), Box<dyn Error>> {
-        let endpoint = "AP.NonameNona.Top:19191".parse::<RelayEndpoint>()?;
-        assert_eq!(endpoint.authority(), "ap.nonamenona.top:19191");
+        let endpoint = "Relay.Example.Com:2333".parse::<RelayEndpoint>()?;
+        assert_eq!(endpoint.authority(), "relay.example.com:2333");
         for invalid in [
-            "https://ap.nonamenona.top:19191",
-            "39.105.18.37:19191",
-            "localhost:19191",
+            "https://relay.example.com:2333",
+            "192.0.2.1:2333",
+            "localhost:2333",
             "ap.nonamenona.top",
             "ap.nonamenona.top:0",
         ] {

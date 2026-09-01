@@ -35,7 +35,7 @@ pub struct RelayHostConnectionConfig {
     endpoint: RelayEndpoint,
     host_id: String,
     host_authentication_key: Arc<Zeroizing<[u8; 32]>>,
-    local_native_address: SocketAddr,
+    local_tunnel_address: SocketAddr,
 }
 
 impl RelayHostConnectionConfig {
@@ -44,7 +44,7 @@ impl RelayHostConnectionConfig {
         endpoint: RelayEndpoint,
         host_id: impl Into<String>,
         enrollment_token: &str,
-        local_native_address: SocketAddr,
+        local_tunnel_address: SocketAddr,
     ) -> Result<Self, RelayError> {
         if enrollment_token.trim().is_empty()
             || enrollment_token.trim() != enrollment_token
@@ -59,7 +59,7 @@ impl RelayHostConnectionConfig {
             endpoint,
             host_id,
             *host_authentication_key(enrollment_token),
-            local_native_address,
+            local_tunnel_address,
         )
     }
 
@@ -68,7 +68,7 @@ impl RelayHostConnectionConfig {
         endpoint: RelayEndpoint,
         host_id: impl Into<String>,
         authentication_key: [u8; 32],
-        local_native_address: SocketAddr,
+        local_tunnel_address: SocketAddr,
     ) -> Result<Self, RelayError> {
         let host_id = host_id.into();
         let parsed = Uuid::parse_str(&host_id)
@@ -76,9 +76,9 @@ impl RelayHostConnectionConfig {
         if parsed.get_version_num() != 7 {
             return Err(RelayError::invalid("host_id", "must be UUIDv7"));
         }
-        if local_native_address.port() == 0 {
+        if local_tunnel_address.port() == 0 {
             return Err(RelayError::invalid(
-                "local_native_address",
+                "local_tunnel_address",
                 "port must be non-zero",
             ));
         }
@@ -86,7 +86,7 @@ impl RelayHostConnectionConfig {
             endpoint,
             host_id,
             host_authentication_key: Arc::new(Zeroizing::new(authentication_key)),
-            local_native_address,
+            local_tunnel_address,
         })
     }
 
@@ -103,7 +103,7 @@ impl std::fmt::Debug for RelayHostConnectionConfig {
             .debug_struct("RelayHostConnectionConfig")
             .field("endpoint", &self.endpoint)
             .field("host_id", &self.host_id)
-            .field("local_native_address", &self.local_native_address)
+            .field("local_tunnel_address", &self.local_tunnel_address)
             .finish_non_exhaustive()
     }
 }
@@ -129,10 +129,25 @@ pub fn connect_host_once_with_route_check(
     stop: &AtomicBool,
     routes_are_current: impl Fn() -> bool,
 ) -> Result<RelayTunnelStats, RelayError> {
+    connect_host_once_with_route_check_and_waiting(config, routes, stop, routes_are_current, || {})
+}
+
+/// Opens one Host registration and reports when its routes are publicly waiting.
+///
+/// The callback runs exactly once, after the Relay authenticated and installed
+/// this registration. It is intended for short-lived QR pairing sessions that
+/// must not expose a QR code before its public route is usable.
+pub fn connect_host_once_with_route_check_and_waiting(
+    config: &RelayHostConnectionConfig,
+    routes: &[RouteRegistration],
+    stop: &AtomicBool,
+    routes_are_current: impl Fn() -> bool,
+    on_waiting: impl FnOnce(),
+) -> Result<RelayTunnelStats, RelayError> {
     if routes.is_empty() {
         return Err(RelayError::invalid(
             "routes",
-            "at least one paired device is required",
+            "at least one authenticated route is required",
         ));
     }
     let mut routes = routes.to_vec();
@@ -159,6 +174,7 @@ pub fn connect_host_once_with_route_check(
         .sock
         .set_read_timeout(Some(HOST_WAIT_TIMEOUT))
         .map_err(|source| RelayError::io("set Relay Host wait timeout", source))?;
+    let mut on_waiting = Some(on_waiting);
 
     loop {
         match read_relay(&mut stream)? {
@@ -167,6 +183,9 @@ pub fn connect_host_once_with_route_check(
             } if waiting_id == connection_id => {
                 if !routes_are_current() {
                     return Err(RelayError::RoutesChanged);
+                }
+                if let Some(callback) = on_waiting.take() {
+                    callback();
                 }
             }
             RelayMessage::Ping { ping_id } => {
@@ -187,11 +206,11 @@ pub fn connect_host_once_with_route_check(
         }
     }
 
-    let mut local = TcpStream::connect_timeout(&config.local_native_address, CONNECT_TIMEOUT)
-        .map_err(|source| RelayError::io("connect local Native endpoint", source))?;
+    let mut local = TcpStream::connect_timeout(&config.local_tunnel_address, CONNECT_TIMEOUT)
+        .map_err(|source| RelayError::io("connect local tunnel target", source))?;
     local
         .set_nonblocking(true)
-        .map_err(|source| RelayError::io("configure local Native tunnel", source))?;
+        .map_err(|source| RelayError::io("configure local tunnel target", source))?;
     stream
         .sock
         .set_nonblocking(true)

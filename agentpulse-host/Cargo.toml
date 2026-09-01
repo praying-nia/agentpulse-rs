@@ -31,10 +31,5 @@ thiserror.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
-bluer.workspace = true
-futures.workspace = true
-tokio.workspace = true
-
 [lints]
 workspace = true

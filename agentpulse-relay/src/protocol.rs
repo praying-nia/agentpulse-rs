@@ -54,7 +54,7 @@ pub enum EndpointMessage {
         /// Challenge-bound HMAC proof.
         proof: String,
     },
-    /// Replies to a waiting-slot heartbeat.
+    /// Replies to a waiting-registration heartbeat.
     Pong {
         /// Matching UUIDv7 Ping identity.
         ping_id: String,
@@ -112,7 +112,7 @@ pub enum RelayErrorCode {
     InvalidRequest,
     /// The configured Host is not waiting.
     HostUnavailable,
-    /// Another Host registration owns the waiting slot.
+    /// Another Host registration owns an overlapping route.
     HostBusy,
     /// A bounded capacity or size limit was exceeded.
     ResourceLimit,

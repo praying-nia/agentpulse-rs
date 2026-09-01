@@ -49,14 +49,21 @@ pub struct PairingSession {
 }
 
 impl PairingSession {
-    /// Binds a two-minute pairing endpoint on the Native endpoint's LAN IP.
+    /// Binds a two-minute pairing endpoint for one QR bootstrap.
     pub fn bind(
         store: HostCredentialStore,
         bind_address: SocketAddr,
         native_address: SocketAddr,
+        relay_endpoint: String,
         native_transport_version: u16,
         domain_protocol_versions: Vec<u16>,
     ) -> Result<Self, PairingError> {
+        if !bind_address.ip().is_loopback() {
+            return Err(PairingError::InvalidField {
+                field: "bind_address",
+                reason: "QR pairing listeners must be loopback-only".to_owned(),
+            });
+        }
         if domain_protocol_versions.is_empty() || native_transport_version == 0 {
             return Err(PairingError::InvalidField {
                 field: "supported_versions",
@@ -89,6 +96,7 @@ impl PairingSession {
             port: local_address.port(),
             leaf_sha256,
             bootstrap_token,
+            relay_endpoint,
             expires_at_unix_seconds: OffsetDateTime::now_utc().unix_timestamp()
                 + i64::try_from(SESSION_LIFETIME.as_secs()).unwrap_or(120),
         };
@@ -105,7 +113,7 @@ impl PairingSession {
         })
     }
 
-    /// Returns the opaque URI to expose over BLE and QR.
+    /// Returns the opaque URI encoded by the terminal QR code.
     #[must_use]
     pub fn pairing_uri(&self) -> &str {
         &self.pairing_uri
@@ -115,6 +123,12 @@ impl PairingSession {
     #[must_use]
     pub const fn bundle(&self) -> &PairingBundle {
         &self.bundle
+    }
+
+    /// Returns the private listener address used as the Relay tunnel target.
+    #[must_use]
+    pub fn local_address(&self) -> SocketAddr {
+        self.listener.local_address()
     }
 
     /// Serves until one locally approved credential is issued or the session ends.

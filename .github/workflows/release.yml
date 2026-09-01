@@ -33,13 +33,6 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Install Linux build dependencies
-        if: steps.workspace.outputs.exists == 'true'
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes libdbus-1-dev pkg-config
-
       - name: Install stable Rust toolchain
         if: steps.workspace.outputs.exists == 'true'
         shell: bash

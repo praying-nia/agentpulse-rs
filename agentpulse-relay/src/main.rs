@@ -34,10 +34,10 @@ enum Command {
         /// Destination JSON configuration file, which must not already exist.
         #[arg(long)]
         config: PathBuf,
-        /// Public listener address, normally 0.0.0.0:19191.
+        /// Public listener address, for example 0.0.0.0:2333.
         #[arg(long)]
         bind: SocketAddr,
-        /// Canonical public DNS authority, such as relay.example.com:19191.
+        /// Canonical public DNS authority, such as relay.example.com:2333.
         #[arg(long)]
         public_endpoint: RelayEndpoint,
         /// Full leaf-plus-intermediate PEM certificate chain.
@@ -134,6 +134,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             let config = RelayServerConfig::load(config)?;
             let (_, certificate) = config.tls_server_config()?;
             println!("Relay configuration is valid.");
+            println!("Bind address: {}", config.bind_address);
             println!("Public endpoint: {}", config.public_endpoint);
             println!(
                 "Certificate expires at Unix timestamp: {}",
@@ -169,9 +170,9 @@ mod tests {
                 "agentpulse-relay",
                 "init",
                 "--bind",
-                "0.0.0.0:19191",
+                "0.0.0.0:2333",
                 "--public-endpoint",
-                "relay.example.com:19191",
+                "relay.example.com:2333",
                 "--certificate-chain",
                 "/tmp/cert.pem",
                 "--private-key",
