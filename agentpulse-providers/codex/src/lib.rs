@@ -26,12 +26,17 @@ use mapper::CodexEventMapper;
 use protocol::ProtocolSchema;
 use status::{SharedStatus, snapshot};
 
-/// The only Codex CLI version accepted by this Provider release.
-pub const SUPPORTED_CODEX_CLI_VERSION: &str = "0.150.1";
+/// Preferred current Codex CLI version for this Provider release.
+pub const SUPPORTED_CODEX_CLI_VERSION: &str = "0.152.0";
 
-/// SHA-256 of the bundled official `0.150.1` App Server schema bundle.
+/// Explicit Codex CLI versions verified against the bundled schema and fixtures.
+pub const SUPPORTED_CODEX_CLI_VERSIONS: &[&str] = &["0.150.1", "0.152.0"];
+
+pub(crate) const SUPPORTED_CODEX_CLI_VERSION_REQUIREMENT: &str = "0.150.1 or 0.152.0";
+
+/// SHA-256 of the bundled official `0.152.0` App Server schema bundle.
 pub const BUNDLED_CODEX_SCHEMA_SHA256: &str =
-    "18ba0e2282f69f7b3a05ffdc8ab0801c1468f25d72de3b4a37f1c8be67432a1d";
+    "d8faa38d5f00aa7ddfe635a2d374ee5f871ffd217d4d175c72fbe7f009f4f669";
 
 /// Thread-safe monitoring handle for a built Codex Provider.
 #[derive(Clone)]

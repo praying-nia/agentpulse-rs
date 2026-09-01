@@ -17,6 +17,7 @@ agentpulse-core = { path = "../agentpulse-core" }
 agentpulse-pairing = { path = "../agentpulse-pairing" }
 agentpulse-protocol = { path = "../agentpulse-protocol" }
 agentpulse-provider-codex = { path = "../agentpulse-providers/codex" }
+agentpulse-relay = { path = "../agentpulse-relay" }
 agentpulse-transport = { path = "../agentpulse-transport" }
 clap.workspace = true
 ctrlc.workspace = true
@@ -28,6 +29,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+zeroize.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 bluer.workspace = true

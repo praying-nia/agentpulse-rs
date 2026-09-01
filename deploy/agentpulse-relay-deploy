@@ -1,0 +1,78 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 1 ]; then
+    echo "usage: agentpulse-relay-deploy <40-character-git-sha>" >&2
+    exit 2
+fi
+
+revision=$1
+case "$revision" in
+    *[!0-9a-f]*|'') echo "revision must be lowercase hexadecimal" >&2; exit 2 ;;
+esac
+if [ "${#revision}" -ne 40 ]; then
+    echo "revision must contain exactly 40 characters" >&2
+    exit 2
+fi
+
+incoming="/var/lib/agentpulse-deploy/incoming/agentpulse-relay-$revision"
+release_directory="/opt/agentpulse-relay/releases/$revision"
+release_binary="$release_directory/agentpulse-relay"
+current_link=/opt/agentpulse-relay/current
+config=/etc/agentpulse-relay/relay.json
+
+if [ ! -f "$incoming" ] || [ -L "$incoming" ]; then
+    echo "staged Relay binary is missing or unsafe" >&2
+    exit 1
+fi
+if [ "$(stat -c %U "$incoming")" != agentpulse-deploy ]; then
+    echo "staged Relay binary has the wrong owner" >&2
+    exit 1
+fi
+size=$(stat -c %s "$incoming")
+if [ "$size" -lt 100000 ] || [ "$size" -gt 100000000 ]; then
+    echo "staged Relay binary has an invalid size" >&2
+    exit 1
+fi
+
+install -d -o root -g root -m 0755 "$release_directory"
+install -o root -g root -m 0755 "$incoming" "$release_binary.new"
+mv -f "$release_binary.new" "$release_binary"
+runuser -u agentpulse-relay -- "$release_binary" --version >/dev/null
+runuser -u agentpulse-relay -- "$release_binary" check-config --config "$config"
+
+previous=
+if [ -L "$current_link" ]; then
+    previous=$(readlink "$current_link")
+fi
+ln -s "$release_directory" "$current_link.new"
+mv -Tf "$current_link.new" "$current_link"
+
+if systemctl restart agentpulse-relay.service; then
+    healthy=false
+    attempts=0
+    while [ "$attempts" -lt 20 ]; do
+        if systemctl is-active --quiet agentpulse-relay.service &&
+            timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/19191' 2>/dev/null; then
+            healthy=true
+            break
+        fi
+        attempts=$((attempts + 1))
+        sleep 0.5
+    done
+    if [ "$healthy" = true ]; then
+        rm -f "$incoming"
+        echo "deployed AgentPulse Relay revision $revision"
+        exit 0
+    fi
+fi
+
+echo "Relay deployment failed; restoring the previous release" >&2
+if [ -n "$previous" ] && [ -d "$previous" ]; then
+    ln -s "$previous" "$current_link.rollback"
+    mv -Tf "$current_link.rollback" "$current_link"
+    systemctl restart agentpulse-relay.service || true
+else
+    systemctl stop agentpulse-relay.service || true
+fi
+exit 1

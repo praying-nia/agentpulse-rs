@@ -51,7 +51,9 @@ fn private_address() -> Result<IpAddr, Box<dyn Error>> {
         .map(|interface| interface.ip())
         .find(|address| match address {
             IpAddr::V4(address) => address.is_private() || address.is_link_local(),
-            IpAddr::V6(address) => address.is_unique_local() || address.is_unicast_link_local(),
+            // A link-local IPv6 address needs an interface scope identifier,
+            // which is lost when `if_addrs` exposes it as a bare `IpAddr`.
+            IpAddr::V6(address) => address.is_unique_local(),
         })
         .ok_or_else(|| "no private address is available for the TLS test".into())
 }

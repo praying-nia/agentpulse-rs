@@ -128,7 +128,7 @@ impl CodexProviderConfig {
         self.provider_id
     }
 
-    /// Returns the exact supported Codex CLI version.
+    /// Returns the preferred current Codex CLI version.
     #[must_use]
     pub const fn supported_codex_version(&self) -> &'static str {
         SUPPORTED_CODEX_CLI_VERSION

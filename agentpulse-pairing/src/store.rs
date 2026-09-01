@@ -92,6 +92,32 @@ pub struct DeviceCredentialSummary {
     pub paired_at_unix_seconds: i64,
 }
 
+/// Private device credential material used to derive an optional transport route.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DeviceCredentialDigest {
+    /// Stable Android installation identity.
+    pub client_id: String,
+    token_sha256: Zeroizing<[u8; 32]>,
+}
+
+impl DeviceCredentialDigest {
+    /// Borrows the exact SHA-256 digest already used by Native authorization.
+    #[must_use]
+    pub fn token_sha256(&self) -> &[u8; 32] {
+        &self.token_sha256
+    }
+}
+
+impl std::fmt::Debug for DeviceCredentialDigest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeviceCredentialDigest")
+            .field("client_id", &self.client_id)
+            .field("token_sha256", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// Versioned persistent Host identity and credential store.
 #[derive(Clone, Debug)]
 pub struct HostCredentialStore {
@@ -189,6 +215,25 @@ impl HostCredentialStore {
                 paired_at_unix_seconds: device.paired_at_unix_seconds,
             })
             .collect())
+    }
+
+    /// Loads private device digests for deriving optional authenticated routes.
+    pub fn device_credential_digests(&self) -> Result<Vec<DeviceCredentialDigest>, PairingError> {
+        self.load_record()?
+            .devices
+            .into_iter()
+            .map(|device| {
+                let token_sha256 = decode_hex_32(&device.token_sha256).ok_or_else(|| {
+                    PairingError::InvalidStore {
+                        message: "invalid device credential hash".to_owned(),
+                    }
+                })?;
+                Ok(DeviceCredentialDigest {
+                    client_id: device.client_id,
+                    token_sha256: Zeroizing::new(token_sha256),
+                })
+            })
+            .collect()
     }
 
     /// Issues or replaces one device-specific bearer credential.
@@ -689,6 +734,12 @@ mod tests {
         assert!(authorizer.authorize(&client_id, &token));
         assert!(!authorizer.authorize(&client_id, "wrong-token"));
         assert_eq!(store.devices()?.len(), 1);
+        let digests = store.device_credential_digests()?;
+        assert_eq!(digests.len(), 1);
+        assert_eq!(digests[0].client_id, client_id);
+        let expected_digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        assert_eq!(digests[0].token_sha256(), &expected_digest);
+        assert!(!format!("{:?}", digests[0]).contains(&token));
 
         store.revoke_device(&client_id)?;
         assert!(!authorizer.authorize(&client_id, &token));

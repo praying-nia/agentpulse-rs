@@ -121,3 +121,59 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
+
+  deploy:
+    name: Deploy production Relay
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    steps:
+      - name: Download tested Rust artifacts
+        uses: actions/download-artifact@v6
+        with:
+          name: ${{ github.event.repository.name }}-rust-${{ github.sha }}
+          path: artifact
+
+      - name: Install restricted SSH identity
+        env:
+          DEPLOY_KEY: ${{ secrets.RELAY_DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.RELAY_DEPLOY_KNOWN_HOSTS }}
+        shell: bash
+        run: |
+          test -n "$DEPLOY_KEY"
+          test -n "$KNOWN_HOSTS"
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/agentpulse-relay-deploy"
+          printf '%s\n' "$KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/agentpulse-relay-deploy" "$HOME/.ssh/known_hosts"
+
+      - name: Stage and activate tested Relay
+        env:
+          DEPLOY_HOST: ${{ vars.RELAY_DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ vars.RELAY_DEPLOY_PORT }}
+        shell: bash
+        run: |
+          test -n "$DEPLOY_HOST"
+          test -n "$DEPLOY_PORT"
+          chmod 0755 artifact/agentpulse-relay
+          test -x artifact/agentpulse-relay
+          scp -P "$DEPLOY_PORT" \
+            -i "$HOME/.ssh/agentpulse-relay-deploy" \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            artifact/agentpulse-relay \
+            "agentpulse-deploy@$DEPLOY_HOST:/var/lib/agentpulse-deploy/incoming/agentpulse-relay-$GITHUB_SHA"
+          ssh -p "$DEPLOY_PORT" \
+            -i "$HOME/.ssh/agentpulse-relay-deploy" \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "agentpulse-deploy@$DEPLOY_HOST" \
+            sudo /usr/local/sbin/agentpulse-relay-deploy "$GITHUB_SHA"
+
+      - name: Probe public Relay
+        env:
+          RELAY_ENDPOINT: ${{ vars.RELAY_ENDPOINT }}
+        shell: bash
+        run: |
+          test -n "$RELAY_ENDPOINT"
+          artifact/agentpulse-relay probe --endpoint "$RELAY_ENDPOINT"

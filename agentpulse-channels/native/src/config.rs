@@ -68,7 +68,7 @@ impl NativeChannelConfig {
         self
     }
 
-    /// Creates a configuration for a bearer-authenticated TLS LAN endpoint.
+    /// Creates a configuration for a bearer-authenticated TLS loopback or LAN endpoint.
     pub fn authenticated_lan(
         channel_id: ChannelId,
         address: SocketAddr,

@@ -19,7 +19,8 @@ pub use protocol::{
 pub use qr::terminal_qr;
 pub use server::{PairingOutcome, PairingSession};
 pub use store::{
-    DeviceCredentialSummary, FileCredentialAuthorizer, HostCredentialStore, HostIdentitySnapshot,
+    DeviceCredentialDigest, DeviceCredentialSummary, FileCredentialAuthorizer, HostCredentialStore,
+    HostIdentitySnapshot,
 };
 
 /// Fixed BLE GATT service for AgentPulse Pairing v1.

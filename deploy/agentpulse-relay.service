@@ -1,0 +1,38 @@
+[Unit]
+Description=AgentPulse public Relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agentpulse-relay
+Group=agentpulse-relay
+WorkingDirectory=/var/lib/agentpulse-relay
+ExecStartPre=/opt/agentpulse-relay/current/agentpulse-relay check-config --config /etc/agentpulse-relay/relay.json
+ExecStart=/opt/agentpulse-relay/current/agentpulse-relay serve --config /etc/agentpulse-relay/relay.json
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=20s
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+MemoryMax=384M
+TasksMax=64
+LimitNOFILE=1024
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

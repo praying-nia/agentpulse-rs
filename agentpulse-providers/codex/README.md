@@ -6,7 +6,7 @@
 
 ## Compatibility / 兼容范围
 
-- Codex CLI: exactly `0.150.1` / 仅支持精确版本 `0.150.1`。
+- Codex CLI: explicitly verified `0.150.1` and `0.152.0`; other versions fail closed / 已明确验证 `0.150.1` 与 `0.152.0`，其他版本默认拒绝。
 - Platforms: Linux and macOS managed Unix sockets / Linux 与 macOS 受管 Unix Socket。
 - Input: explicitly configured UUIDv7 thread IDs / 显式配置的 UUIDv7 Thread ID。
 - Events: live state, agent messages, connection changes, and turn outcomes / 实时状态、Agent 消息、连接变化与 Turn 结果。
@@ -18,7 +18,7 @@ The bundled schema was generated with:
 codex app-server generate-json-schema --out schemas
 ```
 
-Its SHA-256 is `18ba0e2282f69f7b3a05ffdc8ab0801c1468f25d72de3b4a37f1c8be67432a1d`. A Codex upgrade requires changing the version constant, schema, fixtures, and tests together.
+The bundled `0.152.0` aggregate schema SHA-256 is `d8faa38d5f00aa7ddfe635a2d374ee5f871ffd217d4d175c72fbe7f009f4f669`. The existing `0.150.1` captured fixtures also validate against this bundle. A Codex upgrade requires regenerating the schema and verifying fixtures plus a real managed App Server before adding the version to the explicit compatibility set.
 
 ## Runtime usage / 运行方式
 

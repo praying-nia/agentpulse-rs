@@ -92,7 +92,7 @@ impl fmt::Debug for TlsServerIdentity {
     }
 }
 
-/// Configuration for one bounded private-network TLS WebSocket listener.
+/// Configuration for one bounded loopback or private-network TLS WebSocket listener.
 #[derive(Clone)]
 pub struct TlsWebSocketConfig {
     bind_address: SocketAddr,
@@ -171,7 +171,7 @@ impl TlsWebSocketConfig {
     }
 
     fn validate(&self) -> Result<(), LoopbackWebSocketError> {
-        if !is_private_lan(self.bind_address.ip()) {
+        if !is_private_endpoint(self.bind_address.ip()) {
             return Err(LoopbackWebSocketError::NonPrivateAddress {
                 address: self.bind_address,
             });
@@ -505,10 +505,14 @@ fn header<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
         .filter(|value| !value.trim().is_empty() && value.len() <= 512)
 }
 
-fn is_private_lan(address: IpAddr) -> bool {
+fn is_private_endpoint(address: IpAddr) -> bool {
     match address {
-        IpAddr::V4(address) => address.is_private() || address.is_link_local(),
-        IpAddr::V6(address) => address.is_unique_local() || address.is_unicast_link_local(),
+        IpAddr::V4(address) => {
+            address.is_loopback() || address.is_private() || address.is_link_local()
+        }
+        IpAddr::V6(address) => {
+            address.is_loopback() || address.is_unique_local() || address.is_unicast_link_local()
+        }
     }
 }
 
@@ -519,15 +523,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lan_boundary_rejects_public_wildcard_and_loopback_addresses() {
-        for address in [
-            Ipv4Addr::UNSPECIFIED,
-            Ipv4Addr::LOCALHOST,
-            Ipv4Addr::new(8, 8, 8, 8),
-        ] {
-            assert!(!is_private_lan(IpAddr::V4(address)));
+    fn endpoint_boundary_accepts_loopback_and_private_but_rejects_public() {
+        for address in [Ipv4Addr::UNSPECIFIED, Ipv4Addr::new(8, 8, 8, 8)] {
+            assert!(!is_private_endpoint(IpAddr::V4(address)));
         }
-        assert!(is_private_lan(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20))));
-        assert!(is_private_lan(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 4))));
+        assert!(is_private_endpoint(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(is_private_endpoint(IpAddr::V4(Ipv4Addr::new(
+            192, 168, 1, 20
+        ))));
+        assert!(is_private_endpoint(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 1, 4
+        ))));
     }
 }

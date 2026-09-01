@@ -37,7 +37,7 @@ Provider 与 Channel 不直接依赖。Core 只路由与展示方式无关的事
 | --- | --- |
 | `agentpulse-core` | Shared domain models and task/session state / 共享领域模型及任务、会话状态 |
 | `agentpulse-bridge` | Runtime-neutral endpoint orchestration, subscriptions, fan-out, and Adapter lifecycle hosting / 运行时中立的端点编排、订阅、扇出与 Adapter 生命周期托管 |
-| `agentpulse-relay` | Optional self-hosted synchronization and message-routing service / 可选的自托管同步与消息路由服务 |
+| [`agentpulse-relay`](agentpulse-relay) | Optional authenticated opaque public tunnel for Native v1 / 可选、带认证且不解密 Native v1 的公网隧道 |
 | `agentpulse-protocol` | Rust types and codecs implementing the canonical protocol / 协议规范的 Rust 类型与编解码实现 |
 | [`agentpulse-transport`](agentpulse-transport) | Bounded concrete transport primitives / 有界的具体传输原语 |
 | [`agentpulse-pairing`](agentpulse-pairing) | Host identity, one-shot pairing, and device credentials / Host 身份、一次性配对与设备凭证 |
@@ -49,9 +49,9 @@ Initial Provider targets are Codex, Claude Code, OpenCode, and DeepSeek Harness.
 
 首批 Provider 目标为 Codex、Claude Code、OpenCode 与 DeepSeek Harness。Provider 集成应优先使用官方 RPC 或 SDK，其次为 Plugin API、可回写 Hook、只读 Hook，最后才考虑 PTY/TUI 技术。
 
-The first production Provider is [`agentpulse-provider-codex`](agentpulse-providers/codex). It manages a shared Unix-socket Codex App Server, strictly validates the pinned `0.150.1` schema, resumes explicit threads, and publishes live read-only session events.
+The first production Provider is [`agentpulse-provider-codex`](agentpulse-providers/codex). It manages a shared Unix-socket Codex App Server, strictly validates the generated `0.152.0` schema for explicitly verified CLI versions, resumes explicit threads, and publishes live read-only session events.
 
-首个正式 Provider 是 [`agentpulse-provider-codex`](agentpulse-providers/codex)。它托管共享 Unix Socket Codex App Server，严格校验固定的 `0.150.1` Schema，恢复显式 Thread，并发布实时只读 Session Event。
+首个正式 Provider 是 [`agentpulse-provider-codex`](agentpulse-providers/codex)。它托管共享 Unix Socket Codex App Server，针对明确验证过的 CLI 版本严格校验由 `0.152.0` 生成的 Schema，恢复显式 Thread，并发布实时只读 Session Event。
 
 Initial Channel targets are Native, Feishu, QQ, and Webhook. The Native Channel implements the protocol and transport between the Rust Bridge and the separately maintained Android, iOS, and HarmonyOS apps; it does not reimplement those clients.
 
@@ -85,6 +85,6 @@ Every Provider and Channel declares its capabilities. A remote operation is expo
 
 ## Status / 状态
 
-The Rust workspace now powers a usable local read-only product path: the `agentpulse` Host CLI owns a stable private identity and CA, explicit Codex threads, authenticated private-LAN Native WSS, mDNS discovery, one-shot BLE/QR pairing, per-device revocation, and credential rotation. Session/Event data remains in memory. Relay, offline history, databases, and write-back remain separate future milestones.
+The Rust workspace now powers a usable read-only product path: the `agentpulse` Host CLI owns a stable private identity and CA, explicit Codex threads, authenticated private-LAN Native WSS, mDNS discovery, one-shot BLE/QR pairing, per-device revocation, credential rotation, and an optional outbound Relay connector. `agentpulse-relay` authenticates Host/device routes over public TLS and pumps the existing Host-CA Native TLS ciphertext without access to Session/Event plaintext. Session/Event and Relay route state remain in memory. Offline history, databases, and write-back remain separate future milestones. Production deployment assets are documented in [`deploy`](deploy).
 
 Rust workspace 现已支撑可用的本地只读产品链路：`agentpulse` Host CLI 管理稳定私有身份与 CA、显式 Codex Thread、带认证私有 LAN Native WSS、mDNS 发现、一次性 BLE/QR 配对、逐设备撤销及凭证轮换。Session/Event 数据仍只保存在内存中；Relay、离线历史、数据库与写回属于后续独立里程碑。

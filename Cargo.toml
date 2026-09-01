@@ -7,6 +7,7 @@ members = [
     "agentpulse-pairing",
     "agentpulse-protocol",
     "agentpulse-providers/codex",
+    "agentpulse-relay",
     "agentpulse-transport",
 ]
 resolver = "3"
@@ -25,6 +26,8 @@ thiserror = "2"
 time = { version = "0.3", default-features = false, features = ["std"] }
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 uuid = { version = "1", features = ["v7"] }
+webpki-roots = "1"
+x509-parser = "0.16"
 jsonschema = { version = "0.52", default-features = false }
 base64 = "0.22"
 bluer = { version = "0.17.4", features = ["bluetoothd"] }
@@ -33,12 +36,14 @@ ctrlc = "3"
 directories = "6"
 fs2 = "0.4"
 futures = "0.3"
+hmac = "0.12"
 if-addrs = "0.14"
 mdns-sd = "0.17"
 qrcode = { version = "0.14", default-features = false }
 rand = "0.10"
 rcgen = { version = "0.13", features = ["x509-parser"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
 sha2 = "0.10"
 subtle = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }

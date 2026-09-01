@@ -643,12 +643,14 @@ fn verify_codex_version(config: &CodexProviderConfig) -> Result<(), CodexProvide
         })?
         .trim()
         .to_owned();
-    let expected_output = format!("codex-cli {}", crate::SUPPORTED_CODEX_CLI_VERSION);
-    if actual == expected_output {
+    if crate::SUPPORTED_CODEX_CLI_VERSIONS
+        .iter()
+        .any(|version| actual == format!("codex-cli {version}"))
+    {
         Ok(())
     } else {
         Err(CodexProviderSourceError::VersionMismatch {
-            expected: crate::SUPPORTED_CODEX_CLI_VERSION,
+            expected: crate::SUPPORTED_CODEX_CLI_VERSION_REQUIREMENT,
             actual,
         })
     }
