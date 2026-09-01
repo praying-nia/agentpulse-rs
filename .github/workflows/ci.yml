@@ -128,7 +128,7 @@ jobs:
     needs: rust
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    environment: production
+    environment: awa
     steps:
       - name: Download tested Rust artifacts
         uses: actions/download-artifact@v6
