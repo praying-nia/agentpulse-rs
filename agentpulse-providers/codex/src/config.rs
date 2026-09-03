@@ -30,6 +30,7 @@ pub struct CodexProviderConfig {
     pub(crate) socket_path: PathBuf,
     pub(crate) remote_uri: String,
     pub(crate) threads: Vec<ConfiguredThread>,
+    pub(crate) discover_threads: bool,
     pub(crate) codex_executable: PathBuf,
     pub(crate) startup_timeout: Duration,
     pub(crate) shutdown_timeout: Duration,
@@ -46,7 +47,6 @@ impl CodexProviderConfig {
         runtime_root: impl Into<PathBuf>,
         thread_ids: impl IntoIterator<Item = impl Into<String>>,
     ) -> Result<Self, CodexProviderBuildError> {
-        let runtime_root = absolute_path(runtime_root.into())?;
         let thread_ids = thread_ids.into_iter().map(Into::into).collect::<Vec<_>>();
         if thread_ids.is_empty() {
             return Err(CodexProviderBuildError::EmptyThreadList);
@@ -70,6 +70,26 @@ impl CodexProviderConfig {
                 session_id,
             });
         }
+
+        Self::finish(provider_id, runtime_root.into(), threads, false)
+    }
+
+    /// Creates an ephemeral configuration that follows threads started or resumed by
+    /// another client of the same managed App Server.
+    pub fn discovering(
+        provider_id: ProviderId,
+        runtime_root: impl Into<PathBuf>,
+    ) -> Result<Self, CodexProviderBuildError> {
+        Self::finish(provider_id, runtime_root.into(), Vec::new(), true)
+    }
+
+    fn finish(
+        provider_id: ProviderId,
+        runtime_root: PathBuf,
+        threads: Vec<ConfiguredThread>,
+        discover_threads: bool,
+    ) -> Result<Self, CodexProviderBuildError> {
+        let runtime_root = absolute_path(runtime_root)?;
 
         let runtime_directory = runtime_root.join(runtime_directory_key(provider_id));
         let socket_path = runtime_directory.join(SOCKET_FILE_NAME);
@@ -95,6 +115,7 @@ impl CodexProviderConfig {
             socket_path,
             remote_uri,
             threads,
+            discover_threads,
             codex_executable: PathBuf::from("codex"),
             startup_timeout: Duration::from_secs(10),
             shutdown_timeout: Duration::from_secs(5),
@@ -242,6 +263,16 @@ mod tests {
                 maximum,
             } if maximum == PORTABLE_UNIX_SOCKET_PATH_MAX && length > maximum
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn discovering_config_has_no_persistent_thread_binding() -> Result<(), Box<dyn Error>> {
+        let provider_id = ProviderId::from_str(PROVIDER_ID)?;
+        let config = CodexProviderConfig::discovering(provider_id, "/tmp/agentpulse")?;
+
+        assert!(config.threads.is_empty());
+        assert!(config.discover_threads);
         Ok(())
     }
 }

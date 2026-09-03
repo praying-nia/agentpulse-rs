@@ -18,14 +18,19 @@ Examples:
   ap rinia -C /path/to/project
 
 The first command starts or reuses the matching AgentPulse Host, then opens
-the Codex terminal UI through its managed App Server. A newly started Host
-shows one pairing QR code first. The Host remains running after the terminal UI
-exits so paired phones can reconnect.
+the Codex terminal UI in the current directory through its managed App Server.
+An explicit Codex -C/--cd argument overrides that directory. A newly started
+Host shows one pairing QR code first. The Host remains running after the
+terminal UI exits so paired phones can reconnect.
 EOF
 }
 
 state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/agentpulse"
 service_name=agentpulse-host.service
+proxy_variables=(
+    HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY
+    http_proxy https_proxy all_proxy no_proxy
+)
 
 agentpulse_bin="${AGENTPULSE_BIN:-$(command -v agentpulse || true)}"
 if [[ -z "$agentpulse_bin" || ! -x "$agentpulse_bin" ]]; then
@@ -39,6 +44,38 @@ host_status() {
 
 host_is_running() {
     [[ "$1" == Host:* ]]
+}
+
+host_has_current_proxy_environment() {
+    local host_pid="$1"
+    local entry
+    local name
+    local proxy_name
+    local value
+    declare -A host_proxy_environment=()
+
+    [[ -n "$host_pid" && -r "/proc/$host_pid/environ" ]] || return 1
+    while IFS= read -r -d '' entry; do
+        name="${entry%%=*}"
+        for proxy_name in "${proxy_variables[@]}"; do
+            if [[ "$name" == "$proxy_name" ]]; then
+                host_proxy_environment["$name"]="${entry#*=}"
+                break
+            fi
+        done
+    done < "/proc/$host_pid/environ"
+
+    for name in "${proxy_variables[@]}"; do
+        if [[ -v "$name" ]]; then
+            value="${!name}"
+            if [[ ! -v "host_proxy_environment[$name]" || "${host_proxy_environment[$name]}" != "$value" ]]; then
+                return 1
+            fi
+        elif [[ -v "host_proxy_environment[$name]" ]]; then
+            return 1
+        fi
+    done
+    return 0
 }
 
 unit_load_state() {
@@ -185,21 +222,37 @@ if host_is_running "$status"; then
         echo "Switching AgentPulse Host from ${active_codex:-an unknown Codex executable} to $codex_bin..."
         stop_host "$status"
         status="AgentPulse Host is stopped."
+    else
+        host_pid="$(sed -n 's/^Host PID: //p' <<<"$status")"
+        if ! host_has_current_proxy_environment "$host_pid"; then
+            echo "Restarting AgentPulse Host to inherit the current proxy environment..."
+            stop_host "$status"
+            status="AgentPulse Host is stopped."
+        fi
     fi
 fi
 
 if ! host_is_running "$status"; then
+    systemd_environment=()
+    for name in "${proxy_variables[@]}"; do
+        if [[ -v "$name" ]]; then
+            systemd_environment+=(--setenv="$name")
+        fi
+    done
     wait_until_unit_collected
     echo "Starting AgentPulse Host with $codex_command..."
     systemd-run --user \
         --unit agentpulse-host \
         --collect \
         --quiet \
+        --same-dir \
+        "${systemd_environment[@]}" \
         --property Type=exec \
         --property KillMode=mixed \
         --property TimeoutStopSec=30s \
         "$agentpulse_bin" serve \
         --bind 127.0.0.1 \
+        --discover-threads \
         --codex "$codex_bin"
     wait_until_ready
     started_host=true
@@ -218,4 +271,18 @@ if $started_host; then
     "$agentpulse_bin" pair
 fi
 
-exec "$agentpulse_bin" codex --codex "$codex_bin" -- "$@"
+codex_arguments=("$@")
+has_explicit_working_directory=false
+for argument in "${codex_arguments[@]}"; do
+    case "$argument" in
+        -C|--cd|--cd=*|-C?*)
+            has_explicit_working_directory=true
+            break
+            ;;
+    esac
+done
+if ! $has_explicit_working_directory; then
+    codex_arguments=(-C "$PWD" "${codex_arguments[@]}")
+fi
+
+exec "$agentpulse_bin" codex --codex "$codex_bin" -- "${codex_arguments[@]}"

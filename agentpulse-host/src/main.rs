@@ -114,6 +114,9 @@ struct ServeArgs {
     /// Codex executable to version-check and launch.
     #[arg(long, default_value = "codex")]
     codex: PathBuf,
+    /// Follows threads started in this App Server without persistent thread bindings.
+    #[arg(long)]
+    discover_threads: bool,
 }
 
 #[derive(Args)]
@@ -394,7 +397,7 @@ fn serve(paths: &HostPaths, args: ServeArgs) -> AppResult<()> {
     let store = paths.store();
     let identity = store.load_identity()?;
     let relay_settings = load_relay_settings(&paths.relay_config, &identity.host_id)?;
-    if identity.thread_ids.is_empty() {
+    if identity.thread_ids.is_empty() && !args.discover_threads {
         return Err("no Codex threads configured; run `agentpulse threads add` first".into());
     }
     let bind_ip = match args.bind {
@@ -412,11 +415,12 @@ fn serve(paths: &HostPaths, args: ServeArgs) -> AppResult<()> {
     };
     let provider_id = ProviderId::from_str(&identity.provider_id)?;
     let channel_id = ChannelId::from_str(&identity.channel_id)?;
-    let provider_config = CodexProviderConfig::new(
-        provider_id,
-        paths.runtime_dir.join("codex"),
-        identity.thread_ids.clone(),
-    )?
+    let runtime_root = paths.runtime_dir.join("codex");
+    let provider_config = if args.discover_threads {
+        CodexProviderConfig::discovering(provider_id, runtime_root)?
+    } else {
+        CodexProviderConfig::new(provider_id, runtime_root, identity.thread_ids.clone())?
+    }
     .with_codex_executable(args.codex.clone());
     let provider_parts = CodexProvider::build(provider_config)?;
     let provider_handle = provider_parts.handle().clone();

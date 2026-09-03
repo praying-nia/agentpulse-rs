@@ -1014,7 +1014,39 @@ mod tests {
         let config =
             CodexProviderConfig::new(provider_id, "/tmp/ap-test", thread_ids.iter().copied())?;
         let schema = ProtocolSchema::compile()?;
-        let mapper = CodexEventMapper::new(provider_id, &config.threads);
+        let mapper = CodexEventMapper::new(provider_id, &config.threads, config.discover_threads);
+        let status = Arc::new(Mutex::new(Default::default()));
+        let source = CodexProviderSource::with_runtime(
+            config,
+            schema,
+            mapper,
+            Arc::clone(&status),
+            Box::new(FakeRuntime { control }),
+        );
+        let descriptor = provider_descriptor(provider_id)?;
+        Ok((
+            provider_id,
+            CodexProviderPort::new(descriptor),
+            source,
+            status,
+        ))
+    }
+
+    fn test_discovering_provider(
+        control: Arc<FakeControl>,
+    ) -> Result<
+        (
+            ProviderId,
+            CodexProviderPort,
+            CodexProviderSource,
+            SharedStatus,
+        ),
+        crate::CodexProviderBuildError,
+    > {
+        let provider_id = ProviderId::new();
+        let config = CodexProviderConfig::discovering(provider_id, "/tmp/ap-test")?;
+        let schema = ProtocolSchema::compile()?;
+        let mapper = CodexEventMapper::new(provider_id, &config.threads, config.discover_threads);
         let status = Arc::new(Mutex::new(Default::default()));
         let source = CodexProviderSource::with_runtime(
             config,
@@ -1161,6 +1193,33 @@ mod tests {
                 message: ProtocolMessage::AgentSession(ref session),
             } if session.id() == session_id
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn discovering_provider_follows_thread_started_without_saved_ids() -> TestResult {
+        let control = Arc::new(FakeControl::default());
+        let initialize = LIVE_FIXTURE
+            .lines()
+            .next()
+            .ok_or("fixture has no initialize response")?;
+        let thread_started = LIVE_FIXTURE
+            .lines()
+            .find(|line| line.contains("\"method\":\"thread/started\""))
+            .ok_or("fixture has no thread/started notification")?;
+        control.push_text(initialize);
+        let (_provider_id, port, source, status) = test_discovering_provider(Arc::clone(&control))?;
+        let session_id = SessionId::from_str(THREAD_ID)?;
+        let mut host = RuntimeHost::new();
+        host.register_provider(port, source)?;
+        let _ = host.start()?;
+
+        assert_eq!(locked(&control.outgoing).len(), 2);
+        control.push_text(thread_started);
+        wait_until(|| snapshot(&status).mapped_events() == 1)?;
+        assert!(host.inspect_bridge(|bridge| bridge.session_aggregate(session_id).is_some())?);
+        assert_eq!(snapshot(&status).health(), CodexProviderHealth::Running);
+        let _ = host.stop()?;
         Ok(())
     }
 

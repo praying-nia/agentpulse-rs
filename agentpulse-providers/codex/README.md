@@ -1,14 +1,14 @@
 # AgentPulse Codex Provider
 
-`agentpulse-provider-codex` is a complete read-only Provider for explicit Codex threads. It owns a schema-pinned Codex App Server, exposes that server over a private Unix socket, validates the complete raw protocol, and maps live thread activity into AgentPulse sessions.
+`agentpulse-provider-codex` is a complete read-only Provider for Codex threads. It owns a schema-pinned Codex App Server, exposes that server over a private Unix socket, validates the complete raw protocol, and maps live thread activity into AgentPulse sessions.
 
-`agentpulse-provider-codex` 是面向显式 Codex Thread 的完整只读 Provider。它托管固定 Schema 的 Codex App Server，通过私有 Unix Socket 暴露共享端点，校验完整原始协议，并将实时 Thread 活动映射为 AgentPulse Session。
+`agentpulse-provider-codex` 是面向 Codex Thread 的完整只读 Provider。它托管固定 Schema 的 Codex App Server，通过私有 Unix Socket 暴露共享端点，校验完整原始协议，并将实时 Thread 活动映射为 AgentPulse Session。
 
 ## Compatibility / 兼容范围
 
 - Codex CLI: explicitly verified `0.150.1`, `0.152.0`, and `0.152.1`. A valid SemVer newer than `0.152.1` starts best-effort with a visible warning; older unknown versions and malformed output fail before runtime creation / 已明确验证 `0.150.1`、`0.152.0` 与 `0.152.1`。高于 `0.152.1` 的合法 SemVer 会在明确警告后尽力启动；未验证的旧版本与非法输出会在创建运行目录前失败。
 - Platforms: Linux and macOS managed Unix sockets / Linux 与 macOS 受管 Unix Socket。
-- Input: explicitly configured UUIDv7 thread IDs / 显式配置的 UUIDv7 Thread ID。
+- Input: explicitly configured UUIDv7 thread IDs, or ephemeral discovery of threads opened through the same managed App Server / 显式配置的 UUIDv7 Thread ID，或对同一受管 App Server 中已打开 Thread 的临时发现。
 - Events: live state, agent messages, connection changes, and turn outcomes / 实时状态、Agent 消息、连接变化与 Turn 结果。
 - Write-back: unsupported; server requests receive an explicit JSON-RPC read-only error / 不支持回写；服务端请求会收到明确的 JSON-RPC 只读错误。
 
@@ -52,6 +52,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 ```
 
 Start RuntimeHost before connecting another client with `codex --remote <uri>`. The Provider resumes every configured thread before reporting startup success. It does not replay turns included in `thread/resume`; only notifications observed after the subscription boundary become AgentPulse events.
+
+Use `CodexProviderConfig::discovering` instead when the Provider must start with
+no saved Thread IDs and follow `thread/started` events from a Remote TUI. That
+mapping exists only for the lifetime of the Provider.
 
 RuntimeHost 停止会关闭 WebSocket、等待读取 Worker、终止受管 App Server，并仅清理 Provider 自己创建的私有目录。实时协议或进程故障会将已跟踪 Session 标记为 `Disconnected`，并通过 `CodexProviderHandle` 暴露终态错误；恢复方式是显式停止并重新启动 RuntimeHost。
 

@@ -36,8 +36,21 @@ ap stop
 Starting or switching the Host shows one pairing QR before opening Codex; press
 `Ctrl+C` to skip it and run `ap` again, leaving the Host in the background.
 `ap qrcode` opens another one-time pairing session whenever the Host is already
-running. Additional arguments are forwarded to Codex, for example
+running. Each foreground `ap` invocation opens Codex in the shell's current
+directory even when it reuses an older background Host. Additional arguments
+are forwarded to Codex; an explicit `-C` or `--cd` takes precedence, for example
 `ap rinia -C /path/to/project`.
+
+The background Host inherits the current shell's upper- and lower-case HTTP,
+HTTPS, ALL, and NO proxy variables. If they change, the next `ap` invocation
+restarts the Host with the new proxy environment.
+
+The shortcut does not read, change, or persist the manual `agentpulse threads`
+allowlist. It follows only threads started or resumed through its managed App
+Server while that Host is running; stopping the Host discards that runtime
+mapping. The Host identity, paired-device credentials, and Relay configuration
+remain machine-level so a stopped shortcut does not force the phone to pair
+again.
 
 ## Pair and operate
 

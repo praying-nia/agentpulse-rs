@@ -1,6 +1,9 @@
 //! Codex thread and turn mapping into AgentPulse domain events.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    str::FromStr,
+};
 
 use agentpulse_bridge::{ProviderEventHandle, ProviderEventIngressError};
 use agentpulse_core::{
@@ -37,6 +40,7 @@ struct ThreadMapping {
 
 pub(crate) struct CodexEventMapper {
     provider_id: ProviderId,
+    discover_threads: bool,
     configured: BTreeMap<String, SessionId>,
     threads: BTreeMap<String, ThreadMapping>,
     recent_keys: BTreeSet<String>,
@@ -44,9 +48,14 @@ pub(crate) struct CodexEventMapper {
 }
 
 impl CodexEventMapper {
-    pub(crate) fn new(provider_id: ProviderId, threads: &[ConfiguredThread]) -> Self {
+    pub(crate) fn new(
+        provider_id: ProviderId,
+        threads: &[ConfiguredThread],
+        discover_threads: bool,
+    ) -> Self {
         Self {
             provider_id,
+            discover_threads,
             configured: threads
                 .iter()
                 .map(|thread| (thread.external_id.as_str().to_owned(), thread.session_id))
@@ -200,6 +209,16 @@ impl CodexEventMapper {
         events: &ProviderEventHandle,
         status: &SharedStatus,
     ) -> Result<MappingDisposition, CodexProviderSourceError> {
+        if method == "thread/started" && self.discover_threads {
+            let thread = object_field(params, "thread")?;
+            let thread_id = string_field(thread, "id")?;
+            if !self.configured.contains_key(thread_id) {
+                self.configured
+                    .insert(thread_id.to_owned(), SessionId::from_str(thread_id)?);
+            }
+            self.resume_thread(params, events, status)?;
+            return Ok(MappingDisposition::Mapped);
+        }
         let Some(thread_id) = params.get("threadId").and_then(Value::as_str).or_else(|| {
             params
                 .get("thread")

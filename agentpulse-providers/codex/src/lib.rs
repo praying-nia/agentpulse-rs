@@ -1,7 +1,8 @@
 //! A complete read-only Codex Provider backed by a managed App Server.
 //!
-//! The Provider owns a Unix-socket Codex App Server, resumes an explicit set
-//! of threads, strictly validates the schema-pinned protocol, and publishes
+//! The Provider owns a Unix-socket Codex App Server, either resumes an explicit
+//! set of threads or follows threads opened by another client of that same
+//! server, strictly validates the schema-pinned protocol, and publishes
 //! normalized live session events through `agentpulse-bridge`.
 
 mod config;
@@ -99,7 +100,8 @@ impl CodexProvider {
         )
         .with_version(NonEmptyText::new(SUPPORTED_CODEX_CLI_VERSION)?);
         let status = Arc::new(Mutex::new(Default::default()));
-        let mapper = CodexEventMapper::new(config.provider_id, &config.threads);
+        let mapper =
+            CodexEventMapper::new(config.provider_id, &config.threads, config.discover_threads);
         let handle = CodexProviderHandle {
             remote_uri: config.remote_uri.clone(),
             status: Arc::clone(&status),
