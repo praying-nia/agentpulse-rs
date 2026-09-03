@@ -16,7 +16,7 @@ use std::{
         mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use agentpulse_bridge::RuntimeHost;
@@ -32,9 +32,9 @@ use agentpulse_provider_codex::{
     CodexProvider, CodexProviderConfig, CodexProviderHealth, SUPPORTED_CODEX_CLI_VERSION,
 };
 use agentpulse_relay::{
-    RelayEndpoint, RelayError, RelayHostConnectionConfig, RouteRegistration,
-    connect_host_once_with_route_check, connect_host_once_with_route_check_and_waiting,
-    derive_route, device_root_from_token,
+    RelayConnectionCanceller, RelayEndpoint, RelayError, RelayHostConnectionConfig,
+    RouteRegistration, connect_host_once_with_route_check,
+    connect_host_once_with_route_check_and_waiting, derive_route, device_root_from_token,
 };
 use clap::{Args, Parser, Subcommand};
 use directories::ProjectDirs;
@@ -45,6 +45,7 @@ use zeroize::Zeroizing;
 
 type AppResult<T> = Result<T, Box<dyn Error>>;
 const DEFAULT_NATIVE_PORT: u16 = 49_320;
+const RELAY_CONNECTOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Parser)]
 #[command(name = "agentpulse", version, about = "Secure local AgentPulse Host")]
@@ -271,6 +272,27 @@ struct RelayRuntimeState(Arc<Mutex<RelayRuntimeSnapshot>>);
 struct RelayRuntimeSnapshot {
     health: String,
     last_error: Option<String>,
+}
+
+struct RelayConnector {
+    canceller: RelayConnectionCanceller,
+    worker: thread::JoinHandle<()>,
+}
+
+impl RelayConnector {
+    fn cancel_and_join(self, timeout: Duration) -> Result<(), &'static str> {
+        self.canceller.cancel();
+        let deadline = Instant::now() + timeout;
+        while !self.worker.is_finished() {
+            if Instant::now() >= deadline {
+                return Err("Relay connector did not stop before its deadline; detaching it");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        self.worker
+            .join()
+            .map_err(|_| "Relay connector thread terminated unexpectedly")
+    }
 }
 
 impl RelayRuntimeState {
@@ -518,10 +540,11 @@ fn serve(paths: &HostPaths, args: ServeArgs) -> AppResult<()> {
         &paths.status_file,
     );
     stop_requested.store(true, Ordering::Release);
-    if let Some(relay_thread) = relay_thread
-        && relay_thread.join().is_err()
+    if let Some(relay_connector) = relay_thread
+        && let Err(error) =
+            relay_connector.cancel_and_join(RELAY_CONNECTOR_SHUTDOWN_TIMEOUT)
     {
-        eprintln!("warning: Relay connector thread terminated unexpectedly");
+        eprintln!("warning: {error}");
     }
     let stop_result = host.stop();
     if let Some(mdns) = mdns {
@@ -882,15 +905,17 @@ fn spawn_relay_connector(
     settings: RelayHostSettings,
     stop: Arc<AtomicBool>,
     runtime: RelayRuntimeState,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
+) -> RelayConnector {
+    let canceller = RelayConnectionCanceller::new();
+    let worker_canceller = canceller.clone();
+    let worker = thread::spawn(move || {
         let config = match RelayHostConnectionConfig::new(
             settings.endpoint.clone(),
             host_id,
             settings.enrollment_token.as_str(),
             native_address,
         ) {
-            Ok(config) => config,
+            Ok(config) => config.with_connection_canceller(worker_canceller),
             Err(error) => {
                 runtime.update("failed", Some(error.to_string()));
                 return;
@@ -933,7 +958,8 @@ fn spawn_relay_connector(
             }
         }
         runtime.update("stopped", None);
-    })
+    });
+    RelayConnector { canceller, worker }
 }
 
 fn sleep_until_stopped(stop: &AtomicBool, duration: Duration) {
@@ -1174,6 +1200,36 @@ mod tests {
             _ => return Err("serve command was not selected".into()),
         };
         assert_eq!(args.port, 49_321);
+        Ok(())
+    }
+
+    #[test]
+    fn relay_connector_join_is_bounded() -> AppResult<()> {
+        let (release_sender, release_receiver) = mpsc::channel();
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_finished = Arc::clone(&finished);
+        let worker = thread::spawn(move || {
+            let _ = release_receiver.recv();
+            worker_finished.store(true, Ordering::Release);
+        });
+        let connector = RelayConnector {
+            canceller: RelayConnectionCanceller::new(),
+            worker,
+        };
+
+        let started = Instant::now();
+        assert!(
+            connector
+                .cancel_and_join(Duration::from_millis(20))
+                .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release_sender.send(())?;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !finished.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(finished.load(Ordering::Acquire));
         Ok(())
     }
 }

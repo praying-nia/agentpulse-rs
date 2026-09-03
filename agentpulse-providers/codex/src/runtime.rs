@@ -27,9 +27,11 @@ use semver::Version;
 #[cfg(unix)]
 use std::{
     fs,
+    net::Shutdown,
     os::unix::{
         fs::PermissionsExt,
         net::{UnixListener, UnixStream},
+        process::CommandExt,
     },
 };
 
@@ -95,7 +97,7 @@ pub struct CodexProviderSource {
     stop_sender: Option<mpsc::Sender<()>>,
     worker: Option<JoinHandle<WorkerExit>>,
     client_proxy_enabled: bool,
-    proxy_stop: Option<Arc<AtomicBool>>,
+    proxy_control: Option<Arc<ProxyControl>>,
     proxy_worker: Option<JoinHandle<ProxyExit>>,
     resources_acquired: bool,
 }
@@ -142,7 +144,7 @@ impl CodexProviderSource {
             stop_sender: None,
             worker: None,
             client_proxy_enabled: false,
-            proxy_stop: None,
+            proxy_control: None,
             proxy_worker: None,
             resources_acquired: false,
         }
@@ -268,8 +270,8 @@ impl CodexProviderSource {
                 Arc::clone(&self.approvals),
                 events.clone(),
             ) {
-                Ok((stop, worker)) => {
-                    self.proxy_stop = Some(stop);
+                Ok((control, worker)) => {
+                    self.proxy_control = Some(control);
                     self.proxy_worker = Some(worker);
                 }
                 Err(error) => {
@@ -284,8 +286,8 @@ impl CodexProviderSource {
 
     fn stop_inner(&mut self) -> Result<(), CodexProviderSourceError> {
         let mut cleanup_failures = Vec::new();
-        if let Some(stop) = self.proxy_stop.take() {
-            stop.store(true, Ordering::Release);
+        if let Some(control) = self.proxy_control.take() {
+            control.request_stop();
         }
         if let Some(sender) = self.stop_sender.take() {
             let _ = sender.send(());
@@ -1572,6 +1574,69 @@ fn protocol_string<'a>(
         .ok_or_else(|| CodexProviderSourceError::protocol(format!("{field} must be a string")))
 }
 
+#[derive(Default)]
+struct ProxyControl {
+    stopped: AtomicBool,
+    #[cfg(unix)]
+    connections: Mutex<BTreeMap<u64, Vec<UnixStream>>>,
+}
+
+impl ProxyControl {
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    fn request_stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+        #[cfg(unix)]
+        {
+            let connections = {
+                let mut connections = self
+                    .connections
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                std::mem::take(&mut *connections)
+            };
+            for stream in connections.into_values().flatten() {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn register(
+        &self,
+        route: ApprovalRoute,
+        stream: &UnixStream,
+    ) -> Result<bool, CodexProviderSourceError> {
+        let interrupt = stream.try_clone().map_err(|error| {
+            CodexProviderSourceError::runtime("client proxy cancellation socket clone", error)
+        })?;
+        let mut connections = self
+            .connections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.is_stopped() {
+            drop(connections);
+            let _ = interrupt.shutdown(Shutdown::Both);
+            return Ok(false);
+        }
+        connections
+            .entry(route_number(route))
+            .or_default()
+            .push(interrupt);
+        Ok(true)
+    }
+
+    #[cfg(unix)]
+    fn unregister(&self, route: ApprovalRoute) {
+        self.connections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&route_number(route));
+    }
+}
+
 #[cfg(unix)]
 fn start_client_proxy(
     config: &CodexProviderConfig,
@@ -1580,7 +1645,7 @@ fn start_client_proxy(
     status: SharedStatus,
     approvals: SharedApprovalState,
     events: ProviderEventHandle,
-) -> Result<(Arc<AtomicBool>, JoinHandle<ProxyExit>), CodexProviderSourceError> {
+) -> Result<(Arc<ProxyControl>, JoinHandle<ProxyExit>), CodexProviderSourceError> {
     let listener = UnixListener::bind(&config.proxy_socket_path)
         .map_err(|error| CodexProviderSourceError::runtime("client proxy bind", error))?;
     if let Err(error) =
@@ -1600,8 +1665,8 @@ fn start_client_proxy(
         ));
     }
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let worker_stop = Arc::clone(&stop);
+    let control = Arc::new(ProxyControl::default());
+    let worker_control = Arc::clone(&control);
     let app_server_socket_path = config.socket_path.clone();
     let proxy_socket_path = config.proxy_socket_path.clone();
     let worker = thread::Builder::new()
@@ -1616,14 +1681,14 @@ fn start_client_proxy(
                 status,
                 approvals,
                 events,
-                worker_stop,
+                worker_control,
             )
         })
         .map_err(|error| {
             let _ = fs::remove_file(&config.proxy_socket_path);
             CodexProviderSourceError::runtime("client proxy thread spawn", error)
         })?;
-    Ok((stop, worker))
+    Ok((control, worker))
 }
 
 #[cfg(not(unix))]
@@ -1634,7 +1699,7 @@ fn start_client_proxy(
     _status: SharedStatus,
     _approvals: SharedApprovalState,
     _events: ProviderEventHandle,
-) -> Result<(Arc<AtomicBool>, JoinHandle<ProxyExit>), CodexProviderSourceError> {
+) -> Result<(Arc<ProxyControl>, JoinHandle<ProxyExit>), CodexProviderSourceError> {
     Err(CodexProviderSourceError::UnsupportedPlatform)
 }
 
@@ -1649,11 +1714,11 @@ fn run_client_proxy(
     status: SharedStatus,
     approvals: SharedApprovalState,
     events: ProviderEventHandle,
-    stop: Arc<AtomicBool>,
+    control: Arc<ProxyControl>,
 ) -> ProxyExit {
     let mut next_route = 1_u64;
     let mut clients: Vec<JoinHandle<()>> = Vec::new();
-    while !stop.load(Ordering::Acquire) {
+    while !control.is_stopped() {
         let mut index = 0;
         while index < clients.len() {
             if clients[index].is_finished() {
@@ -1678,7 +1743,7 @@ fn run_client_proxy(
                 let worker_status = Arc::clone(&status);
                 let worker_approvals = Arc::clone(&approvals);
                 let worker_events = events.clone();
-                let worker_stop = Arc::clone(&stop);
+                let worker_control = Arc::clone(&control);
                 match thread::Builder::new()
                     .name(format!("agentpulse-codex-client-{}", route_number(route)))
                     .spawn(move || {
@@ -1690,12 +1755,13 @@ fn run_client_proxy(
                             worker_status,
                             worker_approvals,
                             worker_events,
-                            worker_stop,
+                            worker_control,
                             route,
                         );
                     }) {
                     Ok(worker) => clients.push(worker),
                     Err(error) => {
+                        control.unregister(route);
                         eprintln!("warning: failed to spawn Codex client proxy: {error}");
                     }
                 }
@@ -1708,7 +1774,7 @@ fn run_client_proxy(
                 let mut current = lock_status(&status);
                 current.health = CodexProviderHealth::Failed;
                 current.last_error = Some(message);
-                stop.store(true, Ordering::Release);
+                control.request_stop();
                 for worker in clients {
                     let _ = worker.join();
                 }
@@ -1747,7 +1813,7 @@ fn run_proxy_connection(
     status: SharedStatus,
     approvals: SharedApprovalState,
     events: ProviderEventHandle,
-    stop: Arc<AtomicBool>,
+    control: Arc<ProxyControl>,
     route: ApprovalRoute,
 ) {
     let result = proxy_connection_loop(
@@ -1758,9 +1824,10 @@ fn run_proxy_connection(
         &status,
         &approvals,
         &events,
-        &stop,
+        &control,
         route,
     );
+    control.unregister(route);
     let closed = lock_approvals(&approvals).close_route(route);
     for approval in closed {
         let _ = publish_closed(
@@ -1772,7 +1839,7 @@ fn run_proxy_connection(
         );
     }
     if let Err(error) = result
-        && !stop.load(Ordering::Acquire)
+        && !control.is_stopped()
     {
         eprintln!("warning: Codex client proxy connection ended: {error}");
     }
@@ -1788,9 +1855,12 @@ fn proxy_connection_loop(
     status: &SharedStatus,
     approvals: &SharedApprovalState,
     events: &ProviderEventHandle,
-    stop: &AtomicBool,
+    control: &ProxyControl,
     route: ApprovalRoute,
 ) -> Result<(), CodexProviderSourceError> {
+    if !control.register(route, &downstream_stream)? {
+        return Ok(());
+    }
     downstream_stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .map_err(|error| CodexProviderSourceError::runtime("client handshake timeout", error))?;
@@ -1804,6 +1874,9 @@ fn proxy_connection_loop(
 
     let upstream_stream = UnixStream::connect(app_server_socket_path)
         .map_err(|error| CodexProviderSourceError::runtime("proxy upstream connection", error))?;
+    if !control.register(route, &upstream_stream)? {
+        return Ok(());
+    }
     configure_proxy_stream(&upstream_stream)?;
     let (mut upstream, _) =
         tungstenite::client("ws://localhost/", upstream_stream).map_err(|error| {
@@ -1813,7 +1886,7 @@ fn proxy_connection_loop(
         })?;
     let protocol = ProtocolEngine::new(schema.clone());
 
-    while !stop.load(Ordering::Acquire) {
+    while !control.is_stopped() {
         flush_approval_responses(
             &mut UnixWebSocketRef(&mut upstream),
             &protocol,
@@ -2035,10 +2108,11 @@ impl AppServerRuntime for ManagedCodexRuntime {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped());
+            command.process_group(0);
             let child = command
                 .spawn()
                 .map_err(|error| CodexProviderSourceError::runtime("process launch", error))?;
-            self.process = Some(ManagedProcess::new(child)?);
+            self.process = Some(ManagedProcess::new_in_own_process_group(child)?);
 
             let deadline = Instant::now() + config.startup_timeout;
             loop {
@@ -2133,6 +2207,10 @@ impl AppServerRuntime for ManagedCodexRuntime {
                 if let Err(error) = process.wait() {
                     failures.push(format!("process wait: {error}"));
                 }
+            } else if let Err(error) = process.kill_remaining_process_group()
+                && error.kind() != io::ErrorKind::InvalidInput
+            {
+                failures.push(format!("remaining process group termination: {error}"));
             }
             process.join_stderr(IO_POLL_INTERVAL);
         }
@@ -2214,13 +2292,35 @@ fn version_mismatch(actual: &str) -> CodexProviderSourceError {
 
 struct ManagedProcess {
     child: Child,
+    #[cfg(unix)]
+    process_group: Option<i32>,
     stderr: Arc<Mutex<VecDeque<u8>>>,
     stderr_thread: Option<JoinHandle<()>>,
     stderr_done: mpsc::Receiver<()>,
 }
 
 impl ManagedProcess {
-    fn new(mut child: Child) -> Result<Self, CodexProviderSourceError> {
+    #[cfg(test)]
+    fn new(child: Child) -> Result<Self, CodexProviderSourceError> {
+        Self::new_with_process_group(child, None)
+    }
+
+    #[cfg(unix)]
+    fn new_in_own_process_group(child: Child) -> Result<Self, CodexProviderSourceError> {
+        let process_group = i32::try_from(child.id()).map_err(|_| {
+            CodexProviderSourceError::runtime(
+                "process group capture",
+                "child PID exceeds the supported process-group range",
+            )
+        })?;
+        Self::new_with_process_group(child, Some(process_group))
+    }
+
+    fn new_with_process_group(
+        mut child: Child,
+        #[cfg(unix)] process_group: Option<i32>,
+        #[cfg(not(unix))] _process_group: Option<i32>,
+    ) -> Result<Self, CodexProviderSourceError> {
         let Some(stderr_pipe) = child.stderr.take() else {
             let _ = child.kill();
             let _ = child.wait();
@@ -2250,6 +2350,8 @@ impl ManagedProcess {
         };
         Ok(Self {
             child,
+            #[cfg(unix)]
+            process_group,
             stderr,
             stderr_thread: Some(stderr_thread),
             stderr_done,
@@ -2260,10 +2362,6 @@ impl ManagedProcess {
         self.child.try_wait()
     }
 
-    fn kill(&mut self) -> io::Result<()> {
-        self.child.kill()
-    }
-
     #[cfg(unix)]
     fn terminate(&mut self) -> io::Result<()> {
         use nix::{
@@ -2272,9 +2370,10 @@ impl ManagedProcess {
             unistd::Pid,
         };
 
-        let pid = i32::try_from(self.child.id())
+        let child_pid = i32::try_from(self.child.id())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "child PID exceeds i32"))?;
-        match kill(Pid::from_raw(pid), Signal::SIGTERM) {
+        let target = self.process_group.map_or(child_pid, |group| -group);
+        match kill(Pid::from_raw(target), Signal::SIGTERM) {
             Ok(()) | Err(Errno::ESRCH) => Ok(()),
             Err(error) => Err(io::Error::from(error)),
         }
@@ -2283,6 +2382,50 @@ impl ManagedProcess {
     #[cfg(not(unix))]
     fn terminate(&mut self) -> io::Result<()> {
         self.kill()
+    }
+
+    #[cfg(unix)]
+    fn kill(&mut self) -> io::Result<()> {
+        use nix::{
+            errno::Errno,
+            sys::signal::{Signal, kill},
+            unistd::Pid,
+        };
+
+        if let Some(process_group) = self.process_group {
+            return match kill(Pid::from_raw(-process_group), Signal::SIGKILL) {
+                Ok(()) | Err(Errno::ESRCH) => Ok(()),
+                Err(error) => Err(io::Error::from(error)),
+            };
+        }
+        self.child.kill()
+    }
+
+    #[cfg(not(unix))]
+    fn kill(&mut self) -> io::Result<()> {
+        self.child.kill()
+    }
+
+    #[cfg(unix)]
+    fn kill_remaining_process_group(&mut self) -> io::Result<()> {
+        use nix::{
+            errno::Errno,
+            sys::signal::{Signal, kill},
+            unistd::Pid,
+        };
+
+        let Some(process_group) = self.process_group else {
+            return Ok(());
+        };
+        match kill(Pid::from_raw(-process_group), Signal::SIGKILL) {
+            Ok(()) | Err(Errno::ESRCH) => Ok(()),
+            Err(error) => Err(io::Error::from(error)),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn kill_remaining_process_group(&mut self) -> io::Result<()> {
+        Ok(())
     }
 
     fn wait(&mut self) -> io::Result<ExitStatus> {
@@ -3418,6 +3561,57 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn client_proxy_shutdown_interrupts_connected_desktop() -> TestResult {
+        let observer = Arc::new(FakeControl::default());
+        seed_lines(&observer, LIVE_FIXTURE.lines().take(2));
+        let proxy = Arc::new(ProxyTestControl::default());
+        let provider_id = ProviderId::new();
+        let runtime_root = std::env::temp_dir().join(format!("agentpulse-proxy-{provider_id}"));
+        let config = CodexProviderConfig::new(provider_id, &runtime_root, [THREAD_ID])?;
+        let proxy_socket_path = config.proxy_socket_path.clone();
+        let schema = ProtocolSchema::compile()?;
+        let mapper = CodexEventMapper::new(provider_id, &config.threads, config.discover_threads);
+        let status = Arc::new(Mutex::new(Default::default()));
+        let approvals = Arc::new(Mutex::new(ApprovalRuntimeState::new()));
+        let controls = Arc::new(Mutex::new(ControlRuntimeState::new()));
+        let mut source = CodexProviderSource::with_runtime_and_states(
+            config,
+            schema,
+            mapper,
+            status,
+            Arc::clone(&approvals),
+            Arc::clone(&controls),
+            Box::new(ProxyTestRuntime {
+                observer,
+                proxy,
+                worker: None,
+            }),
+        );
+        source.client_proxy_enabled = true;
+        let port = CodexProviderPort::new(provider_descriptor(provider_id)?, approvals, controls);
+        let mut host = RuntimeHost::new();
+        host.register_provider(port, source)?;
+        let _ = host.start()?;
+
+        let stream = UnixStream::connect(proxy_socket_path)?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        let (mut desktop, _) = tungstenite::client("ws://localhost/", stream)?;
+        desktop.send(Message::Text(
+            r#"{"id":77,"method":"initialize","params":{}}"#.into(),
+        ))?;
+        let response = desktop.read()?;
+        assert!(matches!(response, Message::Text(text) if text.contains("\"id\":77")));
+
+        let started = Instant::now();
+        let _ = host.stop()?;
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!runtime_root.exists());
+        Ok(())
+    }
+
     #[test]
     fn channel_handoff_failure_keeps_committed_sequence_and_live_reader() -> TestResult {
         let control = Arc::new(FakeControl::default());
@@ -3661,6 +3855,50 @@ mod tests {
         runtime.stop(&config)?;
 
         assert!(started.elapsed() < Duration::from_secs(2));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_runtime_kills_the_complete_process_group_after_deadline() -> TestResult {
+        let config = CodexProviderConfig::new(ProviderId::new(), "/tmp", [THREAD_ID])?
+            .with_shutdown_timeout(Duration::from_millis(100));
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("trap '' TERM; sleep 30 & printf ready; wait")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command.process_group(0);
+        let mut child = command.spawn()?;
+        let mut ready = [0_u8; 5];
+        child
+            .stdout
+            .take()
+            .ok_or("managed process readiness pipe was unavailable")?
+            .read_exact(&mut ready)?;
+        assert_eq!(&ready, b"ready");
+        let process_group = i32::try_from(child.id())?;
+        let mut runtime = ManagedCodexRuntime {
+            process: Some(ManagedProcess::new_in_own_process_group(child)?),
+            owns_runtime_directory: false,
+        };
+
+        let started = Instant::now();
+        runtime.stop(&config)?;
+
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match nix::sys::signal::kill(nix::unistd::Pid::from_raw(-process_group), None) {
+                Err(nix::errno::Errno::ESRCH) => break,
+                Ok(()) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                Ok(()) => return Err("managed process group remained alive".into()),
+                Err(error) => return Err(error.into()),
+            }
+        }
         Ok(())
     }
 

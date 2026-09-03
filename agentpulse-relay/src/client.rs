@@ -1,10 +1,11 @@
 //! Outbound Host connector and deployment health probe.
 
 use std::{
+    collections::BTreeMap,
     net::{SocketAddr, TcpStream, ToSocketAddrs},
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -32,6 +33,101 @@ const HOST_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
 const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const TUNNEL_STALLED_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// One-shot handle that interrupts every active socket opened by a Host connector.
+///
+/// Callers should cancel this handle before joining the connector thread. This
+/// wakes TLS reads immediately instead of waiting for their bounded network
+/// timeout. A cancelled handle cannot be reused for later connections.
+#[derive(Clone, Default)]
+pub struct RelayConnectionCanceller {
+    inner: Arc<RelayConnectionCancellerInner>,
+}
+
+#[derive(Default)]
+struct RelayConnectionCancellerInner {
+    cancelled: AtomicBool,
+    next_connection: AtomicU64,
+    connections: Mutex<BTreeMap<u64, TcpStream>>,
+}
+
+impl RelayConnectionCanceller {
+    /// Creates a handle for one connector lifecycle.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Interrupts active and future connections associated with this handle.
+    pub fn cancel(&self) {
+        self.inner.cancelled.store(true, Ordering::Release);
+        let connections = {
+            let mut connections = self
+                .inner
+                .connections
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *connections)
+        };
+        for stream in connections.into_values() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    fn register(
+        &self,
+        stream: &TcpStream,
+        stop: &AtomicBool,
+    ) -> Result<RelayConnectionRegistration, RelayError> {
+        let interrupt = stream
+            .try_clone()
+            .map_err(|source| RelayError::io("clone Relay connection for cancellation", source))?;
+        let mut connections = self
+            .inner
+            .connections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.inner.cancelled.load(Ordering::Acquire) || stop.load(Ordering::Acquire) {
+            drop(connections);
+            let _ = interrupt.shutdown(std::net::Shutdown::Both);
+            return Err(RelayError::Stopped);
+        }
+        let connection = self.inner.next_connection.fetch_add(1, Ordering::Relaxed);
+        connections.insert(connection, interrupt);
+        Ok(RelayConnectionRegistration {
+            connection,
+            canceller: self.clone(),
+        })
+    }
+
+    fn unregister(&self, connection: u64) {
+        self.inner
+            .connections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&connection);
+    }
+}
+
+impl std::fmt::Debug for RelayConnectionCanceller {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RelayConnectionCanceller")
+            .field("cancelled", &self.inner.cancelled.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
+struct RelayConnectionRegistration {
+    connection: u64,
+    canceller: RelayConnectionCanceller,
+}
+
+impl Drop for RelayConnectionRegistration {
+    fn drop(&mut self) {
+        self.canceller.unregister(self.connection);
+    }
+}
+
 /// Validated Host-side settings for one Relay registration cycle.
 #[derive(Clone)]
 pub struct RelayHostConnectionConfig {
@@ -39,6 +135,7 @@ pub struct RelayHostConnectionConfig {
     host_id: String,
     host_authentication_key: Arc<Zeroizing<[u8; 32]>>,
     local_tunnel_address: SocketAddr,
+    connection_canceller: Option<RelayConnectionCanceller>,
 }
 
 impl RelayHostConnectionConfig {
@@ -90,7 +187,18 @@ impl RelayHostConnectionConfig {
             host_id,
             host_authentication_key: Arc::new(Zeroizing::new(authentication_key)),
             local_tunnel_address,
+            connection_canceller: None,
         })
+    }
+
+    /// Associates a one-shot connection canceller with this connector.
+    #[must_use]
+    pub fn with_connection_canceller(
+        mut self,
+        connection_canceller: RelayConnectionCanceller,
+    ) -> Self {
+        self.connection_canceller = Some(connection_canceller);
+        self
     }
 
     /// Returns the configured public endpoint.
@@ -153,9 +261,17 @@ pub fn connect_host_once_with_route_check_and_waiting(
             "at least one authenticated route is required",
         ));
     }
+    if stop.load(Ordering::Acquire) {
+        return Err(RelayError::Stopped);
+    }
     let mut routes = routes.to_vec();
     routes.sort_by(|left, right| left.route_id.cmp(&right.route_id));
     let mut stream = connect_tls(&config.endpoint)?;
+    let _connection_registration = config
+        .connection_canceller
+        .as_ref()
+        .map(|canceller| canceller.register(&stream.sock, stop))
+        .transpose()?;
     let (connection_id, nonce, expires_at) = read_challenge(&mut stream)?;
     let proof = host_proof(
         &config.host_authentication_key,
@@ -361,5 +477,53 @@ fn map_remote_error(code: RelayErrorCode, message: String) -> RelayError {
         RelayErrorCode::HostUnavailable => RelayError::HostUnavailable,
         RelayErrorCode::HostBusy => RelayError::HostBusy,
         _ => RelayError::Protocol { message },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        error::Error,
+        io::Read,
+        net::TcpListener,
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use super::*;
+
+    type TestResult = Result<(), Box<dyn Error>>;
+
+    #[test]
+    fn connection_canceller_wakes_a_blocked_read() -> TestResult {
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let mut client = TcpStream::connect(listener.local_addr()?)?;
+        let (_server, _) = listener.accept()?;
+        client.set_read_timeout(Some(Duration::from_secs(5)))?;
+
+        let stop = AtomicBool::new(false);
+        let canceller = RelayConnectionCanceller::new();
+        let registration = canceller.register(&client, &stop)?;
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let _ = ready_sender.send(());
+            let started = Instant::now();
+            let mut byte = [0_u8; 1];
+            let result = client.read(&mut byte);
+            (started.elapsed(), result, registration)
+        });
+
+        ready_receiver.recv_timeout(Duration::from_secs(1))?;
+        canceller.cancel();
+        let (elapsed, result, _registration) = worker.join().map_err(|_| "read worker panicked")?;
+
+        assert!(elapsed < Duration::from_secs(1));
+        assert!(matches!(result, Ok(0) | Err(_)));
+        assert!(matches!(
+            canceller.register(&_server, &stop),
+            Err(RelayError::Stopped)
+        ));
+        Ok(())
     }
 }

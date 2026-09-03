@@ -18,7 +18,7 @@ mod tunnel;
 use std::time::Duration;
 
 pub use client::{
-    RelayHostConnectionConfig, build_client_hello, connect_host_once,
+    RelayConnectionCanceller, RelayHostConnectionConfig, build_client_hello, connect_host_once,
     connect_host_once_with_route_check, connect_host_once_with_route_check_and_waiting, probe,
 };
 pub use config::{
