@@ -1,7 +1,7 @@
 //! A complete read-only Codex Provider backed by a managed App Server.
 //!
 //! The Provider owns a Unix-socket Codex App Server, resumes an explicit set
-//! of threads, strictly validates the version-pinned protocol, and publishes
+//! of threads, strictly validates the schema-pinned protocol, and publishes
 //! normalized live session events through `agentpulse-bridge`.
 
 mod config;
@@ -27,14 +27,15 @@ use protocol::ProtocolSchema;
 use status::{SharedStatus, snapshot};
 
 /// Preferred current Codex CLI version for this Provider release.
-pub const SUPPORTED_CODEX_CLI_VERSION: &str = "0.152.0";
+pub const SUPPORTED_CODEX_CLI_VERSION: &str = "0.152.1";
 
 /// Explicit Codex CLI versions verified against the bundled schema and fixtures.
-pub const SUPPORTED_CODEX_CLI_VERSIONS: &[&str] = &["0.150.1", "0.152.0"];
+pub const SUPPORTED_CODEX_CLI_VERSIONS: &[&str] = &["0.150.1", "0.152.0", "0.152.1"];
 
-pub(crate) const SUPPORTED_CODEX_CLI_VERSION_REQUIREMENT: &str = "0.150.1 or 0.152.0";
+pub(crate) const SUPPORTED_CODEX_CLI_VERSION_REQUIREMENT: &str =
+    "0.150.1, 0.152.0, 0.152.1, or a valid version newer than 0.152.1";
 
-/// SHA-256 of the bundled official `0.152.0` App Server schema bundle.
+/// SHA-256 of the byte-identical official `0.152.0` and `0.152.1` schema bundles.
 pub const BUNDLED_CODEX_SCHEMA_SHA256: &str =
     "d8faa38d5f00aa7ddfe635a2d374ee5f871ffd217d4d175c72fbe7f009f4f669";
 
@@ -80,7 +81,7 @@ impl CodexProviderParts {
     }
 }
 
-/// Factory for a version-pinned managed Codex Provider.
+/// Factory for a schema-pinned managed Codex Provider.
 pub struct CodexProvider;
 
 impl CodexProvider {

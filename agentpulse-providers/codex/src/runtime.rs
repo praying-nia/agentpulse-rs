@@ -13,6 +13,8 @@ use agentpulse_bridge::{ProviderEventHandle, ProviderEventSource};
 use tungstenite::{Message, WebSocket};
 
 #[cfg(unix)]
+use semver::Version;
+#[cfg(unix)]
 use std::{
     fs,
     os::unix::{fs::PermissionsExt, net::UnixStream},
@@ -28,6 +30,15 @@ use crate::{
 const IO_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const STDERR_LIMIT: usize = 64 * 1024;
+#[cfg(unix)]
+const LATEST_VERIFIED_CODEX_CLI_CORE: (u64, u64, u64) = (0, 152, 1);
+
+#[cfg(unix)]
+#[derive(Debug, Eq, PartialEq)]
+enum CodexCliCompatibility {
+    Verified,
+    UnverifiedNewer(Version),
+}
 
 pub(crate) enum ReadOutcome {
     Text(String),
@@ -471,7 +482,15 @@ impl AppServerRuntime for ManagedCodexRuntime {
 
         #[cfg(unix)]
         {
-            verify_codex_version(config)?;
+            if let CodexCliCompatibility::UnverifiedNewer(version) = verify_codex_version(config)? {
+                eprintln!(
+                    "warning: Codex CLI {version} is newer than the latest verified version {}; \
+                     starting best-effort with the strict {} App Server schema, and any protocol \
+                     incompatibility will fail the Codex Provider",
+                    crate::SUPPORTED_CODEX_CLI_VERSION,
+                    crate::SUPPORTED_CODEX_CLI_VERSION,
+                );
+            }
             fs::create_dir_all(&config.runtime_root)
                 .map_err(|error| CodexProviderSourceError::runtime("root creation", error))?;
             match fs::create_dir(&config.runtime_directory) {
@@ -625,7 +644,9 @@ impl AppServerRuntime for ManagedCodexRuntime {
 }
 
 #[cfg(unix)]
-fn verify_codex_version(config: &CodexProviderConfig) -> Result<(), CodexProviderSourceError> {
+fn verify_codex_version(
+    config: &CodexProviderConfig,
+) -> Result<CodexCliCompatibility, CodexProviderSourceError> {
     let output = Command::new(&config.codex_executable)
         .arg("--version")
         .output()
@@ -643,16 +664,31 @@ fn verify_codex_version(config: &CodexProviderConfig) -> Result<(), CodexProvide
         })?
         .trim()
         .to_owned();
-    if crate::SUPPORTED_CODEX_CLI_VERSIONS
-        .iter()
-        .any(|version| actual == format!("codex-cli {version}"))
-    {
-        Ok(())
+    classify_codex_version(&actual)
+}
+
+#[cfg(unix)]
+fn classify_codex_version(actual: &str) -> Result<CodexCliCompatibility, CodexProviderSourceError> {
+    let Some(version_text) = actual.strip_prefix("codex-cli ") else {
+        return Err(version_mismatch(actual));
+    };
+    if crate::SUPPORTED_CODEX_CLI_VERSIONS.contains(&version_text) {
+        return Ok(CodexCliCompatibility::Verified);
+    }
+    let version = Version::parse(version_text).map_err(|_| version_mismatch(actual))?;
+    let actual_core = (version.major, version.minor, version.patch);
+    if actual_core > LATEST_VERIFIED_CODEX_CLI_CORE {
+        Ok(CodexCliCompatibility::UnverifiedNewer(version))
     } else {
-        Err(CodexProviderSourceError::VersionMismatch {
-            expected: crate::SUPPORTED_CODEX_CLI_VERSION_REQUIREMENT,
-            actual,
-        })
+        Err(version_mismatch(actual))
+    }
+}
+
+#[cfg(unix)]
+fn version_mismatch(actual: &str) -> CodexProviderSourceError {
+    CodexProviderSourceError::VersionMismatch {
+        expected: crate::SUPPORTED_CODEX_CLI_VERSION_REQUIREMENT,
+        actual: actual.to_owned(),
     }
 }
 
@@ -1442,6 +1478,59 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn verified_codex_versions_are_accepted() -> TestResult {
+        for version in crate::SUPPORTED_CODEX_CLI_VERSIONS {
+            let actual = format!("codex-cli {version}");
+            assert_eq!(
+                classify_codex_version(&actual)?,
+                CodexCliCompatibility::Verified
+            );
+        }
+        let preferred = Version::parse(crate::SUPPORTED_CODEX_CLI_VERSION)?;
+        assert_eq!(
+            (preferred.major, preferred.minor, preferred.patch),
+            LATEST_VERIFIED_CODEX_CLI_CORE
+        );
+        assert_eq!(
+            crate::SUPPORTED_CODEX_CLI_VERSIONS.last().copied(),
+            Some(crate::SUPPORTED_CODEX_CLI_VERSION)
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn newer_codex_versions_are_accepted_as_unverified() -> TestResult {
+        for version in ["0.152.2", "0.153.0-beta.1", "1.0.0"] {
+            let actual = format!("codex-cli {version}");
+            assert_eq!(
+                classify_codex_version(&actual)?,
+                CodexCliCompatibility::UnverifiedNewer(Version::parse(version)?)
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn older_unknown_and_malformed_codex_versions_are_rejected() {
+        for actual in [
+            "codex-cli 0.151.0",
+            "codex-cli 0.152.1+unverified",
+            "codex-cli 0.152.1-beta.1",
+            "codex-cli latest",
+            "codex 0.153.0",
+            "",
+        ] {
+            assert!(matches!(
+                classify_codex_version(actual),
+                Err(CodexProviderSourceError::VersionMismatch { .. })
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn managed_runtime_rejects_version_mismatch_before_creating_runtime_directory() -> TestResult {
         let provider_id = ProviderId::new();
         let (root, executable) = fake_codex_script("0.151.0")?;
@@ -1454,6 +1543,28 @@ mod tests {
             error,
             Err(CodexProviderSourceError::VersionMismatch { .. })
         ));
+        assert!(!runtime_directory.exists());
+        fs::remove_file(executable)?;
+        fs::remove_dir(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_runtime_allows_newer_version_past_version_gate() -> TestResult {
+        let provider_id = ProviderId::new();
+        let (root, executable) = fake_codex_script("0.152.2")?;
+        let config = CodexProviderConfig::new(provider_id, &root, [THREAD_ID])?
+            .with_codex_executable(&executable);
+        let runtime_directory = config.runtime_directory.clone();
+        let mut runtime = ManagedCodexRuntime::default();
+        let error = runtime.start(&config);
+        assert!(matches!(
+            error,
+            Err(CodexProviderSourceError::ProcessExited { .. })
+        ));
+        assert!(runtime_directory.exists());
+        runtime.stop(&config)?;
         assert!(!runtime_directory.exists());
         fs::remove_file(executable)?;
         fs::remove_dir(root)?;

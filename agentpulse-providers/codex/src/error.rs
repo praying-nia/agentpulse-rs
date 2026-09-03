@@ -95,10 +95,10 @@ pub enum CodexProviderSourceError {
         /// The process or output failure.
         message: String,
     },
-    /// The installed Codex version does not match the bundled protocol schema.
-    #[error("unsupported Codex version {actual}; expected one of {expected}")]
+    /// The installed Codex version is neither verified nor newer than the schema baseline.
+    #[error("unsupported Codex version {actual}; expected {expected}")]
     VersionMismatch {
-        /// The supported version.
+        /// The accepted version policy.
         expected: &'static str,
         /// The observed version output.
         actual: String,
