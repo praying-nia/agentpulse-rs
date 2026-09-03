@@ -8,6 +8,7 @@ use std::{
 use agentpulse_core::{
     ApprovalCommandKind, ApprovalDisposition, ApprovalFileChange, ApprovalFileChangeKind,
     ApprovalNetworkContext, ApprovalOption, ApprovalOptionId, ApprovalRequest, ApprovalSubject,
+    ChoiceOption, ChoiceOptionId, FormAnswerValue, FormField, FormFieldId, FormRequest,
     InteractionId, InteractionRequest, InteractionRequestPayload, InteractionResponse,
     InteractionResponsePayload, NonEmptyText, SessionId, Timestamp,
 };
@@ -32,14 +33,25 @@ pub(crate) struct OutboundApproval {
     pub(crate) interaction_id: InteractionId,
     pub(crate) request_id: RequestId,
     pub(crate) method: String,
-    pub(crate) decision: Value,
+    pub(crate) result: Value,
+}
+
+#[derive(Clone)]
+enum ResponseMapping {
+    Approval(BTreeMap<ApprovalOptionId, Value>),
+    Form {
+        question_ids: BTreeMap<FormFieldId, String>,
+        option_values: BTreeMap<ChoiceOptionId, String>,
+        allows_text: BTreeMap<FormFieldId, bool>,
+    },
 }
 
 #[derive(Clone)]
 enum PendingStatus {
     Awaiting,
     Queued(InteractionResponse),
-    Sent(InteractionResponse),
+    SentApproval(InteractionResponse),
+    SentForm,
 }
 
 struct PendingApproval {
@@ -50,7 +62,7 @@ struct PendingApproval {
     turn_id: String,
     item_id: String,
     session_id: SessionId,
-    decisions: BTreeMap<ApprovalOptionId, Value>,
+    response_mapping: ResponseMapping,
     status: PendingStatus,
 }
 
@@ -60,6 +72,11 @@ pub(crate) enum ResolvedApproval {
         response: InteractionResponse,
     },
     Closed {
+        thread_id: String,
+        session_id: SessionId,
+        interaction_id: InteractionId,
+    },
+    RespondedForm {
         thread_id: String,
         session_id: SessionId,
         interaction_id: InteractionId,
@@ -122,7 +139,7 @@ impl ApprovalRuntimeState {
                 turn_id: prepared.turn_id.clone(),
                 item_id: prepared.item_id.clone(),
                 session_id: prepared.request.session_id(),
-                decisions: prepared.decisions.clone(),
+                response_mapping: prepared.response_mapping.clone(),
                 status: PendingStatus::Awaiting,
             },
         );
@@ -155,16 +172,56 @@ impl ApprovalRuntimeState {
         if !matches!(pending.status, PendingStatus::Awaiting) {
             return Err(CodexProviderPortError::InteractionAlreadyClaimed { interaction_id });
         }
-        let option_id = match response.payload() {
-            InteractionResponsePayload::Approval(selection) => selection.option_id(),
+        let result = match (&pending.response_mapping, response.payload()) {
+            (
+                ResponseMapping::Approval(decisions),
+                InteractionResponsePayload::Approval(selection),
+            ) => {
+                let option_id = selection.option_id();
+                let decision = decisions.get(&option_id).cloned().ok_or(
+                    CodexProviderPortError::UnknownApprovalOption {
+                        interaction_id,
+                        option_id,
+                    },
+                )?;
+                json!({"decision": decision})
+            }
+            (
+                ResponseMapping::Form {
+                    question_ids,
+                    option_values,
+                    allows_text,
+                },
+                InteractionResponsePayload::Form(form),
+            ) => {
+                let mut answers = serde_json::Map::new();
+                for answer in form.answers() {
+                    let question_id = question_ids
+                        .get(&answer.field_id())
+                        .ok_or(CodexProviderPortError::UnsupportedInteractionResponse)?;
+                    let value = match answer.value() {
+                        FormAnswerValue::Choice(option_id) => option_values
+                            .get(option_id)
+                            .cloned()
+                            .ok_or(CodexProviderPortError::UnsupportedInteractionResponse)?,
+                        FormAnswerValue::Text(text)
+                            if allows_text
+                                .get(&answer.field_id())
+                                .copied()
+                                .unwrap_or(false) =>
+                        {
+                            text.as_str().to_owned()
+                        }
+                        FormAnswerValue::Text(_) => {
+                            return Err(CodexProviderPortError::UnsupportedInteractionResponse);
+                        }
+                    };
+                    answers.insert(question_id.clone(), json!({"answers": [value]}));
+                }
+                json!({"answers": answers})
+            }
             _ => return Err(CodexProviderPortError::UnsupportedInteractionResponse),
         };
-        let decision = pending.decisions.get(&option_id).cloned().ok_or(
-            CodexProviderPortError::UnknownApprovalOption {
-                interaction_id,
-                option_id,
-            },
-        )?;
         if self.outbound.len() >= MAX_PENDING_APPROVALS {
             return Err(CodexProviderPortError::OutboundQueueFull {
                 capacity: MAX_PENDING_APPROVALS,
@@ -176,7 +233,7 @@ impl ApprovalRuntimeState {
             interaction_id,
             request_id: pending.request_id.clone(),
             method: pending.method.clone(),
-            decision,
+            result,
         });
         Ok(())
     }
@@ -201,7 +258,17 @@ impl ApprovalRuntimeState {
                 "approval was not queued when its response was written",
             ));
         };
-        pending.status = PendingStatus::Sent(response.clone());
+        pending.status = match response.payload() {
+            InteractionResponsePayload::Approval(_) => {
+                PendingStatus::SentApproval(response.clone())
+            }
+            InteractionResponsePayload::Form(_) => PendingStatus::SentForm,
+            _ => {
+                return Err(CodexProviderSourceError::protocol(
+                    "queued interaction changed to an unsupported response type",
+                ));
+            }
+        };
         Ok(())
     }
 
@@ -230,9 +297,14 @@ impl ApprovalRuntimeState {
         self.outbound
             .retain(|outbound| outbound.interaction_id != interaction_id);
         Ok(Some(match pending.status {
-            PendingStatus::Sent(response) => ResolvedApproval::Responded {
+            PendingStatus::SentApproval(response) => ResolvedApproval::Responded {
                 thread_id: pending.thread_id,
                 response,
+            },
+            PendingStatus::SentForm => ResolvedApproval::RespondedForm {
+                thread_id: pending.thread_id,
+                session_id: pending.session_id,
+                interaction_id,
             },
             PendingStatus::Awaiting | PendingStatus::Queued(_) => ResolvedApproval::Closed {
                 thread_id: pending.thread_id,
@@ -302,7 +374,9 @@ impl ApprovalRuntimeState {
 
 pub(crate) struct PreparedApproval {
     pub(crate) request: InteractionRequest,
-    pub(crate) decisions: BTreeMap<ApprovalOptionId, Value>,
+    response_mapping: ResponseMapping,
+    #[cfg(test)]
+    decisions: BTreeMap<ApprovalOptionId, Value>,
     pub(crate) thread_id: String,
     pub(crate) turn_id: String,
     pub(crate) item_id: String,
@@ -365,7 +439,87 @@ pub(crate) fn prepare_approval(
     );
     Ok(PreparedApproval {
         request,
+        response_mapping: ResponseMapping::Approval(decisions.clone()),
+        #[cfg(test)]
         decisions,
+        thread_id,
+        turn_id,
+        item_id,
+    })
+}
+
+pub(crate) fn prepare_user_input(
+    params: &Value,
+    session_id: SessionId,
+) -> Result<PreparedApproval, CodexProviderSourceError> {
+    let thread_id = required_string(params, "threadId")?.to_owned();
+    let turn_id = required_string(params, "turnId")?.to_owned();
+    let item_id = required_string(params, "itemId")?.to_owned();
+    let blocking = params
+        .get("isBlocking")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| CodexProviderSourceError::protocol("isBlocking must be a boolean"))?;
+    let questions = params
+        .get("questions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CodexProviderSourceError::protocol("questions must be an array"))?;
+    let mut fields = Vec::with_capacity(questions.len());
+    let mut question_ids = BTreeMap::new();
+    let mut option_values = BTreeMap::new();
+    let mut allows_text = BTreeMap::new();
+    for question in questions {
+        let external_id = required_string(question, "id")?.to_owned();
+        let field_id = FormFieldId::new();
+        let mut options = Vec::new();
+        if let Some(values) = question.get("options").and_then(Value::as_array) {
+            for value in values {
+                let label = required_string(value, "label")?.to_owned();
+                let option_id = ChoiceOptionId::new();
+                options.push(
+                    ChoiceOption::new(option_id, NonEmptyText::new(label.clone())?)
+                        .with_description(NonEmptyText::new(
+                            required_string(value, "description")?.to_owned(),
+                        )?),
+                );
+                option_values.insert(option_id, label);
+            }
+        }
+        let allow_other = question
+            .get("isOther")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || options.is_empty();
+        let field = FormField::new(
+            field_id,
+            NonEmptyText::new(required_string(question, "header")?.to_owned())?,
+            NonEmptyText::new(required_string(question, "question")?.to_owned())?,
+            options,
+            allow_other,
+            question
+                .get("isSecret")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        )?;
+        question_ids.insert(field_id, external_id);
+        allows_text.insert(field_id, allow_other);
+        fields.push(field);
+    }
+    let request = InteractionRequest::new(
+        InteractionId::new(),
+        session_id,
+        Timestamp::now_utc(),
+        NonEmptyText::new("Codex needs your input")?,
+        InteractionRequestPayload::Form(FormRequest::new(fields, blocking)?),
+    );
+    Ok(PreparedApproval {
+        request,
+        response_mapping: ResponseMapping::Form {
+            question_ids,
+            option_values,
+            allows_text,
+        },
+        #[cfg(test)]
+        decisions: BTreeMap::new(),
         thread_id,
         turn_id,
         item_id,
@@ -705,7 +859,9 @@ fn timestamp_milliseconds(value: i64) -> Result<Timestamp, CodexProviderSourceEr
 mod tests {
     use std::error::Error;
 
-    use agentpulse_core::{ApprovalSelection, ChannelId, InteractionResponsePayload};
+    use agentpulse_core::{
+        ApprovalSelection, ChannelId, FormAnswer, FormResponse, InteractionResponsePayload,
+    };
 
     use super::*;
 
@@ -903,6 +1059,72 @@ mod tests {
             assert!(command.is_none());
             assert!(network.is_none());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn user_input_forms_are_atomic_and_secrets_are_not_retained_after_write() -> TestResult {
+        let session_id = SessionId::new();
+        let prepared = prepare_user_input(
+            &json!({
+                "threadId": "019976a4-00f0-7312-b36c-d01f9c5c06f6",
+                "turnId": "019976a4-00f1-76c0-b845-e1509dc4e3de",
+                "itemId": "019976a4-00f2-741b-870f-21b4fb983746",
+                "isBlocking": true,
+                "questions": [{
+                    "id": "token",
+                    "header": "Credential",
+                    "question": "Token?",
+                    "isSecret": true,
+                    "isOther": true,
+                    "options": []
+                }]
+            }),
+            session_id,
+        )?;
+        let InteractionRequestPayload::Form(form) = prepared.request.payload() else {
+            return Err("expected form request".into());
+        };
+        assert!(form.is_blocking());
+        assert!(form.fields()[0].is_sensitive());
+        let answer = FormAnswer::new(
+            form.fields()[0].id(),
+            FormAnswerValue::Text(NonEmptyText::new("top-secret")?),
+        );
+        let response = InteractionResponse::new(
+            prepared.request.id(),
+            session_id,
+            ChannelId::new(),
+            Timestamp::now_utc(),
+            InteractionResponsePayload::Form(FormResponse::new(vec![answer])?),
+        );
+        let route = ApprovalRoute::Observer;
+        let request_id = RequestId::String("form-1".to_owned());
+        let mut state = ApprovalRuntimeState::new();
+        state.register(
+            route,
+            request_id.clone(),
+            "item/tool/requestUserInput".to_owned(),
+            &prepared,
+        )?;
+        state.claim(response)?;
+        let outbound = state.pop_outbound_for(route).ok_or("form was not queued")?;
+        assert_eq!(
+            outbound.result["answers"]["token"]["answers"][0],
+            "top-secret"
+        );
+        state.mark_sent(outbound.interaction_id)?;
+        assert!(matches!(
+            state
+                .pending
+                .get(&prepared.request.id())
+                .map(|pending| &pending.status),
+            Some(PendingStatus::SentForm)
+        ));
+        assert!(matches!(
+            state.resolve(route, &request_id, "019976a4-00f0-7312-b36c-d01f9c5c06f6")?,
+            Some(ResolvedApproval::RespondedForm { .. })
+        ));
         Ok(())
     }
 }

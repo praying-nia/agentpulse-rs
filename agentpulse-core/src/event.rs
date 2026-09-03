@@ -18,9 +18,22 @@ pub enum AgentMessageLevel {
     Error,
 }
 
+/// The participant that produced a normalized conversation message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum AgentMessageRole {
+    /// A message submitted by a user-facing client.
+    User,
+    /// A message produced by the agent.
+    Assistant,
+    /// A provider or runtime status message.
+    System,
+}
+
 /// A normalized user-facing agent message.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentMessage {
+    role: AgentMessageRole,
     level: AgentMessageLevel,
     content: NonEmptyText,
 }
@@ -29,7 +42,31 @@ impl AgentMessage {
     /// Creates a normalized agent message.
     #[must_use]
     pub const fn new(level: AgentMessageLevel, content: NonEmptyText) -> Self {
-        Self { level, content }
+        Self {
+            role: AgentMessageRole::Assistant,
+            level,
+            content,
+        }
+    }
+
+    /// Creates a normalized message with an explicit participant role.
+    #[must_use]
+    pub const fn with_role(
+        role: AgentMessageRole,
+        level: AgentMessageLevel,
+        content: NonEmptyText,
+    ) -> Self {
+        Self {
+            role,
+            level,
+            content,
+        }
+    }
+
+    /// Returns the participant that produced this message.
+    #[must_use]
+    pub const fn role(&self) -> AgentMessageRole {
+        self.role
     }
 
     /// Returns the message severity.

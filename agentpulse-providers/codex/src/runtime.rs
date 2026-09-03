@@ -1,7 +1,7 @@
 //! Managed Codex App Server process and Provider Source lifecycle.
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     io::{self, Read},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
@@ -14,7 +14,12 @@ use std::{
 };
 
 use agentpulse_bridge::{ProviderEventHandle, ProviderEventSource};
-use agentpulse_core::{AgentEventPayload, InteractionCloseReason, InteractionClosed, Timestamp};
+use agentpulse_core::{
+    AgentCommandPayload, AgentEventPayload, AgentMessage, AgentMessageLevel, AgentMessageRole,
+    AgentState, InteractionCloseReason, InteractionClosed, NonEmptyText, PromptDelivery,
+    QueueAction, SessionId, Timestamp,
+};
+use serde_json::json;
 use tungstenite::{Message, WebSocket};
 
 #[cfg(unix)]
@@ -32,8 +37,9 @@ use crate::{
     CodexProviderConfig, CodexProviderHealth, CodexProviderSourceError,
     approval::{
         ApprovalRoute, ApprovalRuntimeState, ClosedApproval, ResolvedApproval, SharedApprovalState,
-        prepare_approval,
+        prepare_approval, prepare_user_input,
     },
+    control::{ControlRuntimeState, SharedControlState, TurnDefaults},
     mapper::{CodexEventMapper, MappingDisposition},
     protocol::{
         ExpectedResponse, ObservedServerFrame, ProtocolEngine, ProtocolSchema, ServerFrame,
@@ -84,6 +90,7 @@ pub struct CodexProviderSource {
     mapper: Arc<Mutex<CodexEventMapper>>,
     status: SharedStatus,
     approvals: SharedApprovalState,
+    controls: SharedControlState,
     runtime: Box<dyn AppServerRuntime>,
     stop_sender: Option<mpsc::Sender<()>>,
     worker: Option<JoinHandle<WorkerExit>>,
@@ -100,25 +107,28 @@ impl CodexProviderSource {
         mapper: CodexEventMapper,
         status: SharedStatus,
         approvals: SharedApprovalState,
+        controls: SharedControlState,
     ) -> Self {
-        let mut source = Self::with_runtime_and_approvals(
+        let mut source = Self::with_runtime_and_states(
             config,
             schema,
             mapper,
             status,
             approvals,
+            controls,
             Box::new(ManagedCodexRuntime::default()),
         );
         source.client_proxy_enabled = true;
         source
     }
 
-    pub(crate) fn with_runtime_and_approvals(
+    fn with_runtime_and_states(
         config: CodexProviderConfig,
         schema: ProtocolSchema,
         mapper: CodexEventMapper,
         status: SharedStatus,
         approvals: SharedApprovalState,
+        controls: SharedControlState,
         runtime: Box<dyn AppServerRuntime>,
     ) -> Self {
         Self {
@@ -127,6 +137,7 @@ impl CodexProviderSource {
             mapper: Arc::new(Mutex::new(mapper)),
             status,
             approvals,
+            controls,
             runtime,
             stop_sender: None,
             worker: None,
@@ -225,6 +236,7 @@ impl CodexProviderSource {
         let status = Arc::clone(&self.status);
         let worker_events = events.clone();
         let approvals = Arc::clone(&self.approvals);
+        let controls = Arc::clone(&self.controls);
         let worker = thread::Builder::new()
             .name("agentpulse-codex-reader".to_owned())
             .spawn(move || {
@@ -234,6 +246,7 @@ impl CodexProviderSource {
                     mapper,
                     status,
                     approvals,
+                    controls,
                     worker_events,
                     stop_receiver,
                 )
@@ -463,15 +476,42 @@ enum ProxyExit {
     Failed,
 }
 
+enum PendingControl {
+    Report {
+        session_id: SessionId,
+    },
+    ResumeThread {
+        source_session_id: SessionId,
+    },
+    StartThread,
+    ForkThread,
+    TurnStart {
+        session_id: SessionId,
+        thread_id: String,
+        prompt: NonEmptyText,
+    },
+    Silent {
+        session_id: SessionId,
+    },
+    HistoryItems {
+        session_id: SessionId,
+        thread_id: String,
+    },
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_worker(
     mut io: Box<dyn AppServerIo>,
     mut protocol: ProtocolEngine,
     mapper: Arc<Mutex<CodexEventMapper>>,
     status: SharedStatus,
     approvals: SharedApprovalState,
+    controls: SharedControlState,
     events: ProviderEventHandle,
     stop_receiver: mpsc::Receiver<()>,
 ) -> WorkerExit {
+    lock_controls(&controls).clear_all_inflight();
+    let mut pending_controls = BTreeMap::new();
     loop {
         if stop_receiver.try_recv().is_ok() {
             close_all_approvals(&approvals, &mapper, &events, &status);
@@ -481,6 +521,22 @@ fn run_worker(
             flush_approval_responses(&mut *io, &protocol, &approvals, ApprovalRoute::Observer);
         if let Err(error) = result {
             close_all_approvals(&approvals, &mapper, &events, &status);
+            lock_mapper(&mapper).disconnect_all(&events, &status);
+            let message = error.to_string();
+            let mut current = lock_status(&status);
+            current.health = CodexProviderHealth::Failed;
+            current.last_error = Some(message);
+            return WorkerExit::Failed;
+        }
+        if let Err(error) = flush_control_commands(
+            &mut *io,
+            &mut protocol,
+            &mapper,
+            &status,
+            &controls,
+            &events,
+            &mut pending_controls,
+        ) {
             lock_mapper(&mapper).disconnect_all(&events, &status);
             let message = error.to_string();
             let mut current = lock_status(&status);
@@ -499,7 +555,9 @@ fn run_worker(
                 &mapper,
                 &status,
                 &approvals,
+                &controls,
                 &events,
+                &mut pending_controls,
                 &text,
                 ApprovalRoute::Observer,
             ),
@@ -522,13 +580,678 @@ fn run_worker(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn flush_control_commands(
+    io: &mut dyn AppServerIo,
+    protocol: &mut ProtocolEngine,
+    mapper: &Arc<Mutex<CodexEventMapper>>,
+    status: &SharedStatus,
+    controls: &SharedControlState,
+    events: &ProviderEventHandle,
+    pending: &mut BTreeMap<crate::protocol::RequestId, PendingControl>,
+) -> Result<(), CodexProviderSourceError> {
+    for session_id in lock_controls(controls).inflight_sessions() {
+        let active = lock_mapper(mapper)
+            .command_context(session_id)
+            .is_some_and(|(_, turn, _)| turn.is_some());
+        lock_controls(controls).observe_turn(session_id, active);
+    }
+    while let Some(command) = lock_controls(controls).pop_command() {
+        let session_id = command.session_id();
+        let context = lock_mapper(mapper)
+            .command_context(session_id)
+            .map(|(thread, turn, state)| (thread.to_owned(), turn.map(str::to_owned), state));
+        match command.payload() {
+            AgentCommandPayload::SelectModel { model, effort } => {
+                let mut controls = lock_controls(controls);
+                let defaults = controls.defaults_mut(session_id);
+                defaults.model = Some(model.to_string());
+                defaults.effort = effort.as_ref().map(ToString::to_string);
+                drop(controls);
+                publish_system_for_session(
+                    context.as_ref(),
+                    format!(
+                        "Model set to {}{}",
+                        model,
+                        effort
+                            .as_ref()
+                            .map(|v| format!(" ({v})"))
+                            .unwrap_or_default()
+                    ),
+                    mapper,
+                    events,
+                    status,
+                )?;
+            }
+            AgentCommandPayload::SetPlanMode { enabled } => {
+                lock_controls(controls).defaults_mut(session_id).plan_mode = *enabled;
+                publish_system_for_session(
+                    context.as_ref(),
+                    if *enabled {
+                        "Plan mode enabled"
+                    } else {
+                        "Plan mode disabled"
+                    },
+                    mapper,
+                    events,
+                    status,
+                )?;
+            }
+            AgentCommandPayload::SelectPermissionProfile { profile } => {
+                lock_controls(controls)
+                    .defaults_mut(session_id)
+                    .permission_profile = Some(profile.to_string());
+                publish_system_for_session(
+                    context.as_ref(),
+                    format!("Permission profile set to {profile}"),
+                    mapper,
+                    events,
+                    status,
+                )?;
+            }
+            AgentCommandPayload::Queue { action } => {
+                let (count, bytes, paused) = lock_controls(controls).queue_summary(session_id);
+                publish_system_for_session(
+                    context.as_ref(),
+                    format!(
+                        "Queue {}: {count} prompt(s), {bytes} bytes",
+                        if paused { "paused" } else { "active" }
+                    ),
+                    mapper,
+                    events,
+                    status,
+                )?;
+                if matches!(action, QueueAction::Clear) {
+                    // The summary above is the durable user-visible acknowledgement.
+                }
+            }
+            AgentCommandPayload::Status => {
+                let defaults = lock_controls(controls).defaults(session_id);
+                let (count, bytes, paused) = lock_controls(controls).queue_summary(session_id);
+                let state = context
+                    .as_ref()
+                    .map(|v| format!("{:?}", v.2))
+                    .unwrap_or_else(|| "unknown".to_owned());
+                publish_system_for_session(
+                    context.as_ref(),
+                    format!(
+                        "State: {state}; model: {}; plan: {}; permissions: {}; queue: {count} item(s)/{bytes} bytes{}",
+                        defaults.model.as_deref().unwrap_or("default"),
+                        if defaults.plan_mode { "on" } else { "off" },
+                        defaults.permission_profile.as_deref().unwrap_or("default"),
+                        if paused { " (paused)" } else { "" },
+                    ),
+                    mapper,
+                    events,
+                    status,
+                )?;
+            }
+            AgentCommandPayload::ListModels => {
+                send_control_request(
+                    io,
+                    protocol,
+                    ExpectedResponse::ModelList,
+                    json!({"limit": 50}),
+                    PendingControl::Report { session_id },
+                    pending,
+                )?;
+            }
+            AgentCommandPayload::ListPermissionProfiles => {
+                send_control_request(
+                    io,
+                    protocol,
+                    ExpectedResponse::PermissionProfileList,
+                    json!({"limit": 50}),
+                    PendingControl::Report { session_id },
+                    pending,
+                )?;
+            }
+            AgentCommandPayload::ListThreads { cursor } => {
+                send_control_request(
+                    io,
+                    protocol,
+                    ExpectedResponse::ThreadList,
+                    json!({"cursor": cursor.as_ref().map(ToString::to_string), "limit": 50, "sortKey": "updated_at", "sortDirection": "desc"}),
+                    PendingControl::Report { session_id },
+                    pending,
+                )?;
+            }
+            AgentCommandPayload::ResumeThread { thread_id } => {
+                lock_mapper(mapper).track_discovered_thread(thread_id.as_str())?;
+                send_control_request(
+                    io,
+                    protocol,
+                    ExpectedResponse::ThreadResume,
+                    json!({"threadId": thread_id.as_str()}),
+                    PendingControl::ResumeThread {
+                        source_session_id: session_id,
+                    },
+                    pending,
+                )?;
+            }
+            AgentCommandPayload::StartThread { cwd } => {
+                let defaults = lock_controls(controls).defaults(session_id);
+                let mut params = json!({"cwd": cwd.as_str(), "sessionStartSource": "clear"});
+                apply_thread_defaults(&mut params, &defaults);
+                send_control_request(
+                    io,
+                    protocol,
+                    ExpectedResponse::ThreadStart,
+                    params,
+                    PendingControl::StartThread,
+                    pending,
+                )?;
+            }
+            AgentCommandPayload::Compact => {
+                if let Some((thread_id, _, _)) = context.as_ref() {
+                    send_control_request(
+                        io,
+                        protocol,
+                        ExpectedResponse::ThreadCompact,
+                        json!({"threadId": thread_id}),
+                        PendingControl::Silent { session_id },
+                        pending,
+                    )?;
+                }
+            }
+            AgentCommandPayload::Review { instructions } => {
+                if let Some((thread_id, _, _)) = context.as_ref() {
+                    let target = instructions.as_ref().map_or_else(
+                        || json!({"type": "uncommittedChanges"}),
+                        |value| json!({"type": "custom", "instructions": value.as_str()}),
+                    );
+                    send_control_request(
+                        io,
+                        protocol,
+                        ExpectedResponse::ReviewStart,
+                        json!({"threadId": thread_id, "target": target, "delivery": "inline"}),
+                        PendingControl::Silent { session_id },
+                        pending,
+                    )?;
+                }
+            }
+            AgentCommandPayload::Rename { name } => {
+                if let Some((thread_id, _, _)) = context.as_ref() {
+                    send_control_request(
+                        io,
+                        protocol,
+                        ExpectedResponse::ThreadSetName,
+                        json!({"threadId": thread_id, "name": name.as_str()}),
+                        PendingControl::Silent { session_id },
+                        pending,
+                    )?;
+                }
+            }
+            AgentCommandPayload::Fork => {
+                if let Some((thread_id, _, _)) = context.as_ref() {
+                    send_control_request(
+                        io,
+                        protocol,
+                        ExpectedResponse::ThreadFork,
+                        json!({"threadId": thread_id}),
+                        PendingControl::ForkThread,
+                        pending,
+                    )?;
+                }
+            }
+            AgentCommandPayload::CancelSession { .. } => {
+                if let Some((thread_id, Some(turn_id), _)) = context.as_ref() {
+                    send_control_request(
+                        io,
+                        protocol,
+                        ExpectedResponse::TurnInterrupt,
+                        json!({"threadId": thread_id, "turnId": turn_id}),
+                        PendingControl::Silent { session_id },
+                        pending,
+                    )?;
+                }
+            }
+            AgentCommandPayload::SubmitPrompt {
+                text,
+                delivery: PromptDelivery::Steer,
+            } => {
+                if let Some((thread_id, Some(turn_id), _)) = context.as_ref() {
+                    send_control_request(
+                        io,
+                        protocol,
+                        ExpectedResponse::TurnSteer,
+                        json!({"threadId": thread_id, "expectedTurnId": turn_id, "input": [text_input(text.as_str())]}),
+                        PendingControl::Silent { session_id },
+                        pending,
+                    )?;
+                    publish_user_message(thread_id, text.as_str(), mapper, events, status)?;
+                } else {
+                    publish_system_for_session(
+                        context.as_ref(),
+                        "Cannot steer: no active turn",
+                        mapper,
+                        events,
+                        status,
+                    )?;
+                }
+            }
+            AgentCommandPayload::SubmitPrompt {
+                delivery: PromptDelivery::Queue,
+                ..
+            } => {}
+            _ => {}
+        }
+    }
+
+    for session_id in lock_controls(controls).queued_sessions() {
+        let context = lock_mapper(mapper)
+            .command_context(session_id)
+            .map(|(thread, turn, state)| (thread.to_owned(), turn.map(str::to_owned), state));
+        let Some((thread_id, None, state)) = context else {
+            continue;
+        };
+        if matches!(
+            state,
+            AgentState::Completed | AgentState::Failed | AgentState::Cancelled
+        ) {
+            continue;
+        }
+        let Some(prompt) = lock_controls(controls).front_prompt(session_id) else {
+            continue;
+        };
+        let defaults = lock_controls(controls).defaults(session_id);
+        let mut params =
+            json!({"threadId": thread_id, "input": turn_input(prompt.as_str(), &defaults)});
+        apply_turn_defaults(&mut params, &defaults);
+        send_control_request(
+            io,
+            protocol,
+            ExpectedResponse::TurnStart,
+            params,
+            PendingControl::TurnStart {
+                session_id,
+                thread_id,
+                prompt,
+            },
+            pending,
+        )?;
+        lock_controls(controls).mark_turn_inflight(session_id);
+    }
+    Ok(())
+}
+
+fn send_control_request(
+    io: &mut dyn AppServerIo,
+    protocol: &mut ProtocolEngine,
+    expected: ExpectedResponse,
+    params: serde_json::Value,
+    kind: PendingControl,
+    pending: &mut BTreeMap<crate::protocol::RequestId, PendingControl>,
+) -> Result<(), CodexProviderSourceError> {
+    let (id, request) = protocol.request(expected, params)?;
+    if let Err(error) = io.write_text(request) {
+        protocol.cancel_pending(&id);
+        return Err(error);
+    }
+    pending.insert(id, kind);
+    Ok(())
+}
+
+fn text_input(text: &str) -> serde_json::Value {
+    json!({"type": "text", "text": text})
+}
+
+fn turn_input(text: &str, defaults: &TurnDefaults) -> serde_json::Value {
+    if defaults.plan_mode {
+        json!([
+            text_input(
+                "Work in Plan mode: inspect and reason, ask for any required choices, and do not modify files until Plan mode is disabled."
+            ),
+            text_input(text),
+        ])
+    } else {
+        json!([text_input(text)])
+    }
+}
+
+fn apply_turn_defaults(params: &mut serde_json::Value, defaults: &TurnDefaults) {
+    let Some(object) = params.as_object_mut() else {
+        return;
+    };
+    if let Some(model) = &defaults.model {
+        object.insert("model".to_owned(), json!(model));
+    }
+    if let Some(effort) = &defaults.effort {
+        object.insert("effort".to_owned(), json!(effort));
+    }
+    if let Some(profile) = defaults.permission_profile.as_deref() {
+        let policy = match profile {
+            "read-only" | "read_only" => Some(json!({"type": "readOnly"})),
+            "workspace-write" | "workspace_write" => Some(json!({"type": "workspaceWrite"})),
+            "danger-full-access" | "danger_full_access" => {
+                Some(json!({"type": "dangerFullAccess"}))
+            }
+            _ => None,
+        };
+        if let Some(policy) = policy {
+            object.insert("sandboxPolicy".to_owned(), policy);
+        }
+    }
+}
+
+fn apply_thread_defaults(params: &mut serde_json::Value, defaults: &TurnDefaults) {
+    let Some(object) = params.as_object_mut() else {
+        return;
+    };
+    if let Some(model) = &defaults.model {
+        object.insert("model".to_owned(), json!(model));
+    }
+    if defaults.plan_mode {
+        object.insert("config".to_owned(), json!({"collaboration_mode": "plan"}));
+    }
+}
+
+fn publish_user_message(
+    thread_id: &str,
+    text: &str,
+    mapper: &Arc<Mutex<CodexEventMapper>>,
+    events: &ProviderEventHandle,
+    status: &SharedStatus,
+) -> Result<(), CodexProviderSourceError> {
+    lock_mapper(mapper).publish_payload(
+        thread_id,
+        Timestamp::now_utc(),
+        AgentEventPayload::Message(AgentMessage::with_role(
+            AgentMessageRole::User,
+            AgentMessageLevel::Info,
+            NonEmptyText::new(text.to_owned())?,
+        )),
+        events,
+        status,
+    )
+}
+
+fn publish_system_for_session(
+    context: Option<&(String, Option<String>, AgentState)>,
+    text: impl Into<String>,
+    mapper: &Arc<Mutex<CodexEventMapper>>,
+    events: &ProviderEventHandle,
+    status: &SharedStatus,
+) -> Result<(), CodexProviderSourceError> {
+    let Some((thread_id, _, _)) = context else {
+        return Ok(());
+    };
+    lock_mapper(mapper).publish_payload(
+        thread_id,
+        Timestamp::now_utc(),
+        AgentEventPayload::Message(AgentMessage::with_role(
+            AgentMessageRole::System,
+            AgentMessageLevel::Info,
+            NonEmptyText::new(text.into())?,
+        )),
+        events,
+        status,
+    )
+}
+
+fn lock_controls(state: &SharedControlState) -> MutexGuard<'_, ControlRuntimeState> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_control_response(
+    io: &mut dyn AppServerIo,
+    protocol: &mut ProtocolEngine,
+    id: crate::protocol::RequestId,
+    expected: ExpectedResponse,
+    result: serde_json::Value,
+    pending: &mut BTreeMap<crate::protocol::RequestId, PendingControl>,
+    controls: &SharedControlState,
+    mapper: &Arc<Mutex<CodexEventMapper>>,
+    events: &ProviderEventHandle,
+    status: &SharedStatus,
+) -> Result<(), CodexProviderSourceError> {
+    let kind = pending.remove(&id).ok_or_else(|| {
+        CodexProviderSourceError::protocol(format!(
+            "unexpected live {} response",
+            expected.method()
+        ))
+    })?;
+    match kind {
+        PendingControl::Report { session_id } => {
+            let current_cwd = lock_mapper(mapper)
+                .cwd_for_session(session_id)
+                .map(str::to_owned);
+            let text = format_catalog(expected, &result, current_cwd.as_deref())?;
+            let context = lock_mapper(mapper)
+                .command_context(session_id)
+                .map(|(thread, turn, state)| (thread.to_owned(), turn.map(str::to_owned), state));
+            publish_system_for_session(context.as_ref(), text, mapper, events, status)
+        }
+        PendingControl::ResumeThread { .. } => {
+            let thread_id = result
+                .get("thread")
+                .and_then(|thread| thread.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    CodexProviderSourceError::protocol("thread/resume omitted thread.id")
+                })?
+                .to_owned();
+            let hydrate_history = !lock_mapper(mapper).is_thread_tracked(&thread_id);
+            lock_mapper(mapper).resume_thread(&result, events, status)?;
+            if !hydrate_history {
+                return Ok(());
+            }
+            let session_id = lock_mapper(mapper)
+                .session_id_for_thread(&thread_id)
+                .ok_or_else(|| {
+                    CodexProviderSourceError::protocol("resumed thread was not tracked")
+                })?;
+            send_control_request(
+                io,
+                protocol,
+                ExpectedResponse::ThreadItemsList,
+                json!({"threadId": thread_id, "limit": 100, "sortDirection": "asc"}),
+                PendingControl::HistoryItems {
+                    session_id,
+                    thread_id,
+                },
+                pending,
+            )
+        }
+        PendingControl::StartThread | PendingControl::ForkThread => {
+            let thread_id = result
+                .get("thread")
+                .and_then(|thread| thread.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    CodexProviderSourceError::protocol("thread response omitted thread.id")
+                })?
+                .to_owned();
+            let mut mapper = lock_mapper(mapper);
+            mapper.track_discovered_thread(&thread_id)?;
+            mapper.resume_thread(&result, events, status)
+        }
+        PendingControl::TurnStart {
+            session_id,
+            thread_id,
+            prompt,
+        } => {
+            let removed = lock_controls(controls).pop_prompt(session_id);
+            if removed.as_ref() != Some(&prompt) {
+                return Err(CodexProviderSourceError::protocol(
+                    "queued prompt changed before turn/start completed",
+                ));
+            }
+            publish_user_message(&thread_id, prompt.as_str(), mapper, events, status)
+        }
+        PendingControl::Silent { .. } => Ok(()),
+        PendingControl::HistoryItems {
+            session_id,
+            thread_id,
+        } => {
+            let data = result
+                .get("data")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    CodexProviderSourceError::protocol("thread/items/list omitted data")
+                })?;
+            lock_mapper(mapper).publish_history_items(&thread_id, data, events, status)?;
+            if let Some(cursor) = result.get("nextCursor").and_then(serde_json::Value::as_str) {
+                send_control_request(
+                    io,
+                    protocol,
+                    ExpectedResponse::ThreadItemsList,
+                    json!({"threadId": thread_id, "cursor": cursor, "limit": 100, "sortDirection": "asc"}),
+                    PendingControl::HistoryItems {
+                        session_id,
+                        thread_id,
+                    },
+                    pending,
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_control_error(
+    id: crate::protocol::RequestId,
+    expected: ExpectedResponse,
+    code: i64,
+    message: String,
+    pending: &mut BTreeMap<crate::protocol::RequestId, PendingControl>,
+    controls: &SharedControlState,
+    mapper: &Arc<Mutex<CodexEventMapper>>,
+    events: &ProviderEventHandle,
+    status: &SharedStatus,
+) -> Result<(), CodexProviderSourceError> {
+    let kind = pending.remove(&id).ok_or_else(|| {
+        CodexProviderSourceError::protocol(format!(
+            "unexpected live {} error response",
+            expected.method()
+        ))
+    })?;
+    match kind {
+        PendingControl::Report { session_id }
+        | PendingControl::Silent { session_id }
+        | PendingControl::HistoryItems { session_id, .. }
+        | PendingControl::ResumeThread {
+            source_session_id: session_id,
+        } => {
+            let context = lock_mapper(mapper)
+                .command_context(session_id)
+                .map(|(thread, turn, state)| (thread.to_owned(), turn.map(str::to_owned), state));
+            publish_system_for_session(
+                context.as_ref(),
+                format!("{} failed ({code}): {message}", expected.method()),
+                mapper,
+                events,
+                status,
+            )?;
+        }
+        PendingControl::TurnStart { session_id, .. } => {
+            let mut controls = lock_controls(controls);
+            controls.clear_turn_inflight(session_id);
+            controls.pause_prompts(session_id);
+            drop(controls);
+            let context = lock_mapper(mapper)
+                .command_context(session_id)
+                .map(|(thread, turn, state)| (thread.to_owned(), turn.map(str::to_owned), state));
+            publish_system_for_session(
+                context.as_ref(),
+                format!("{} failed ({code}): {message}", expected.method()),
+                mapper,
+                events,
+                status,
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn format_catalog(
+    expected: ExpectedResponse,
+    result: &serde_json::Value,
+    current_cwd: Option<&str>,
+) -> Result<String, CodexProviderSourceError> {
+    let data = result
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| CodexProviderSourceError::protocol("catalog response omitted data"))?;
+    let mut lines = Vec::with_capacity(data.len() + 1);
+    match expected {
+        ExpectedResponse::ModelList => {
+            lines.push("Available models (/model <id> [effort]):".to_owned());
+            let mut threads = data.iter().collect::<Vec<_>>();
+            threads.sort_by_key(|value| {
+                value.get("cwd").and_then(serde_json::Value::as_str) != current_cwd
+            });
+            for value in threads {
+                let id = value
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?");
+                let name = value
+                    .get("displayName")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(id);
+                lines.push(format!("{id} — {name}"));
+            }
+        }
+        ExpectedResponse::PermissionProfileList => {
+            lines.push("Permission profiles (/permissions <id>):".to_owned());
+            for value in data {
+                let id = value
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?");
+                let description = value
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                lines.push(format!("{id} — {description}"));
+            }
+        }
+        ExpectedResponse::ThreadList => {
+            lines.push("Threads, newest first (/resume <id>):".to_owned());
+            for value in data {
+                let id = value
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?");
+                let title = value
+                    .get("name")
+                    .or_else(|| value.get("preview"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Untitled");
+                let cwd = value
+                    .get("cwd")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?");
+                lines.push(format!("{id} — {title} — {cwd}"));
+            }
+            if let Some(cursor) = result.get("nextCursor").and_then(serde_json::Value::as_str) {
+                lines.push(format!("More: /resume --cursor {cursor}"));
+            }
+        }
+        _ => {
+            return Err(CodexProviderSourceError::protocol(
+                "non-catalog response used as a catalog",
+            ));
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn process_live_frame(
     io: &mut dyn AppServerIo,
     protocol: &mut ProtocolEngine,
     mapper: &Arc<Mutex<CodexEventMapper>>,
     status: &SharedStatus,
     approvals: &SharedApprovalState,
+    controls: &SharedControlState,
     events: &ProviderEventHandle,
+    pending_controls: &mut BTreeMap<crate::protocol::RequestId, PendingControl>,
     text: &str,
     route: ApprovalRoute,
 ) -> Result<(), CodexProviderSourceError> {
@@ -548,7 +1271,7 @@ fn process_live_frame(
             Ok(())
         }
         ServerFrame::Request { id, method, params } => {
-            if is_approval_method(&method) {
+            if is_interaction_method(&method) {
                 process_approval_request(
                     Some(io),
                     protocol,
@@ -567,19 +1290,47 @@ fn process_live_frame(
                 Ok(())
             }
         }
-        ServerFrame::Response { expected, .. } | ServerFrame::Error { expected, .. } => {
-            Err(CodexProviderSourceError::protocol(format!(
-                "unexpected live {} response",
-                expected.method()
-            )))
-        }
+        ServerFrame::Response {
+            id,
+            expected,
+            result,
+        } => process_control_response(
+            io,
+            protocol,
+            id,
+            expected,
+            result,
+            pending_controls,
+            controls,
+            mapper,
+            events,
+            status,
+        ),
+        ServerFrame::Error {
+            id,
+            expected,
+            code,
+            message,
+        } => process_control_error(
+            id,
+            expected,
+            code,
+            message,
+            pending_controls,
+            controls,
+            mapper,
+            events,
+            status,
+        ),
     }
 }
 
-fn is_approval_method(method: &str) -> bool {
+fn is_interaction_method(method: &str) -> bool {
     matches!(
         method,
-        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
+        "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/tool/requestUserInput"
     )
 }
 
@@ -607,7 +1358,11 @@ fn process_approval_request(
         lock_status(status).rejected_server_requests += 1;
         return Ok(());
     };
-    let prepared = prepare_approval(&method, &params, item.as_ref(), session_id)?;
+    let prepared = if method == "item/tool/requestUserInput" {
+        prepare_user_input(&params, session_id)?
+    } else {
+        prepare_approval(&method, &params, item.as_ref(), session_id)?
+    };
     let interaction_id = prepared.request.id();
     {
         let mut state = lock_approvals(approvals);
@@ -636,10 +1391,10 @@ fn flush_approval_responses(
         let Some(outbound) = lock_approvals(approvals).pop_outbound_for(route) else {
             return Ok(());
         };
-        io.write_text(protocol.approval_response(
+        io.write_text(protocol.interaction_response(
             outbound.request_id,
             &outbound.method,
-            outbound.decision,
+            outbound.result,
         )?)?;
         lock_approvals(approvals).mark_sent(outbound.interaction_id)?;
     }
@@ -677,6 +1432,25 @@ fn process_resolved_notification(
             session_id,
             interaction_id,
         }) => {
+            publish_closed(
+                ClosedApproval {
+                    thread_id,
+                    session_id,
+                    interaction_id,
+                },
+                InteractionCloseReason::ResolvedElsewhere,
+                mapper,
+                events,
+                status,
+            )?;
+        }
+        Some(ResolvedApproval::RespondedForm {
+            thread_id,
+            session_id,
+            interaction_id,
+        }) => {
+            // Form answers can contain secrets. Their values are written once to Codex and are
+            // deliberately not retained or republished through the event history.
             publish_closed(
                 ClosedApproval {
                     thread_id,
@@ -1157,7 +1931,7 @@ fn observe_proxy_server_text(
             Ok(())
         }
         ObservedServerFrame::Request { id, method, params } => {
-            if is_approval_method(&method) {
+            if is_interaction_method(&method) {
                 process_approval_request(
                     None, protocol, route, id, method, params, mapper, status, approvals, events,
                 )
@@ -1632,7 +2406,7 @@ mod tests {
         InteractionResponsePayload, NonEmptyText, ProviderCapabilities, ProviderDescriptor,
         ProviderId, ProviderKind, SessionId, SessionOutcome, Timestamp,
     };
-    use agentpulse_protocol::{ProtocolMessage, V1_PROTOCOL_VERSION};
+    use agentpulse_protocol::{ProtocolMessage, V2_PROTOCOL_VERSION};
     use tungstenite::{ClientRequestBuilder, Message, WebSocket, client, http::Uri};
 
     use super::*;
@@ -1928,18 +2702,20 @@ mod tests {
         let mapper = CodexEventMapper::new(provider_id, &config.threads, config.discover_threads);
         let status = Arc::new(Mutex::new(Default::default()));
         let approvals = Arc::new(Mutex::new(ApprovalRuntimeState::new()));
-        let source = CodexProviderSource::with_runtime_and_approvals(
+        let controls = Arc::new(Mutex::new(ControlRuntimeState::new()));
+        let source = CodexProviderSource::with_runtime_and_states(
             config,
             schema,
             mapper,
             Arc::clone(&status),
             Arc::clone(&approvals),
+            Arc::clone(&controls),
             Box::new(FakeRuntime { control }),
         );
         let descriptor = provider_descriptor(provider_id)?;
         Ok((
             provider_id,
-            CodexProviderPort::with_approvals(descriptor, approvals),
+            CodexProviderPort::new(descriptor, approvals, controls),
             source,
             status,
         ))
@@ -1962,18 +2738,20 @@ mod tests {
         let mapper = CodexEventMapper::new(provider_id, &config.threads, config.discover_threads);
         let status = Arc::new(Mutex::new(Default::default()));
         let approvals = Arc::new(Mutex::new(ApprovalRuntimeState::new()));
-        let source = CodexProviderSource::with_runtime_and_approvals(
+        let controls = Arc::new(Mutex::new(ControlRuntimeState::new()));
+        let source = CodexProviderSource::with_runtime_and_states(
             config,
             schema,
             mapper,
             Arc::clone(&status),
             Arc::clone(&approvals),
+            Arc::clone(&controls),
             Box::new(FakeRuntime { control }),
         );
         let descriptor = provider_descriptor(provider_id)?;
         Ok((
             provider_id,
-            CodexProviderPort::with_approvals(descriptor, approvals),
+            CodexProviderPort::new(descriptor, approvals, controls),
             source,
             status,
         ))
@@ -2044,7 +2822,9 @@ mod tests {
                 client_id: ChannelId::new().to_string(),
                 display_name: "Codex Fixture Native Client".to_owned(),
                 version: Some("1.0.0-test".to_owned()),
-                supported_protocol_versions: vec![V1_PROTOCOL_VERSION],
+                supported_protocol_versions: vec![V2_PROTOCOL_VERSION],
+                host_run_id: None,
+                session_cursors: Default::default(),
             },
         )?;
         assert!(matches!(
@@ -2494,12 +3274,14 @@ mod tests {
         let mapper = CodexEventMapper::new(provider_id, &config.threads, config.discover_threads);
         let status = Arc::new(Mutex::new(Default::default()));
         let approvals = Arc::new(Mutex::new(ApprovalRuntimeState::new()));
-        let mut source = CodexProviderSource::with_runtime_and_approvals(
+        let controls = Arc::new(Mutex::new(ControlRuntimeState::new()));
+        let mut source = CodexProviderSource::with_runtime_and_states(
             config,
             schema,
             mapper,
             Arc::clone(&status),
             Arc::clone(&approvals),
+            Arc::clone(&controls),
             Box::new(ProxyTestRuntime {
                 observer: Arc::clone(&observer),
                 proxy: Arc::clone(&proxy),
@@ -2507,7 +3289,7 @@ mod tests {
             }),
         );
         source.client_proxy_enabled = true;
-        let port = CodexProviderPort::with_approvals(provider_descriptor(provider_id)?, approvals);
+        let port = CodexProviderPort::new(provider_descriptor(provider_id)?, approvals, controls);
         let session_id = SessionId::from_str(THREAD_ID)?;
         let channel_id = ChannelId::new();
         let actions = Arc::new(Mutex::new(None));

@@ -104,7 +104,7 @@ pub enum NativeChannelSourceError {
     WorkerPanicked,
 }
 
-/// Strict Native Transport v1 encoding or decoding failure.
+/// Strict Native Transport v3 encoding or decoding failure.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum NativeProtocolError {
@@ -131,7 +131,7 @@ pub enum NativeProtocolError {
         /// A human-readable validation failure.
         reason: String,
     },
-    /// A nested AgentPulse JSON v1 domain envelope was invalid.
+    /// A nested AgentPulse JSON v2 domain envelope was invalid.
     #[error("invalid nested AgentPulse domain message: {source}")]
     DomainProtocol {
         /// The existing domain protocol failure.

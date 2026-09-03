@@ -8,8 +8,8 @@ use std::{
 
 use agentpulse_bridge::{
     Bridge, ChannelActionError, ChannelDeliveryKind, ChannelDeliveryResult, ChannelPort,
-    EndpointRegistrationError, ProviderEventError, ProviderEventOutcome, ProviderHandoffKind,
-    ProviderPort, SubscribeOutcome, SubscriptionError, UnsubscribeOutcome,
+    ChannelSessionSync, EndpointRegistrationError, ProviderEventError, ProviderEventOutcome,
+    ProviderHandoffKind, ProviderPort, SubscribeOutcome, SubscriptionError, UnsubscribeOutcome,
 };
 use agentpulse_core::{
     AgentCommand, AgentCommandPayload, AgentEvent, AgentEventPayload, AgentMessage,
@@ -18,7 +18,7 @@ use agentpulse_core::{
     EventSequence, InteractionId, InteractionRequest, InteractionRequestPayload,
     InteractionResponse, InteractionResponsePayload, InteractionRoute, NonEmptyText,
     ProviderCapabilities, ProviderDescriptor, ProviderId, ProviderKind, ReduceError, Revision,
-    SessionId, TextInputRequest, Timestamp, ToolActivity, ToolCallId,
+    SessionAggregateConfig, SessionId, TextInputRequest, Timestamp, ToolActivity, ToolCallId,
 };
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -125,6 +125,7 @@ fn submit_prompt(
         timestamp(140)?,
         AgentCommandPayload::SubmitPrompt {
             text: text("Run tests")?,
+            delivery: agentpulse_core::PromptDelivery::Queue,
         },
     ))
 }
@@ -328,6 +329,17 @@ impl ChannelPort for PrimaryChannel {
             return Err(PrimaryRejected("primary Channel rejected session"));
         }
         state.sessions.push(session);
+        Ok(())
+    }
+
+    fn deliver_session_sync(&mut self, sync: ChannelSessionSync) -> Result<(), Self::Error> {
+        let mut state = channel_state(&self.state)?;
+        for routed in sync.events() {
+            state.events.push((routed.event().clone(), routed.route()));
+        }
+        if let Some(baseline) = sync.baseline() {
+            state.sessions.push(baseline.session().clone());
+        }
         Ok(())
     }
 }
@@ -1124,5 +1136,61 @@ fn provider_handoff_errors_preserve_the_adapter_source_and_state() -> TestResult
             .revision(),
         Revision::FIRST
     );
+    Ok(())
+}
+
+#[test]
+fn retained_history_is_paged_before_the_live_subscription_becomes_active() -> TestResult {
+    let provider_id = ProviderId::new();
+    let channel_id = ChannelId::new();
+    let session_id = SessionId::new();
+    let (provider, _) = primary_provider(
+        provider_id,
+        "History Provider",
+        ProviderCapabilities::SESSION_STATE,
+    )?;
+    let (channel, channel_handle) = primary_channel(
+        channel_id,
+        "History Channel",
+        ChannelCapabilities::NOTIFICATION | ChannelCapabilities::SESSION_VIEW,
+    )?;
+    let mut bridge = Bridge::with_session_config(SessionAggregateConfig::retain_all());
+    bridge.register_provider(provider)?;
+    bridge.register_channel(channel)?;
+    bridge.handle_provider_event(
+        provider_id,
+        initial_event(session(provider_id, session_id)?)?,
+    )?;
+    for sequence in 2..=5 {
+        bridge.handle_provider_event(
+            provider_id,
+            message_event(session_id, sequence, "retained")?,
+        )?;
+    }
+
+    let first = bridge.sync_session(channel_id, session_id, 0, 2)?;
+    assert_eq!(first.through_sequence(), 2);
+    assert_eq!(first.event_count(), 2);
+    assert!(!first.subscribed());
+    assert!(!bridge.is_subscribed(channel_id, session_id));
+
+    let second = bridge.sync_session(channel_id, session_id, 2, 2)?;
+    assert_eq!(second.through_sequence(), 4);
+    assert!(!second.subscribed());
+
+    let final_page = bridge.sync_session(channel_id, session_id, 4, 2)?;
+    assert_eq!(final_page.through_sequence(), 5);
+    assert_eq!(final_page.event_count(), 1);
+    assert!(final_page.subscribed());
+    assert!(bridge.is_subscribed(channel_id, session_id));
+    assert_eq!(
+        channel_state(&channel_handle)?
+            .events
+            .iter()
+            .map(|(event, _)| event.sequence().get())
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5],
+    );
+    assert_eq!(channel_state(&channel_handle)?.sessions.len(), 1);
     Ok(())
 }

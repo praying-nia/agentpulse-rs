@@ -456,6 +456,7 @@ fn commands_require_the_complete_provider_and_channel_route() -> TestResult {
         timestamp(110)?,
         AgentCommandPayload::SubmitPrompt {
             text: text("Continue")?,
+            delivery: agentpulse_core::PromptDelivery::Queue,
         },
     );
     let cancel = AgentCommand::new(

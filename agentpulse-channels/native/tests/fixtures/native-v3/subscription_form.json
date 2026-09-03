@@ -1,0 +1,51 @@
+{
+  "native_transport_version": 3,
+  "message": {
+    "type": "domain_message",
+    "context": {
+      "type": "subscription_interaction",
+      "request_id": "01890f47-7c00-7000-8000-000000000005",
+      "route": "interaction_interactive"
+    },
+    "domain": {
+      "protocol_version": 2,
+      "message": {
+        "type": "interaction_request",
+        "payload": {
+          "id": "01890f47-7c00-7000-8000-00000000000b",
+          "session_id": "01890f47-7c00-7000-8000-000000000003",
+          "requested_at": "2026-09-03T00:03:00Z",
+          "prompt": "Configure the implementation plan",
+          "payload": {
+            "type": "form",
+            "fields": [
+              {
+                "id": "01890f47-7c00-7000-8000-00000000000c",
+                "header": "Scope",
+                "prompt": "Which scope should be used?",
+                "options": [
+                  {
+                    "id": "01890f47-7c00-7000-8000-00000000000d",
+                    "label": "Workspace",
+                    "description": "Use the current workspace"
+                  }
+                ],
+                "allows_other": true,
+                "sensitive": false
+              },
+              {
+                "id": "01890f47-7c00-7000-8000-00000000000e",
+                "header": "Credential",
+                "prompt": "Enter the deployment token",
+                "options": [],
+                "allows_other": true,
+                "sensitive": true
+              }
+            ],
+            "blocking": true
+          }
+        }
+      }
+    }
+  }
+}

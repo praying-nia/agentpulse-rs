@@ -7,6 +7,7 @@
 
 mod approval;
 mod config;
+mod control;
 mod error;
 mod mapper;
 mod port;
@@ -25,6 +26,7 @@ pub use runtime::CodexProviderSource;
 pub use status::{CodexProviderHealth, CodexProviderSnapshot};
 
 use approval::ApprovalRuntimeState;
+use control::ControlRuntimeState;
 use mapper::CodexEventMapper;
 use protocol::ProtocolSchema;
 use status::{SharedStatus, snapshot};
@@ -100,21 +102,33 @@ impl CodexProvider {
             NonEmptyText::new("Codex")?,
             ProviderCapabilities::SESSION_STATE
                 | ProviderCapabilities::APPROVAL_REQUEST
-                | ProviderCapabilities::APPROVAL_RESPONSE,
+                | ProviderCapabilities::APPROVAL_RESPONSE
+                | ProviderCapabilities::USER_INPUT_REQUEST
+                | ProviderCapabilities::USER_INPUT_RESPONSE
+                | ProviderCapabilities::PROMPT_SUBMIT
+                | ProviderCapabilities::CANCEL
+                | ProviderCapabilities::CONTROL,
         )
         .with_version(NonEmptyText::new(SUPPORTED_CODEX_CLI_VERSION)?);
         let status = Arc::new(Mutex::new(Default::default()));
         let approvals = Arc::new(Mutex::new(ApprovalRuntimeState::new()));
+        let controls = Arc::new(Mutex::new(ControlRuntimeState::new()));
         let mapper =
             CodexEventMapper::new(config.provider_id, &config.threads, config.discover_threads);
         let handle = CodexProviderHandle {
             remote_uri: config.remote_uri.clone(),
             status: Arc::clone(&status),
         };
-        let source =
-            CodexProviderSource::new(config, schema, mapper, status, Arc::clone(&approvals));
+        let source = CodexProviderSource::new(
+            config,
+            schema,
+            mapper,
+            status,
+            Arc::clone(&approvals),
+            Arc::clone(&controls),
+        );
         Ok(CodexProviderParts {
-            port: CodexProviderPort::with_approvals(descriptor, approvals),
+            port: CodexProviderPort::new(descriptor, approvals, controls),
             source,
             handle,
         })

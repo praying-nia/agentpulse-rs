@@ -168,6 +168,7 @@ pub enum ApplyOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SessionAggregateConfig {
     recent_event_capacity: usize,
+    retain_all_events: bool,
 }
 
 impl SessionAggregateConfig {
@@ -182,6 +183,16 @@ impl SessionAggregateConfig {
     pub const fn new(recent_event_capacity: usize) -> Self {
         Self {
             recent_event_capacity,
+            retain_all_events: false,
+        }
+    }
+
+    /// Retains every Event observed during this in-memory Aggregate lifetime.
+    #[must_use]
+    pub const fn retain_all() -> Self {
+        Self {
+            recent_event_capacity: 0,
+            retain_all_events: true,
         }
     }
 
@@ -189,6 +200,12 @@ impl SessionAggregateConfig {
     #[must_use]
     pub const fn recent_event_capacity(self) -> usize {
         self.recent_event_capacity
+    }
+
+    /// Returns whether the complete in-memory Event stream is retained.
+    #[must_use]
+    pub const fn retains_all_events(self) -> bool {
+        self.retain_all_events
     }
 }
 
@@ -285,7 +302,7 @@ impl SessionAggregate {
 
         let initial_event = Arc::new(initial_event);
         let mut recent_events = VecDeque::new();
-        if config.recent_event_capacity() > 0 {
+        if config.retains_all_events() || config.recent_event_capacity() > 0 {
             recent_events.push_back(Arc::clone(&initial_event));
         }
 
@@ -500,6 +517,47 @@ impl SessionAggregate {
         self.recent_events.iter().map(Arc::as_ref)
     }
 
+    /// Clones the retained contiguous Event suffix after a zero-or-positive cursor.
+    ///
+    /// Returns `None` when the cursor is ahead of the Aggregate or the configured
+    /// bounded window no longer covers the requested next Event.
+    #[must_use]
+    pub fn retained_events_after(&self, after_sequence: u64) -> Option<Vec<AgentEvent>> {
+        self.retained_event_page_after(after_sequence, usize::MAX)
+    }
+
+    /// Clones at most `max_events` retained Events after a zero-or-positive cursor.
+    #[must_use]
+    pub fn retained_event_page_after(
+        &self,
+        after_sequence: u64,
+        max_events: usize,
+    ) -> Option<Vec<AgentEvent>> {
+        if after_sequence > self.last_sequence().get() {
+            return None;
+        }
+        if after_sequence == self.last_sequence().get() {
+            return Some(Vec::new());
+        }
+        let expected = after_sequence.checked_add(1)?;
+        if self
+            .recent_events
+            .front()
+            .is_none_or(|event| event.sequence().get() > expected)
+        {
+            return None;
+        }
+        Some(
+            self.recent_events
+                .iter()
+                .map(Arc::as_ref)
+                .filter(|event| event.sequence().get() > after_sequence)
+                .take(max_events)
+                .cloned()
+                .collect(),
+        )
+    }
+
     fn validate_cursor(&self, event: &AgentEvent) -> Result<bool, ReduceError> {
         if event.session_id() != self.session.id() {
             return Err(ReduceError::SessionMismatch {
@@ -596,13 +654,15 @@ impl SessionAggregate {
     fn record_event(&mut self, event: AgentEvent) {
         let event = Arc::new(event);
         self.last_event = Arc::clone(&event);
-        if self.config.recent_event_capacity() == 0 {
+        if !self.config.retains_all_events() && self.config.recent_event_capacity() == 0 {
             return;
         }
 
         self.recent_events.push_back(event);
-        while self.recent_events.len() > self.config.recent_event_capacity() {
-            let _ = self.recent_events.pop_front();
+        if !self.config.retains_all_events() {
+            while self.recent_events.len() > self.config.recent_event_capacity() {
+                let _ = self.recent_events.pop_front();
+            }
         }
     }
 }

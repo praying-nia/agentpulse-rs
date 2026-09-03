@@ -23,11 +23,11 @@ use agentpulse_bridge::RuntimeHost;
 use agentpulse_channel_native::{
     NATIVE_TRANSPORT_VERSION, NativeChannel, NativeChannelConfig, NativeChannelHealth,
 };
-use agentpulse_core::{ChannelId, ProviderId};
+use agentpulse_core::{ChannelId, ProviderId, SessionAggregateConfig};
 use agentpulse_pairing::{
     FileCredentialAuthorizer, HostCredentialStore, PairingSession, terminal_qr,
 };
-use agentpulse_protocol::V1_PROTOCOL_VERSION;
+use agentpulse_protocol::V2_PROTOCOL_VERSION;
 use agentpulse_provider_codex::{
     CodexProvider, CodexProviderConfig, CodexProviderHealth, SUPPORTED_CODEX_CLI_VERSION,
 };
@@ -435,7 +435,7 @@ fn serve(paths: &HostPaths, args: ServeArgs) -> AppResult<()> {
     let native_parts = NativeChannel::build(native_config)?;
     let native_handle = native_parts.handle().clone();
     let (native_port, native_source, _) = native_parts.into_parts();
-    let mut host = RuntimeHost::new();
+    let mut host = RuntimeHost::with_session_config(SessionAggregateConfig::retain_all());
     host.register_provider(provider_port, provider_source)?;
     host.register_channel(native_port, native_source)?;
     host.start()?;
@@ -497,7 +497,7 @@ fn serve(paths: &HostPaths, args: ServeArgs) -> AppResult<()> {
     };
     println!("AgentPulse Host '{}' is ready.", identity.host_name);
     println!(
-        "Native WSS: wss://{}:{}/agentpulse/native/v1",
+        "Native WSS: wss://{}:{}/agentpulse/native/v3",
         identity.server_name,
         native_address.port()
     );
@@ -638,7 +638,7 @@ fn pair(paths: &HostPaths) -> AppResult<()> {
         status.native_address,
         settings.endpoint.to_string(),
         NATIVE_TRANSPORT_VERSION,
-        vec![V1_PROTOCOL_VERSION],
+        vec![V2_PROTOCOL_VERSION],
     )?;
     let pairing_root = device_root_from_token(&session.bundle().bootstrap_token);
     let route = derive_route(&pairing_root, &settings.endpoint)?.registration();

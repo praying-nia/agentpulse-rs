@@ -17,6 +17,7 @@ bitflags! {
         const USER_INPUT_RESPONSE = 1 << 7;
         const PROMPT_SUBMIT = 1 << 8;
         const CANCEL = 1 << 9;
+        const CONTROL = 1 << 10;
     }
 }
 
@@ -50,6 +51,8 @@ impl ProviderCapabilities {
     pub const PROMPT_SUBMIT: Self = Self(ProviderCapabilityBits::PROMPT_SUBMIT);
     /// Accepts session cancellation.
     pub const CANCEL: Self = Self(ProviderCapabilityBits::CANCEL);
+    /// Accepts the bounded, typed remote control command set.
+    pub const CONTROL: Self = Self(ProviderCapabilityBits::CONTROL);
 
     /// Returns whether all requested capabilities are present.
     #[must_use]

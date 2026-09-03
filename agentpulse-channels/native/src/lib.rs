@@ -2,7 +2,7 @@
 //!
 //! The Channel serves one explicitly handshaken client over a loopback-only
 //! WebSocket, exposes current Provider/Session discovery, establishes an exact
-//! Session baseline cursor, and streams normalized JSON v1 domain messages.
+//! Session baseline cursor, and streams normalized JSON v2 domain messages.
 
 mod config;
 mod error;
@@ -33,13 +33,13 @@ use state::DeliveryState;
 use status::{SharedStatus, lock_status};
 
 /// Native Transport control protocol version implemented by this crate.
-pub const NATIVE_TRANSPORT_VERSION: u16 = 1;
+pub const NATIVE_TRANSPORT_VERSION: u16 = 3;
 
 /// Exact HTTP path accepted by the local Native WebSocket endpoint.
-pub const NATIVE_WEBSOCKET_PATH: &str = "/agentpulse/native/v1";
+pub const NATIVE_WEBSOCKET_PATH: &str = "/agentpulse/native/v3";
 
 /// Required RFC 6455 WebSocket subprotocol token.
-pub const NATIVE_WEBSOCKET_SUBPROTOCOL: &str = "agentpulse.native.v1";
+pub const NATIVE_WEBSOCKET_SUBPROTOCOL: &str = "agentpulse.native.v3";
 
 /// Thread-safe monitoring handle for one built Native Channel.
 #[derive(Clone)]
@@ -92,7 +92,10 @@ impl NativeChannel {
             ChannelCapabilities::NOTIFICATION
                 | ChannelCapabilities::SESSION_VIEW
                 | ChannelCapabilities::REALTIME_SYNC
-                | ChannelCapabilities::APPROVAL,
+                | ChannelCapabilities::APPROVAL
+                | ChannelCapabilities::FORM_INPUT
+                | ChannelCapabilities::TEXT_INPUT
+                | ChannelCapabilities::REMOTE_COMMAND,
         )
         .with_version(NonEmptyText::new(env!("CARGO_PKG_VERSION"))?);
         let status = Arc::new(Mutex::new(NativeChannelSnapshot::default()));
@@ -124,7 +127,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn factory_declares_the_exact_approval_contract() -> Result<(), Box<dyn Error>> {
+    fn factory_declares_the_exact_interaction_contract() -> Result<(), Box<dyn Error>> {
         let parts = NativeChannel::build(NativeChannelConfig::new(ChannelId::new()))?;
         let descriptor = parts.port.descriptor();
         assert_eq!(descriptor.kind().as_str(), "native");
@@ -134,6 +137,9 @@ mod tests {
                 | ChannelCapabilities::SESSION_VIEW
                 | ChannelCapabilities::REALTIME_SYNC
                 | ChannelCapabilities::APPROVAL
+                | ChannelCapabilities::FORM_INPUT
+                | ChannelCapabilities::TEXT_INPUT
+                | ChannelCapabilities::REMOTE_COMMAND
         );
         Ok(())
     }

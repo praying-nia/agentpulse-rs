@@ -7,9 +7,9 @@ use std::{
 
 use agentpulse_bridge::{ProviderEventHandle, ProviderEventIngressError};
 use agentpulse_core::{
-    AgentEvent, AgentEventPayload, AgentMessage, AgentMessageLevel, AgentSession, AgentState,
-    ConnectionState, EventId, EventSequence, NonEmptyText, ProviderId, Revision, SessionId,
-    SessionOutcome, Timestamp, WorkspaceRef,
+    AgentEvent, AgentEventPayload, AgentMessage, AgentMessageLevel, AgentMessageRole, AgentSession,
+    AgentState, ConnectionState, EventId, EventSequence, NonEmptyText, ProviderId, Revision,
+    SessionId, SessionOutcome, Timestamp, WorkspaceRef,
 };
 use serde_json::{Value, json};
 
@@ -33,6 +33,7 @@ struct ThreadMapping {
     next_sequence: EventSequence,
     state: AgentState,
     connection: ConnectionState,
+    cwd: Option<NonEmptyText>,
     active_turn_id: Option<String>,
     last_message: Option<NonEmptyText>,
     last_final_message: Option<NonEmptyText>,
@@ -49,6 +50,10 @@ pub(crate) struct CodexEventMapper {
 }
 
 impl CodexEventMapper {
+    pub(crate) fn is_thread_tracked(&self, thread_id: &str) -> bool {
+        self.threads.contains_key(thread_id)
+    }
+
     pub(crate) fn new(
         provider_id: ProviderId,
         threads: &[ConfiguredThread],
@@ -131,7 +136,8 @@ impl CodexEventMapper {
         if let Some(title) = thread_title(thread)? {
             builder = builder.title(title);
         }
-        if let Some(cwd) = optional_non_empty_string(thread, "cwd")? {
+        let cwd = optional_non_empty_string(thread, "cwd")?;
+        if let Some(cwd) = cwd.clone() {
             builder = builder.workspace(WorkspaceRef::new(cwd));
         }
         let session = builder.build()?;
@@ -153,12 +159,102 @@ impl CodexEventMapper {
                 next_sequence,
                 state,
                 connection,
+                cwd,
                 active_turn_id: latest_in_progress_turn(thread)?,
                 last_message: None,
                 last_final_message: None,
             },
         );
         Ok(())
+    }
+
+    pub(crate) fn publish_history_items(
+        &mut self,
+        thread_id: &str,
+        entries: &[Value],
+        events: &ProviderEventHandle,
+        status: &SharedStatus,
+    ) -> Result<(), CodexProviderSourceError> {
+        for entry in entries {
+            let item = object_field(entry, "item")?;
+            let (role, text) = match string_field(item, "type")? {
+                "agentMessage" => (
+                    AgentMessageRole::Assistant,
+                    string_field(item, "text")?.to_owned(),
+                ),
+                "userMessage" => {
+                    let content =
+                        item.get("content")
+                            .and_then(Value::as_array)
+                            .ok_or_else(|| {
+                                CodexProviderSourceError::protocol(
+                                    "user message content must be an array",
+                                )
+                            })?;
+                    let text = content
+                        .iter()
+                        .filter(|input| input.get("type").and_then(Value::as_str) == Some("text"))
+                        .filter_map(|input| input.get("text").and_then(Value::as_str))
+                        .filter(|text| !text.starts_with("Work in Plan mode:"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    (AgentMessageRole::User, text)
+                }
+                _ => continue,
+            };
+            if text.trim().is_empty() {
+                continue;
+            }
+            self.publish_payload(
+                thread_id,
+                Timestamp::now_utc(),
+                AgentEventPayload::Message(AgentMessage::with_role(
+                    role,
+                    AgentMessageLevel::Info,
+                    NonEmptyText::new(text)?,
+                )),
+                events,
+                status,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn track_discovered_thread(
+        &mut self,
+        thread_id: &str,
+    ) -> Result<(), CodexProviderSourceError> {
+        self.configured
+            .entry(thread_id.to_owned())
+            .or_insert(SessionId::from_str(thread_id)?);
+        Ok(())
+    }
+
+    pub(crate) fn command_context(
+        &self,
+        session_id: SessionId,
+    ) -> Option<(&str, Option<&str>, AgentState)> {
+        self.threads.iter().find_map(|(thread_id, mapping)| {
+            (mapping.session_id == session_id).then_some((
+                thread_id.as_str(),
+                mapping.active_turn_id.as_deref(),
+                mapping.state,
+            ))
+        })
+    }
+
+    pub(crate) fn session_id_for_thread(&self, thread_id: &str) -> Option<SessionId> {
+        self.threads
+            .get(thread_id)
+            .map(|mapping| mapping.session_id)
+    }
+
+    pub(crate) fn cwd_for_session(&self, session_id: SessionId) -> Option<&str> {
+        self.threads
+            .values()
+            .find(|mapping| mapping.session_id == session_id)
+            .and_then(|mapping| mapping.cwd.as_ref())
+            .map(NonEmptyText::as_str)
     }
 
     pub(crate) fn begin_reconnect(

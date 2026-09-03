@@ -117,6 +117,11 @@ define_id!(
     "choice option ID"
 );
 define_id!(
+    /// Identifies one field in a structured user-input form.
+    FormFieldId,
+    "form field ID"
+);
+define_id!(
     /// Identifies one Provider-issued option in an approval request.
     ApprovalOptionId,
     "approval option ID"

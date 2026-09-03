@@ -1,8 +1,8 @@
 # AgentPulse Codex Provider
 
-`agentpulse-provider-codex` observes Codex threads and writes command/file approval decisions back to Codex. It owns a schema-pinned Codex App Server and a private Unix WebSocket proxy for `codex --remote` clients. The proxy preserves the desktop fallback while allowing a phone decision to return on the exact connection that owns the approval request.
+`agentpulse-provider-codex` observes Codex threads and supports approvals, atomic user-input forms, queued prompts, and common typed remote commands. It owns a schema-pinned Codex App Server and a private Unix WebSocket proxy for `codex --remote` clients. The proxy preserves the desktop fallback while allowing a phone response to return on the exact connection that owns the request.
 
-`agentpulse-provider-codex` 观察 Codex Thread，并把命令/文件审批决定回写给 Codex。它托管固定 Schema 的 Codex App Server，并为 `codex --remote` 客户端提供私有 Unix WebSocket 代理。代理保留桌面审批兜底，同时让手机决定回到拥有该审批请求的原始连接。
+`agentpulse-provider-codex` 观察 Codex Thread，并支持审批、原子用户输入表单、排队 Prompt 与常用类型化远程指令。它托管固定 Schema 的 Codex App Server，并为 `codex --remote` 客户端提供私有 Unix WebSocket 代理。代理保留桌面兜底，同时让手机响应回到拥有请求的原始连接。
 
 ## Compatibility / 兼容范围
 
@@ -10,7 +10,7 @@
 - Platforms: Linux and macOS managed Unix sockets / Linux 与 macOS 受管 Unix Socket。
 - Input: explicitly configured UUIDv7 thread IDs, or ephemeral discovery of threads opened through the same managed App Server / 显式配置的 UUIDv7 Thread ID，或对同一受管 App Server 中已打开 Thread 的临时发现。
 - Events: live state, agent messages, connection changes, and turn outcomes / 实时状态、Agent 消息、连接变化与 Turn 结果。
-- Write-back: command execution and file change approvals, including the exact session and policy-amendment decisions offered by Codex; Agent commands remain unsupported / 支持命令执行与文件修改审批，包括 Codex 实际提供的 Session 与策略 Amendment 决定；Agent Command 仍不支持。
+- Write-back: exact Codex approvals, atomic Plan/user-input forms, queued or steering prompts, and the common model/resume/clear/plan/control commands / 支持精确 Codex 审批、原子 Plan/用户输入表单、排队或 Steer Prompt，以及常用 model/resume/clear/plan/control 指令。
 
 The bundled schema was generated with:
 
@@ -51,9 +51,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 ```
 
-Start RuntimeHost before connecting another client with `codex --remote <uri>`. The URI names the Provider-owned proxy, not the App Server's upstream socket. The Provider resumes every configured thread before reporting startup success. It does not replay turns included in `thread/resume`; only notifications observed after the subscription boundary become AgentPulse events.
+Start RuntimeHost before connecting another client with `codex --remote <uri>`. The URI names the Provider-owned proxy, not the App Server's upstream socket. The Provider resumes every configured thread before reporting startup success. A phone-issued `/resume` additionally hydrates user/assistant history through ascending `thread/items/list` pages into this Host run's memory.
 
-Approvals are correlated entirely in runtime memory. AgentPulse adds no approval timeout: a request stays pending until Codex resolves it or its owning item, turn, thread, connection, or Provider runtime ends. A restart never restores pending approvals.
+Interactions and commands are correlated entirely in runtime memory. AgentPulse adds no interaction timeout: a request stays pending until Codex resolves it or its owning item, turn, thread, connection, or Provider runtime ends. Secret form answers are discarded after write. Prompt queues are bounded to 32 items per Session, 64 KiB per item, and 1 MiB total; a restart restores neither pending interactions nor queued prompts.
 
 Use `CodexProviderConfig::discovering` instead when the Provider must start with
 no saved Thread IDs and follow `thread/started` events from a Remote TUI. That

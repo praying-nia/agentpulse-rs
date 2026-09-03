@@ -1,0 +1,17 @@
+{
+  "native_transport_version": 3,
+  "message": {
+    "type": "client_hello",
+    "client_id": "01890f47-7c00-7000-8000-000000000004",
+    "display_name": "Fixture Native Client",
+    "version": "1.0.0",
+    "supported_protocol_versions": [1],
+    "host_run_id": "01890f47-7c00-7000-8000-000000000011",
+    "session_cursors": [
+      {
+        "session_id": "01890f47-7c00-7000-8000-000000000003",
+        "last_sequence": "7"
+      }
+    ]
+  }
+}

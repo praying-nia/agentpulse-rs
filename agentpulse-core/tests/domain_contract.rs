@@ -7,7 +7,8 @@ use agentpulse_core::{
     ApprovalCommandKind, ApprovalDisposition, ApprovalOption, ApprovalOptionId, ApprovalRequest,
     ApprovalSelection, ApprovalSubject, ChannelCapabilities, ChannelId, ChoiceOption,
     ChoiceOptionId, ChoiceRequest, ChoiceSelection, CommandId, ConnectionState,
-    DeterminateProgress, DomainError, EventId, EventSequence, InteractionId, InteractionRequest,
+    DeterminateProgress, DomainError, EventId, EventSequence, FormAnswer, FormAnswerValue,
+    FormField, FormFieldId, FormRequest, FormResponse, InteractionId, InteractionRequest,
     InteractionRequestPayload, InteractionResponse, InteractionResponsePayload, NonEmptyText,
     PlanItem, PlanItemId, PlanItemStatus, PlanSnapshot, ProgressSnapshot, ProgressValue,
     ProviderCapabilities, ProviderId, ProviderKind, Revision, SessionId, Timestamp,
@@ -272,6 +273,68 @@ fn interactions_reject_mismatched_types_and_expired_responses() -> Result<(), Do
 }
 
 #[test]
+fn forms_require_one_valid_answer_for_every_field() -> Result<(), DomainError> {
+    let session_id = SessionId::new();
+    let option = ChoiceOption::new(ChoiceOptionId::new(), text("Use workspace")?);
+    let choice_field = FormField::new(
+        FormFieldId::new(),
+        text("Mode")?,
+        text("Choose a mode")?,
+        vec![option.clone()],
+        false,
+        false,
+    )?;
+    let text_field = FormField::new(
+        FormFieldId::new(),
+        text("Token")?,
+        text("Enter a token")?,
+        vec![],
+        true,
+        true,
+    )?;
+    let request = InteractionRequest::new(
+        InteractionId::new(),
+        session_id,
+        timestamp(100)?,
+        text("Configure")?,
+        InteractionRequestPayload::Form(FormRequest::new(
+            vec![choice_field.clone(), text_field.clone()],
+            true,
+        )?),
+    );
+    let response = |answers| -> Result<InteractionResponse, DomainError> {
+        Ok(InteractionResponse::new(
+            request.id(),
+            session_id,
+            ChannelId::new(),
+            timestamp(110)?,
+            InteractionResponsePayload::Form(FormResponse::new(answers)?),
+        ))
+    };
+    request.validate_response(&response(vec![
+        FormAnswer::new(choice_field.id(), FormAnswerValue::Choice(option.id())),
+        FormAnswer::new(text_field.id(), FormAnswerValue::Text(text("secret")?)),
+    ])?)?;
+    let incomplete = response(vec![FormAnswer::new(
+        choice_field.id(),
+        FormAnswerValue::Choice(option.id()),
+    )])?;
+    assert!(matches!(
+        request.validate_response(&incomplete),
+        Err(DomainError::InvalidChoiceSelection { .. })
+    ));
+    let invalid_text = response(vec![
+        FormAnswer::new(choice_field.id(), FormAnswerValue::Text(text("custom")?)),
+        FormAnswer::new(text_field.id(), FormAnswerValue::Text(text("secret")?)),
+    ])?;
+    assert!(matches!(
+        request.validate_response(&invalid_text),
+        Err(DomainError::InvalidChoiceSelection { .. })
+    ));
+    Ok(())
+}
+
+#[test]
 fn commands_expose_route_capability_requirements() -> Result<(), DomainError> {
     let command = AgentCommand::new(
         CommandId::new(),
@@ -280,6 +343,7 @@ fn commands_expose_route_capability_requirements() -> Result<(), DomainError> {
         timestamp(100)?,
         AgentCommandPayload::SubmitPrompt {
             text: text("Continue")?,
+            delivery: agentpulse_core::PromptDelivery::Queue,
         },
     );
 

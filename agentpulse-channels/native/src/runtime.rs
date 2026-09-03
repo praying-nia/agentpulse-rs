@@ -13,10 +13,10 @@ use std::{
 
 use agentpulse_bridge::{
     ChannelActionError, ChannelActionHandle, ChannelActionIngressError, ChannelActionSource,
-    ChannelSubscriptionScope, SubscribeOutcome, SubscriptionError, UnsubscribeOutcome,
+    ChannelSubscriptionScope, SubscriptionError, UnsubscribeOutcome,
 };
-use agentpulse_core::{ChannelDescriptor, SessionId};
-use agentpulse_protocol::{ProtocolMessage, V1_PROTOCOL_VERSION};
+use agentpulse_core::{ChannelDescriptor, EventSequence, SessionId};
+use agentpulse_protocol::{ProtocolMessage, V2_PROTOCOL_VERSION};
 use agentpulse_transport::{
     LoopbackWebSocket, LoopbackWebSocketError, LoopbackWebSocketListener, TlsWebSocket,
     TlsWebSocketListener, TransportRead,
@@ -510,6 +510,8 @@ fn process_hello(
     let NativeClientMessage::Hello {
         client_id,
         supported_protocol_versions,
+        host_run_id,
+        session_cursors,
         ..
     } = message
     else {
@@ -530,14 +532,15 @@ fn process_hello(
             },
         ));
     }
-    if !supported_protocol_versions.contains(&V1_PROTOCOL_VERSION) {
+    if !supported_protocol_versions.contains(&V2_PROTOCOL_VERSION) {
         return Err(ConnectionFailure::Fatal(
             NativeProtocolError::InvalidField {
                 field: "supported_protocol_versions",
-                reason: "AgentPulse JSON protocol v1 is required".to_owned(),
+                reason: "AgentPulse JSON protocol v2 is required".to_owned(),
             },
         ));
     }
+    let resume_accepted = host_run_id.as_deref() == Some(config.host_run_id.as_str());
     {
         let mut delivery = lock_delivery(state);
         delivery.clear_connection();
@@ -545,6 +548,11 @@ fn process_hello(
             discovered: BTreeSet::new(),
             subscriptions: BTreeSet::new(),
             pending: None,
+            session_cursors: if resume_accepted {
+                session_cursors
+            } else {
+                Default::default()
+            },
         });
     }
     enqueue_control(
@@ -552,10 +560,12 @@ fn process_hello(
         NativeServerMessage::Hello {
             connection_id: Uuid::now_v7().to_string(),
             channel: descriptor.clone(),
-            protocol_version: V1_PROTOCOL_VERSION,
+            protocol_version: V2_PROTOCOL_VERSION,
             max_frame_bytes: config.max_frame_bytes,
             ping_interval_seconds: config.ping_interval.as_secs(),
             idle_timeout_seconds: config.idle_timeout.as_secs(),
+            host_run_id: config.host_run_id.clone(),
+            resume_accepted,
         },
     )
     .map_err(ConnectionFailure::Fatal)?;
@@ -595,6 +605,10 @@ fn process_ready_message(
             request_id,
             response,
         } => process_interaction_response(request_id, response, actions, state),
+        NativeClientMessage::SubmitCommand {
+            request_id,
+            command,
+        } => process_command(request_id, command, actions, state),
     }
 }
 
@@ -698,14 +712,47 @@ fn process_subscribe(
                 true,
             ))));
         }
+        if client.subscriptions.contains(&session_id) {
+            let baseline_sequence = client
+                .session_cursors
+                .get(&session_id)
+                .copied()
+                .and_then(|sequence| EventSequence::new(sequence).ok())
+                .ok_or_else(|| {
+                    internal_error(
+                        Some(request_id.clone()),
+                        "active subscription cursor is unavailable",
+                    )
+                })?;
+            let frame = server_text(&NativeServerMessage::SubscriptionResult {
+                request_id,
+                session_id,
+                status: NativeSubscriptionStatus::AlreadySubscribed,
+                baseline_sequence,
+                pending_interaction_count: 0,
+                event_count: 0,
+                reset: false,
+            })?;
+            delivery
+                .enqueue(frame)
+                .map_err(|capacity| ConnectionFailure::Fatal(queue_error(capacity)))?;
+            return Ok(());
+        }
         client.pending = Some(PendingSubscription {
             request_id: request_id.clone(),
             session_id,
             frames: Default::default(),
+            trailing_frames: Default::default(),
+            sync_delivered: false,
         });
     }
 
-    let outcome = match actions.subscribe(session_id) {
+    let after_sequence = lock_delivery(state)
+        .client
+        .as_ref()
+        .and_then(|client| client.session_cursors.get(&session_id).copied())
+        .unwrap_or(0);
+    let outcome = match actions.sync_session(session_id, after_sequence, SESSION_SYNC_PAGE_EVENTS) {
         Ok(outcome) => outcome,
         Err(error) => {
             if let Some(client) = lock_delivery(state).client.as_mut() {
@@ -714,79 +761,60 @@ fn process_subscribe(
             return Err(runtime_failure(Some(request_id), error));
         }
     };
-    if let Some(client) = lock_delivery(state).client.as_mut() {
-        let _ = client.subscriptions.insert(session_id);
-    }
-    let (subscription_status, baseline_sequence, pending_interaction_count) = match outcome {
-        SubscribeOutcome::Subscribed {
-            session_view_delivered: true,
-            baseline_sequence,
-            pending_interaction_count,
-        } => (
-            NativeSubscriptionStatus::Subscribed,
-            baseline_sequence,
-            pending_interaction_count,
-        ),
-        SubscribeOutcome::AlreadySubscribed { current_sequence } => (
-            NativeSubscriptionStatus::AlreadySubscribed,
-            current_sequence,
-            0,
-        ),
-        SubscribeOutcome::Subscribed {
-            session_view_delivered: false,
-            ..
-        } => {
-            let _ = actions.unsubscribe(session_id);
-            if let Some(client) = lock_delivery(state).client.as_mut() {
-                client.pending = None;
-                let _ = client.subscriptions.remove(&session_id);
-            }
-            return Err(internal_error(
-                Some(request_id),
-                "Native Channel subscription did not deliver a Session baseline",
-            ));
-        }
-        _ => {
-            let _ = actions.unsubscribe(session_id);
-            if let Some(client) = lock_delivery(state).client.as_mut() {
-                client.pending = None;
-                let _ = client.subscriptions.remove(&session_id);
-            }
-            return Err(internal_error(
-                Some(request_id),
-                "unsupported future subscription outcome",
-            ));
-        }
+    let subscription_status = if outcome.subscribed() {
+        NativeSubscriptionStatus::Subscribed
+    } else {
+        NativeSubscriptionStatus::CatchingUp
     };
+    let baseline_sequence = EventSequence::new(outcome.through_sequence()).map_err(|_| {
+        internal_error(
+            Some(request_id.clone()),
+            "invalid synchronized Event cursor",
+        )
+    })?;
+    let pending_interaction_count = outcome.pending_interaction_count();
     let result_frame = server_text(&NativeServerMessage::SubscriptionResult {
-        request_id,
+        request_id: request_id.clone(),
         session_id,
         status: subscription_status,
         baseline_sequence,
         pending_interaction_count,
+        event_count: outcome.event_count(),
+        reset: outcome.reset(),
     })?;
     let mut delivery = lock_delivery(state);
-    let Some(client) = delivery.client.as_mut() else {
-        return Err(internal_error(
-            None,
-            "client disconnected during subscription",
-        ));
-    };
-    let pending = client
+    let pending = delivery
+        .client
+        .as_mut()
+        .ok_or_else(|| internal_error(None, "client disconnected during subscription"))?
         .pending
         .take()
         .ok_or_else(|| internal_error(None, "subscription synchronization state disappeared"))?;
-    let mut frames = Vec::with_capacity(pending.frames.len() + 1);
+    let mut frames = Vec::with_capacity(pending.frames.len() + 2);
     frames.push(result_frame);
     frames.extend(pending.frames);
+    frames.push(server_text(&NativeServerMessage::SyncCompleted {
+        request_id,
+    })?);
+    frames.extend(pending.trailing_frames);
     delivery
         .enqueue_batch(frames)
         .map_err(|capacity| ConnectionFailure::Fatal(queue_error(capacity)))?;
-    if subscription_status == NativeSubscriptionStatus::Subscribed {
+    let client = delivery
+        .client
+        .as_mut()
+        .ok_or_else(|| internal_error(None, "client disconnected during subscription"))?;
+    client
+        .session_cursors
+        .insert(session_id, outcome.through_sequence());
+    if outcome.subscribed() {
+        let _ = client.subscriptions.insert(session_id);
         lock_status(status).subscriptions += 1;
     }
     Ok(())
 }
+
+const SESSION_SYNC_PAGE_EVENTS: usize = 128;
 
 fn process_interaction_response(
     request_id: String,
@@ -818,6 +846,40 @@ fn process_interaction_response(
             request_id,
             session_id,
             interaction_id,
+        },
+    )
+    .map_err(ConnectionFailure::Fatal)
+}
+
+fn process_command(
+    request_id: String,
+    command: agentpulse_core::AgentCommand,
+    actions: &ChannelActionHandle,
+    state: &SharedDeliveryState,
+) -> Result<(), ConnectionFailure> {
+    let session_id = command.session_id();
+    let command_id = command.id().to_string();
+    let subscribed = lock_delivery(state)
+        .client
+        .as_ref()
+        .is_some_and(|client| client.subscriptions.contains(&session_id));
+    if !subscribed {
+        return Err(ConnectionFailure::Recoverable(Box::new(protocol_error(
+            Some(request_id),
+            NativeErrorCode::SessionNotSubscribed,
+            "the current Native connection is not subscribed to the command Session",
+            true,
+        ))));
+    }
+    actions
+        .submit_command(command)
+        .map_err(|error| interaction_response_failure(request_id.clone(), error))?;
+    enqueue_control(
+        state,
+        NativeServerMessage::CommandResult {
+            request_id,
+            session_id,
+            command_id,
         },
     )
     .map_err(ConnectionFailure::Fatal)

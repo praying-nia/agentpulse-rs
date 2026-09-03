@@ -16,7 +16,7 @@ use agentpulse_core::{
 use crate::{
     Bridge, ChannelActionError, ChannelActionSink, ChannelDiscoverySnapshot, ChannelPort,
     EndpointRegistrationError, ProviderEventError, ProviderEventReport, ProviderEventSink,
-    ProviderPort, SubscribeOutcome, SubscriptionError, UnsubscribeOutcome,
+    ProviderPort, SessionSyncOutcome, SubscribeOutcome, SubscriptionError, UnsubscribeOutcome,
     registry::BoxAdapterError,
 };
 
@@ -756,6 +756,20 @@ impl ChannelActionHandle {
         self.with_bridge_access(|bridge| {
             bridge
                 .subscribe(self.channel_id, session_id)
+                .map_err(ChannelActionIngressError::Subscription)
+        })
+    }
+
+    /// Delivers one bounded retained Event page and subscribes when caught up.
+    pub fn sync_session(
+        &self,
+        session_id: SessionId,
+        after_sequence: u64,
+        max_events: usize,
+    ) -> Result<SessionSyncOutcome, ChannelActionIngressError> {
+        self.with_bridge_access(|bridge| {
+            bridge
+                .sync_session(self.channel_id, session_id, after_sequence, max_events)
                 .map_err(ChannelActionIngressError::Subscription)
         })
     }

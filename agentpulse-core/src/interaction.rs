@@ -3,8 +3,8 @@
 use std::collections::HashSet;
 
 use crate::{
-    ApprovalOptionId, ChannelCapabilities, ChannelId, ChoiceOptionId, DomainError, InteractionId,
-    NonEmptyText, ProviderCapabilities, SessionId, Timestamp,
+    ApprovalOptionId, ChannelCapabilities, ChannelId, ChoiceOptionId, DomainError, FormFieldId,
+    InteractionId, NonEmptyText, ProviderCapabilities, SessionId, Timestamp,
 };
 
 /// The user-visible effect of one Provider-issued approval option.
@@ -391,6 +391,190 @@ impl TextInputRequest {
     }
 }
 
+/// One field in an atomic structured user-input form.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FormField {
+    id: FormFieldId,
+    header: NonEmptyText,
+    prompt: NonEmptyText,
+    options: Vec<ChoiceOption>,
+    allows_other: bool,
+    sensitive: bool,
+}
+
+impl FormField {
+    /// Creates a form field. A field without options is free text.
+    pub fn new(
+        id: FormFieldId,
+        header: NonEmptyText,
+        prompt: NonEmptyText,
+        options: Vec<ChoiceOption>,
+        allows_other: bool,
+        sensitive: bool,
+    ) -> Result<Self, DomainError> {
+        let mut identifiers = HashSet::with_capacity(options.len());
+        for option in &options {
+            if !identifiers.insert(option.id()) {
+                return Err(DomainError::DuplicateId {
+                    field: "form field options",
+                    value: option.id().to_string(),
+                });
+            }
+        }
+        if options.is_empty() && !allows_other {
+            return Err(DomainError::InvalidChoiceSelection {
+                reason: "a text form field must allow a custom answer",
+            });
+        }
+        Ok(Self {
+            id,
+            header,
+            prompt,
+            options,
+            allows_other,
+            sensitive,
+        })
+    }
+
+    /// Returns the opaque field identifier.
+    #[must_use]
+    pub const fn id(&self) -> FormFieldId {
+        self.id
+    }
+    /// Borrows the short field heading.
+    #[must_use]
+    pub const fn header(&self) -> &NonEmptyText {
+        &self.header
+    }
+    /// Borrows the full question shown to the user.
+    #[must_use]
+    pub const fn prompt(&self) -> &NonEmptyText {
+        &self.prompt
+    }
+    /// Borrows the Provider-issued choices in display order.
+    #[must_use]
+    pub fn options(&self) -> &[ChoiceOption] {
+        &self.options
+    }
+    /// Returns whether a custom text answer is accepted.
+    #[must_use]
+    pub const fn allows_other(&self) -> bool {
+        self.allows_other
+    }
+    /// Returns whether the answer must be treated as sensitive.
+    #[must_use]
+    pub const fn is_sensitive(&self) -> bool {
+        self.sensitive
+    }
+    fn contains(&self, option_id: ChoiceOptionId) -> bool {
+        self.options.iter().any(|option| option.id() == option_id)
+    }
+}
+
+/// A collection of fields that must be answered in one atomic response.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FormRequest {
+    fields: Vec<FormField>,
+    blocking: bool,
+}
+
+impl FormRequest {
+    /// Creates a non-empty form with uniquely identified fields.
+    pub fn new(fields: Vec<FormField>, blocking: bool) -> Result<Self, DomainError> {
+        if fields.is_empty() {
+            return Err(DomainError::EmptyCollection {
+                field: "form fields",
+            });
+        }
+        let mut identifiers = HashSet::with_capacity(fields.len());
+        for field in &fields {
+            if !identifiers.insert(field.id()) {
+                return Err(DomainError::DuplicateId {
+                    field: "form fields",
+                    value: field.id().to_string(),
+                });
+            }
+        }
+        Ok(Self { fields, blocking })
+    }
+    /// Borrows the fields in display order.
+    #[must_use]
+    pub fn fields(&self) -> &[FormField] {
+        &self.fields
+    }
+    /// Returns whether the Provider is blocked waiting for this form.
+    #[must_use]
+    pub const fn is_blocking(&self) -> bool {
+        self.blocking
+    }
+}
+
+/// The answer supplied for one form field.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FormAnswerValue {
+    /// One opaque Provider-issued option.
+    Choice(ChoiceOptionId),
+    /// A custom or free-text answer.
+    Text(NonEmptyText),
+}
+
+/// One field-correlated answer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FormAnswer {
+    field_id: FormFieldId,
+    value: FormAnswerValue,
+}
+
+impl FormAnswer {
+    /// Creates one field-correlated answer.
+    #[must_use]
+    pub const fn new(field_id: FormFieldId, value: FormAnswerValue) -> Self {
+        Self { field_id, value }
+    }
+    /// Returns the answered field identifier.
+    #[must_use]
+    pub const fn field_id(&self) -> FormFieldId {
+        self.field_id
+    }
+    /// Borrows the selected or custom answer value.
+    #[must_use]
+    pub const fn value(&self) -> &FormAnswerValue {
+        &self.value
+    }
+}
+
+/// A complete atomic form response.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FormResponse {
+    answers: Vec<FormAnswer>,
+}
+
+impl FormResponse {
+    /// Creates a non-empty response with one answer per field identifier.
+    pub fn new(answers: Vec<FormAnswer>) -> Result<Self, DomainError> {
+        if answers.is_empty() {
+            return Err(DomainError::EmptyCollection {
+                field: "form answers",
+            });
+        }
+        let mut identifiers = HashSet::with_capacity(answers.len());
+        for answer in &answers {
+            if !identifiers.insert(answer.field_id()) {
+                return Err(DomainError::DuplicateId {
+                    field: "form answers",
+                    value: answer.field_id().to_string(),
+                });
+            }
+        }
+        Ok(Self { answers })
+    }
+    /// Borrows the answers in submission order.
+    #[must_use]
+    pub fn answers(&self) -> &[FormAnswer] {
+        &self.answers
+    }
+}
+
 /// The semantic payload of an interaction request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -401,6 +585,8 @@ pub enum InteractionRequestPayload {
     Choice(ChoiceRequest),
     /// Requests non-sensitive text.
     Text(TextInputRequest),
+    /// Requests an atomic collection of choice and text answers.
+    Form(FormRequest),
 }
 
 impl InteractionRequestPayload {
@@ -409,7 +595,9 @@ impl InteractionRequestPayload {
     pub const fn required_provider_request_capability(&self) -> ProviderCapabilities {
         match self {
             Self::Approval(_) => ProviderCapabilities::APPROVAL_REQUEST,
-            Self::Choice(_) | Self::Text(_) => ProviderCapabilities::USER_INPUT_REQUEST,
+            Self::Choice(_) | Self::Text(_) | Self::Form(_) => {
+                ProviderCapabilities::USER_INPUT_REQUEST
+            }
         }
     }
 
@@ -418,7 +606,9 @@ impl InteractionRequestPayload {
     pub const fn required_provider_response_capability(&self) -> ProviderCapabilities {
         match self {
             Self::Approval(_) => ProviderCapabilities::APPROVAL_RESPONSE,
-            Self::Choice(_) | Self::Text(_) => ProviderCapabilities::USER_INPUT_RESPONSE,
+            Self::Choice(_) | Self::Text(_) | Self::Form(_) => {
+                ProviderCapabilities::USER_INPUT_RESPONSE
+            }
         }
     }
 
@@ -429,6 +619,7 @@ impl InteractionRequestPayload {
             Self::Approval(_) => ChannelCapabilities::APPROVAL,
             Self::Choice(_) => ChannelCapabilities::CHOICE_INPUT,
             Self::Text(_) => ChannelCapabilities::TEXT_INPUT,
+            Self::Form(_) => ChannelCapabilities::FORM_INPUT,
         }
     }
 
@@ -437,7 +628,7 @@ impl InteractionRequestPayload {
     pub const fn is_actionable(&self) -> bool {
         match self {
             Self::Approval(request) => request.is_actionable(),
-            Self::Choice(_) | Self::Text(_) => true,
+            Self::Choice(_) | Self::Text(_) | Self::Form(_) => true,
         }
     }
 }
@@ -601,6 +792,40 @@ impl InteractionRequest {
                 }
                 Ok(())
             }
+            (
+                InteractionRequestPayload::Form(request),
+                InteractionResponsePayload::Form(response),
+            ) => {
+                if response.answers.len() != request.fields.len() {
+                    return Err(DomainError::InvalidChoiceSelection {
+                        reason: "form responses must answer every field exactly once",
+                    });
+                }
+                for field in &request.fields {
+                    let answer = response
+                        .answers
+                        .iter()
+                        .find(|answer| answer.field_id == field.id)
+                        .ok_or(DomainError::InvalidChoiceSelection {
+                            reason: "form responses must answer every field exactly once",
+                        })?;
+                    match &answer.value {
+                        FormAnswerValue::Choice(option_id) if field.contains(*option_id) => {}
+                        FormAnswerValue::Text(_) if field.allows_other => {}
+                        FormAnswerValue::Choice(_) => {
+                            return Err(DomainError::InvalidChoiceSelection {
+                                reason: "form answer selected an unknown option",
+                            });
+                        }
+                        FormAnswerValue::Text(_) => {
+                            return Err(DomainError::InvalidChoiceSelection {
+                                reason: "form field does not allow a custom answer",
+                            });
+                        }
+                    }
+                }
+                Ok(())
+            }
             _ => Err(DomainError::InteractionTypeMismatch),
         }
     }
@@ -721,6 +946,8 @@ pub enum InteractionResponsePayload {
     Choice(ChoiceSelection),
     /// Answers a text-input request.
     Text(NonEmptyText),
+    /// Answers every field in an atomic form request.
+    Form(FormResponse),
 }
 
 impl InteractionResponsePayload {
@@ -729,7 +956,9 @@ impl InteractionResponsePayload {
     pub const fn required_provider_capability(&self) -> ProviderCapabilities {
         match self {
             Self::Approval(_) => ProviderCapabilities::APPROVAL_RESPONSE,
-            Self::Choice(_) | Self::Text(_) => ProviderCapabilities::USER_INPUT_RESPONSE,
+            Self::Choice(_) | Self::Text(_) | Self::Form(_) => {
+                ProviderCapabilities::USER_INPUT_RESPONSE
+            }
         }
     }
 
@@ -740,6 +969,7 @@ impl InteractionResponsePayload {
             Self::Approval(_) => ChannelCapabilities::APPROVAL,
             Self::Choice(_) => ChannelCapabilities::CHOICE_INPUT,
             Self::Text(_) => ChannelCapabilities::TEXT_INPUT,
+            Self::Form(_) => ChannelCapabilities::FORM_INPUT,
         }
     }
 }

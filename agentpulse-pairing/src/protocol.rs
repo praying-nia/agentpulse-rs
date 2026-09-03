@@ -604,7 +604,7 @@ mod tests {
             native_address: "192.168.50.4".to_owned(),
             native_port: 49_320,
             access_token: "device-secret".to_owned(),
-            native_transport_version: 1,
+            native_transport_version: 2,
             domain_protocol_versions: vec![1],
         };
         let encoded = encode_server_message(&success)?;

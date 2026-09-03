@@ -3,13 +3,14 @@
 use std::error::Error;
 
 use agentpulse_core::{
-    AgentEvent, AgentEventPayload, AgentSession, AgentState, ApplyOutcome, ApprovalOptionId,
-    ApprovalSelection, ChannelId, ConnectionState, DeterminateProgress, DomainError, EventId,
-    EventSequence, InteractionId, InteractionRequest, InteractionRequestPayload,
-    InteractionResponse, InteractionResponsePayload, NonEmptyText, PlanItem, PlanItemId,
-    PlanItemStatus, PlanSnapshot, ProgressSnapshot, ProgressValue, ProviderId, ReduceError,
-    Revision, SessionAggregate, SessionAggregateConfig, SessionId, SessionOutcome, SnapshotKind,
-    TextInputRequest, Timestamp, ToolActivity, ToolCallId, ToolOutcome,
+    AgentEvent, AgentEventPayload, AgentMessage, AgentMessageLevel, AgentSession, AgentState,
+    ApplyOutcome, ApprovalOptionId, ApprovalSelection, ChannelId, ConnectionState,
+    DeterminateProgress, DomainError, EventId, EventSequence, InteractionId, InteractionRequest,
+    InteractionRequestPayload, InteractionResponse, InteractionResponsePayload, NonEmptyText,
+    PlanItem, PlanItemId, PlanItemStatus, PlanSnapshot, ProgressSnapshot, ProgressValue,
+    ProviderId, ReduceError, Revision, SessionAggregate, SessionAggregateConfig, SessionId,
+    SessionOutcome, SnapshotKind, TextInputRequest, Timestamp, ToolActivity, ToolCallId,
+    ToolOutcome,
 };
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -632,6 +633,34 @@ fn recent_event_retention_is_bounded_and_optional() -> TestResult {
     assert_eq!(disabled.recent_events().len(), 0);
     assert_eq!(disabled.last_sequence().get(), 2);
     assert_eq!(disabled.session().state(), AgentState::Running);
+
+    let session_id = SessionId::new();
+    let mut complete = SessionAggregate::from_initial_event_with_config(
+        initial_event(session_id, 100)?,
+        SessionAggregateConfig::retain_all(),
+    )?;
+    for sequence_value in 2..=300 {
+        complete.apply(event(
+            session_id,
+            sequence_value,
+            100 + i128::from(sequence_value),
+            AgentEventPayload::Message(AgentMessage::new(
+                AgentMessageLevel::Info,
+                text("retained")?,
+            )),
+        )?)?;
+    }
+    assert!(complete.config().retains_all_events());
+    assert_eq!(complete.recent_events().len(), 300);
+    assert_eq!(
+        complete
+            .retained_events_after(256)
+            .ok_or("complete history disappeared")?
+            .first()
+            .map(|event| event.sequence().get()),
+        Some(257),
+    );
+    assert!(complete.retained_events_after(301).is_none());
     Ok(())
 }
 

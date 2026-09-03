@@ -40,23 +40,23 @@ pub use aggregate::{
     SnapshotKind,
 };
 pub use capability::{ChannelCapabilities, ProviderCapabilities};
-pub use command::{AgentCommand, AgentCommandPayload};
+pub use command::{AgentCommand, AgentCommandPayload, PromptDelivery, QueueAction};
 pub use endpoint::{ChannelDescriptor, ProviderDescriptor};
 pub use error::DomainError;
 pub use event::{
-    AgentEvent, AgentEventPayload, AgentMessage, AgentMessageLevel, SessionOutcome, ToolActivity,
-    ToolOutcome,
+    AgentEvent, AgentEventPayload, AgentMessage, AgentMessageLevel, AgentMessageRole,
+    SessionOutcome, ToolActivity, ToolOutcome,
 };
 pub use id::{
-    ApprovalOptionId, ChannelId, ChoiceOptionId, CommandId, EventId, InteractionId, PlanItemId,
-    ProviderId, SessionId, ToolCallId,
+    ApprovalOptionId, ChannelId, ChoiceOptionId, CommandId, EventId, FormFieldId, InteractionId,
+    PlanItemId, ProviderId, SessionId, ToolCallId,
 };
 pub use interaction::{
     ApprovalCommandKind, ApprovalDisposition, ApprovalFileChange, ApprovalFileChangeKind,
     ApprovalNetworkContext, ApprovalOption, ApprovalRequest, ApprovalSelection, ApprovalSubject,
-    ChoiceOption, ChoiceRequest, ChoiceSelection, InteractionCloseReason, InteractionClosed,
-    InteractionRequest, InteractionRequestPayload, InteractionResponse, InteractionResponsePayload,
-    TextInputRequest,
+    ChoiceOption, ChoiceRequest, ChoiceSelection, FormAnswer, FormAnswerValue, FormField,
+    FormRequest, FormResponse, InteractionCloseReason, InteractionClosed, InteractionRequest,
+    InteractionRequestPayload, InteractionResponse, InteractionResponsePayload, TextInputRequest,
 };
 pub use plan::{PlanItem, PlanItemStatus, PlanSnapshot};
 pub use progress::{DeterminateProgress, ProgressSnapshot, ProgressValue};

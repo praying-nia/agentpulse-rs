@@ -1,6 +1,6 @@
 //! Shared bounded delivery state between the Native Port and Source worker.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use agentpulse_core::SessionId;
 
@@ -10,12 +10,15 @@ pub(crate) struct PendingSubscription {
     pub(crate) request_id: String,
     pub(crate) session_id: SessionId,
     pub(crate) frames: VecDeque<String>,
+    pub(crate) trailing_frames: VecDeque<String>,
+    pub(crate) sync_delivered: bool,
 }
 
 pub(crate) struct ActiveClient {
     pub(crate) discovered: BTreeSet<SessionId>,
     pub(crate) subscriptions: BTreeSet<SessionId>,
     pub(crate) pending: Option<PendingSubscription>,
+    pub(crate) session_cursors: BTreeMap<SessionId, u64>,
 }
 
 pub(crate) struct DeliveryState {
@@ -43,7 +46,9 @@ impl DeliveryState {
                 .client
                 .as_ref()
                 .and_then(|client| client.pending.as_ref())
-                .map_or(0, |pending| pending.frames.len())
+                .map_or(0, |pending| {
+                    pending.frames.len() + pending.trailing_frames.len()
+                })
     }
 
     pub(crate) fn enqueue(&mut self, frame: String) -> Result<(), usize> {

@@ -11,6 +11,7 @@ use agentpulse_transport::{
     TlsWebSocketConfig,
 };
 use std::sync::Arc;
+use uuid::Uuid;
 
 use crate::{NATIVE_WEBSOCKET_PATH, NATIVE_WEBSOCKET_SUBPROTOCOL, NativeChannelBuildError};
 
@@ -40,6 +41,7 @@ pub struct NativeChannelConfig {
     pub(crate) shutdown_timeout: Duration,
     pub(crate) max_frame_bytes: usize,
     pub(crate) outbound_capacity: usize,
+    pub(crate) host_run_id: String,
 }
 
 impl NativeChannelConfig {
@@ -57,6 +59,7 @@ impl NativeChannelConfig {
             shutdown_timeout: Duration::from_secs(5),
             max_frame_bytes: DEFAULT_MAX_MESSAGE_BYTES,
             outbound_capacity: DEFAULT_OUTBOUND_CAPACITY,
+            host_run_id: Uuid::now_v7().to_string(),
         }
     }
 

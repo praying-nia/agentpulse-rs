@@ -3,7 +3,7 @@
 use agentpulse_core::DomainError;
 use thiserror::Error;
 
-/// An error produced while converting between JSON v1 and the domain model.
+/// An error produced while converting between JSON v2 and the domain model.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ProtocolError {
@@ -15,7 +15,7 @@ pub enum ProtocolError {
         source: serde_json::Error,
     },
 
-    /// Input was not valid JSON v1 structure.
+    /// Input was not valid JSON v2 structure.
     #[error("failed to decode protocol JSON: {source}")]
     JsonDecode {
         /// The underlying JSON deserialization error.
@@ -32,7 +32,7 @@ pub enum ProtocolError {
         supported: u16,
     },
 
-    /// A scalar or collection violated the JSON v1 wire contract.
+    /// A scalar or collection violated the JSON v2 wire contract.
     #[error("invalid protocol field {field}: {reason}")]
     InvalidWireValue {
         /// The stable semantic field name.
@@ -49,8 +49,8 @@ pub enum ProtocolError {
         source: DomainError,
     },
 
-    /// A future non-exhaustive Core variant has no JSON v1 representation.
-    #[error("{type_name} contains a variant unsupported by protocol v1")]
+    /// A future non-exhaustive Core variant has no JSON v2 representation.
+    #[error("{type_name} contains a variant unsupported by protocol v2")]
     UnsupportedDomainVariant {
         /// The Core enum that cannot be represented.
         type_name: &'static str,

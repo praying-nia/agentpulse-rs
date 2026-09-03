@@ -1,4 +1,4 @@
-//! Canonical Native Transport v1 fixture compatibility.
+//! Canonical Native Transport v3 fixture compatibility.
 
 use std::{error::Error, fs, path::Path};
 
@@ -9,31 +9,34 @@ use serde_json::Value;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
-const CLIENT_FIXTURES: [&str; 5] = [
+const CLIENT_FIXTURES: [&str; 6] = [
     "client_hello.json",
     "discover_sessions.json",
     "subscribe_session.json",
     "unsubscribe_session.json",
     "submit_interaction_response.json",
+    "submit_command.json",
 ];
 
-const SERVER_FIXTURES: [&str; 9] = [
+const SERVER_FIXTURES: [&str; 11] = [
     "server_hello.json",
     "sync_started.json",
     "discovery_session.json",
     "sync_completed.json",
     "subscription_result.json",
     "subscription_interaction.json",
+    "subscription_form.json",
     "interaction_response_result.json",
+    "command_result.json",
     "unsubscription_result.json",
     "error.json",
 ];
 
 #[test]
-fn native_v1_fixtures_decode_and_reencode_without_semantic_drift() -> TestResult {
-    let local = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native-v1");
+fn native_v3_fixtures_decode_and_reencode_without_semantic_drift() -> TestResult {
+    let local = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native-v3");
     let canonical = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../agentpulse-protocol/fixtures/native-v1");
+        .join("../../../agentpulse-protocol/fixtures/native-v3");
 
     for name in CLIENT_FIXTURES {
         let bytes = fs::read(local.join(name))?;

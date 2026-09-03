@@ -2,7 +2,7 @@
 
 use std::sync::MutexGuard;
 
-use agentpulse_bridge::{ChannelPort, ChannelSessionBaseline};
+use agentpulse_bridge::{ChannelPort, ChannelSessionBaseline, ChannelSessionSync};
 use agentpulse_core::{AgentEvent, AgentSession, ChannelDescriptor, ChannelEventRoute, SessionId};
 use agentpulse_protocol::ProtocolMessage;
 
@@ -79,7 +79,11 @@ impl NativeChannelPort {
                 ));
                 return Err(NativeChannelPortError::QueueFull { capacity });
             }
-            pending.frames.push_back(frame);
+            if pending.sync_delivered {
+                pending.trailing_frames.push_back(frame);
+            } else {
+                pending.frames.push_back(frame);
+            }
         } else {
             state
                 .enqueue(frame)
@@ -170,8 +174,79 @@ impl ChannelPort for NativeChannelPort {
             .filter(|pending| pending.session_id == session_id && pending.request_id == request_id)
             .ok_or(NativeChannelPortError::NoActiveClient)?;
         pending.frames.extend(frames);
+        pending.sync_delivered = true;
         lock_status(&state.status).domain_frames +=
             1 + baseline.pending_interactions().len() as u64;
+        Ok(())
+    }
+
+    fn deliver_session_sync(&mut self, sync: ChannelSessionSync) -> Result<(), Self::Error> {
+        let (session_id, request_id) = {
+            let state = lock_delivery(&self.state);
+            let pending = state
+                .client
+                .as_ref()
+                .and_then(|client| client.pending.as_ref())
+                .ok_or(NativeChannelPortError::NoActiveClient)?;
+            (pending.session_id, pending.request_id.clone())
+        };
+        let mut frames = Vec::new();
+        for routed in sync.events() {
+            if routed.event().session_id() != session_id {
+                return Err(NativeChannelPortError::SessionNotSubscribed { session_id });
+            }
+            frames.push(encoded_text(&NativeServerMessage::Domain {
+                context: NativeDeliveryContext::LiveEvent {
+                    route: NativeEventRoute::from_core(routed.route())
+                        .map_err(|_| NativeChannelPortError::UnsupportedEventRoute)?,
+                },
+                message: Box::new(ProtocolMessage::AgentEvent(routed.event().clone())),
+            })?);
+        }
+        if let Some(baseline) = sync.baseline() {
+            frames.push(encoded_text(&NativeServerMessage::Domain {
+                context: NativeDeliveryContext::SubscriptionSession {
+                    request_id: request_id.clone(),
+                },
+                message: Box::new(ProtocolMessage::AgentSession(baseline.session().clone())),
+            })?);
+            for interaction in baseline.pending_interactions() {
+                frames.push(encoded_text(&NativeServerMessage::Domain {
+                    context: NativeDeliveryContext::SubscriptionInteraction {
+                        request_id: request_id.clone(),
+                        route: NativeEventRoute::from_core(ChannelEventRoute::Interaction(
+                            interaction.route(),
+                        ))
+                        .map_err(|_| NativeChannelPortError::UnsupportedEventRoute)?,
+                    },
+                    message: Box::new(ProtocolMessage::InteractionRequest(
+                        interaction.request().clone(),
+                    )),
+                })?);
+            }
+        }
+        let mut state = lock_delivery(&self.state);
+        let queued_len = state.queued_len();
+        let capacity = state.capacity;
+        if queued_len.saturating_add(frames.len()) > capacity {
+            state.abort_reason = Some(format!(
+                "Native client output queue reached its {}-frame limit",
+                capacity
+            ));
+            return Err(NativeChannelPortError::QueueFull { capacity });
+        }
+        let pending = state
+            .client
+            .as_mut()
+            .and_then(|client| client.pending.as_mut())
+            .filter(|pending| pending.session_id == session_id && pending.request_id == request_id)
+            .ok_or(NativeChannelPortError::NoActiveClient)?;
+        pending.frames.extend(frames);
+        pending.sync_delivered = true;
+        lock_status(&state.status).domain_frames += sync.events().len() as u64
+            + sync.baseline().map_or(0, |baseline| {
+                1 + baseline.pending_interactions().len() as u64
+            });
         Ok(())
     }
 }

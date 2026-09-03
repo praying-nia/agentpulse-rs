@@ -20,7 +20,7 @@ use agentpulse_core::{
     AgentState, ChannelId, EventId, EventSequence, InteractionResponse, NonEmptyText,
     ProviderCapabilities, ProviderDescriptor, ProviderId, ProviderKind, SessionId, Timestamp,
 };
-use agentpulse_protocol::{ProtocolMessage, V1_PROTOCOL_VERSION};
+use agentpulse_protocol::{ProtocolMessage, V2_PROTOCOL_VERSION};
 use tungstenite::{ClientRequestBuilder, Message, WebSocket, client, http::Uri};
 use uuid::Uuid;
 
@@ -161,24 +161,26 @@ fn read_server(socket: &mut WebSocket<TcpStream>) -> Result<NativeServerMessage,
     }
 }
 
-fn hello(socket: &mut WebSocket<TcpStream>, client_id: String) -> TestResult {
+fn hello(socket: &mut WebSocket<TcpStream>, client_id: String) -> Result<String, Box<dyn Error>> {
     send_client(
         socket,
         &NativeClientMessage::Hello {
             client_id,
             display_name: "Independent Fake Native Client".to_owned(),
             version: Some("1.0.0-test".to_owned()),
-            supported_protocol_versions: vec![V1_PROTOCOL_VERSION],
+            supported_protocol_versions: vec![V2_PROTOCOL_VERSION],
+            host_run_id: None,
+            session_cursors: Default::default(),
         },
     )?;
-    assert!(matches!(
-        read_server(socket)?,
+    match read_server(socket)? {
         NativeServerMessage::Hello {
-            protocol_version: V1_PROTOCOL_VERSION,
+            protocol_version: V2_PROTOCOL_VERSION,
+            host_run_id,
             ..
-        }
-    ));
-    Ok(())
+        } => Ok(host_run_id),
+        _ => Err("server did not complete the Native hello".into()),
+    }
 }
 
 fn discover_and_subscribe(
@@ -186,6 +188,7 @@ fn discover_and_subscribe(
     provider_id: ProviderId,
     session_id: SessionId,
     expected_cursor: EventSequence,
+    expected_event_count: usize,
 ) -> TestResult {
     let discovery_id = Uuid::now_v7().to_string();
     send_client(
@@ -237,9 +240,27 @@ fn discover_and_subscribe(
             ref request_id,
             status: NativeSubscriptionStatus::Subscribed,
             baseline_sequence,
+            event_count,
+            reset,
             ..
-        } if request_id == &subscription_id && baseline_sequence == expected_cursor
+        } if request_id == &subscription_id
+            && baseline_sequence == expected_cursor
+            && event_count == expected_event_count
+            && !reset
     ));
+    let first_sequence = expected_cursor
+        .get()
+        .saturating_sub(expected_event_count as u64)
+        .saturating_add(1);
+    for sequence in first_sequence..=expected_cursor.get() {
+        assert!(matches!(
+            read_server(socket)?,
+            NativeServerMessage::Domain {
+                context: NativeDeliveryContext::LiveEvent { .. },
+                message,
+            } if matches!(message.as_ref(), ProtocolMessage::AgentEvent(event) if event.sequence().get() == sequence)
+        ));
+    }
     assert!(matches!(
         read_server(socket)?,
         NativeServerMessage::Domain {
@@ -247,6 +268,11 @@ fn discover_and_subscribe(
             message,
         } if request_id == &subscription_id
             && matches!(message.as_ref(), ProtocolMessage::AgentSession(session) if session.id() == session_id)
+    ));
+    assert!(matches!(
+        read_server(socket)?,
+        NativeServerMessage::SyncCompleted { ref request_id }
+            if request_id == &subscription_id
     ));
     Ok(())
 }
@@ -292,8 +318,14 @@ fn independent_client_discovers_subscribes_streams_and_reconnects() -> TestResul
         .ok_or("Native listener did not expose its address")?;
 
     let mut client = connect_client(address)?;
-    hello(&mut client, Uuid::now_v7().to_string())?;
-    discover_and_subscribe(&mut client, provider_id, session_id, EventSequence::FIRST)?;
+    let host_run_id = hello(&mut client, Uuid::now_v7().to_string())?;
+    discover_and_subscribe(
+        &mut client,
+        provider_id,
+        session_id,
+        EventSequence::FIRST,
+        1,
+    )?;
 
     let refresh_id = Uuid::now_v7().to_string();
     send_client(
@@ -375,13 +407,42 @@ fn independent_client_discovers_subscribes_streams_and_reconnects() -> TestResul
     }
     assert!(!host.inspect_bridge(|bridge| bridge.is_subscribed(channel_id, session_id))?);
 
+    let _ = provider_events.publish_event(event(
+        session_id,
+        4,
+        AgentEventPayload::Message(AgentMessage::new(
+            AgentMessageLevel::Info,
+            NonEmptyText::new("missed while disconnected")?,
+        )),
+    )?)?;
+
     let mut reconnected = connect_client(address)?;
-    hello(&mut reconnected, Uuid::now_v7().to_string())?;
+    let mut cursors = std::collections::BTreeMap::new();
+    let _ = cursors.insert(session_id, 3);
+    send_client(
+        &mut reconnected,
+        &NativeClientMessage::Hello {
+            client_id: Uuid::now_v7().to_string(),
+            display_name: "Resuming Native Client".to_owned(),
+            version: Some("1.0.0-test".to_owned()),
+            supported_protocol_versions: vec![V2_PROTOCOL_VERSION],
+            host_run_id: Some(host_run_id),
+            session_cursors: cursors,
+        },
+    )?;
+    assert!(matches!(
+        read_server(&mut reconnected)?,
+        NativeServerMessage::Hello {
+            resume_accepted: true,
+            ..
+        }
+    ));
     discover_and_subscribe(
         &mut reconnected,
         provider_id,
         session_id,
-        EventSequence::new(3)?,
+        EventSequence::new(4)?,
+        1,
     )?;
     reconnected.close(None)?;
     let _ = host.stop()?;
@@ -408,7 +469,7 @@ fn listener_rejects_wrong_path_busy_client_and_incompatible_hello() -> TestResul
     wait_until_listening(&channel_handle)?;
 
     let mut primary = connect_client(address)?;
-    hello(&mut primary, Uuid::now_v7().to_string())?;
+    let _ = hello(&mut primary, Uuid::now_v7().to_string())?;
     let mut competing = connect_client(address)?;
     assert!(matches!(
         read_server(&mut competing)?,
@@ -428,7 +489,9 @@ fn listener_rejects_wrong_path_busy_client_and_incompatible_hello() -> TestResul
             client_id: Uuid::now_v7().to_string(),
             display_name: "Incompatible Native Client".to_owned(),
             version: None,
-            supported_protocol_versions: vec![V1_PROTOCOL_VERSION + 1],
+            supported_protocol_versions: vec![V2_PROTOCOL_VERSION + 1],
+            host_run_id: None,
+            session_cursors: Default::default(),
         },
     )?;
     assert!(matches!(

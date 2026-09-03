@@ -18,7 +18,7 @@ use agentpulse_channel_native::{
 };
 use agentpulse_core::ChannelId;
 use agentpulse_pairing::{FileCredentialAuthorizer, HostCredentialStore};
-use agentpulse_protocol::V1_PROTOCOL_VERSION;
+use agentpulse_protocol::V2_PROTOCOL_VERSION;
 use rustls::{
     ClientConfig, ClientConnection, RootCertStore, StreamOwned,
     pki_types::{CertificateDer, ServerName},
@@ -103,7 +103,9 @@ fn send_hello(socket: &mut TlsClient, client_id: &str) -> TestResult {
         client_id: client_id.to_owned(),
         display_name: "Authenticated Test Client".to_owned(),
         version: Some("0.1.0-test".to_owned()),
-        supported_protocol_versions: vec![V1_PROTOCOL_VERSION],
+        supported_protocol_versions: vec![V2_PROTOCOL_VERSION],
+        host_run_id: None,
+        session_cursors: Default::default(),
     })?;
     socket.send(Message::text(String::from_utf8(bytes)?))?;
     Ok(())

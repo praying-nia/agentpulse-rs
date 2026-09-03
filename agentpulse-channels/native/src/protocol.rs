@@ -1,12 +1,12 @@
-//! Strict Native Transport v1 control and domain-delivery codec.
+//! Strict Native Transport v3 control and incremental domain-delivery codec.
 
-use std::str::FromStr;
+use std::{collections::BTreeMap, str::FromStr};
 
 use agentpulse_core::{
-    ChannelCapabilities, ChannelDescriptor, ChannelEventRoute, EventSequence, InteractionResponse,
-    InteractionRoute, SessionId,
+    AgentCommand, ChannelCapabilities, ChannelDescriptor, ChannelEventRoute, EventSequence,
+    InteractionResponse, InteractionRoute, SessionId,
 };
-use agentpulse_protocol::{ProtocolMessage, V1_PROTOCOL_VERSION, decode_json, encode_json};
+use agentpulse_protocol::{ProtocolMessage, V2_PROTOCOL_VERSION, decode_json, encode_json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -27,6 +27,10 @@ pub enum NativeClientMessage {
         version: Option<String>,
         /// Unique domain protocol versions understood by the client.
         supported_protocol_versions: Vec<u16>,
+        /// Host run observed by the cached client state, when any.
+        host_run_id: Option<String>,
+        /// Last contiguous Event cursor retained for each Session.
+        session_cursors: BTreeMap<SessionId, u64>,
     },
     /// Requests a stable Provider and Session discovery snapshot.
     Discover {
@@ -54,9 +58,16 @@ pub enum NativeClientMessage {
         /// Strict AgentPulse domain response.
         response: InteractionResponse,
     },
+    /// Submits one typed command to an actively subscribed Session.
+    SubmitCommand {
+        /// UUIDv7 transport request correlation identity.
+        request_id: String,
+        /// Strict AgentPulse domain command.
+        command: AgentCommand,
+    },
 }
 
-/// Context attached to one nested AgentPulse JSON v1 domain envelope.
+/// Context attached to one nested AgentPulse JSON v2 domain envelope.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum NativeDeliveryContext {
@@ -127,6 +138,8 @@ impl NativeEventRoute {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum NativeSubscriptionStatus {
+    /// A bounded historical page was delivered; another request is required.
+    CatchingUp,
     /// A new subscription and baseline were established.
     Subscribed,
     /// This connection already owned the subscription.
@@ -187,6 +200,10 @@ pub enum NativeServerMessage {
         ping_interval_seconds: u64,
         /// Connection idle timeout in whole seconds.
         idle_timeout_seconds: u64,
+        /// UUIDv7 identity for this in-memory Host run.
+        host_run_id: String,
+        /// Whether the server accepted the client-provided cursors.
+        resume_accepted: bool,
     },
     /// Begins one stable discovery batch.
     SyncStarted {
@@ -197,7 +214,7 @@ pub enum NativeServerMessage {
         /// Number of Session frames in the batch.
         session_count: usize,
     },
-    /// Carries one unchanged AgentPulse JSON v1 domain envelope.
+    /// Carries one unchanged AgentPulse JSON v2 domain envelope.
     Domain {
         /// Native delivery metadata outside the domain protocol.
         context: NativeDeliveryContext,
@@ -221,6 +238,10 @@ pub enum NativeServerMessage {
         baseline_sequence: EventSequence,
         /// Number of pending interaction frames in this baseline.
         pending_interaction_count: usize,
+        /// Number of historical Event frames in this synchronization page.
+        event_count: usize,
+        /// Whether prior client state for this Session must be discarded.
+        reset: bool,
     },
     /// Reports an idempotent unsubscription result.
     UnsubscriptionResult {
@@ -240,6 +261,15 @@ pub enum NativeServerMessage {
         /// Correlated AgentPulse interaction identifier.
         interaction_id: String,
     },
+    /// Confirms that a command was accepted by the Provider queue.
+    CommandResult {
+        /// Matching transport request.
+        request_id: String,
+        /// Target Session.
+        session_id: SessionId,
+        /// Correlated AgentPulse command identifier.
+        command_id: String,
+    },
     /// Reports a connection-level or request-level failure.
     Error {
         /// Matching request when the failure was request-scoped.
@@ -253,7 +283,7 @@ pub enum NativeServerMessage {
     },
 }
 
-/// Encodes one validated client control message as strict Native Transport v1 JSON.
+/// Encodes one validated client control message as strict Native Transport v3 JSON.
 pub fn encode_client_message(
     message: &NativeClientMessage,
 ) -> Result<Vec<u8>, NativeProtocolError> {
@@ -261,7 +291,7 @@ pub fn encode_client_message(
     encode_envelope(ClientMessageDto::from_semantic(message)?)
 }
 
-/// Decodes and validates one strict Native Transport v1 client control frame.
+/// Decodes and validates one strict Native Transport v3 client control frame.
 pub fn decode_client_message(input: &[u8]) -> Result<NativeClientMessage, NativeProtocolError> {
     let dto: Envelope<ClientMessageDto> = decode_envelope(input)?;
     let message = dto.message.into_semantic()?;
@@ -277,7 +307,7 @@ pub fn encode_server_message(
     encode_envelope(ServerMessageDto::from_semantic(message)?)
 }
 
-/// Decodes and validates one strict Native Transport v1 server frame.
+/// Decodes and validates one strict Native Transport v3 server frame.
 pub fn decode_server_message(input: &[u8]) -> Result<NativeServerMessage, NativeProtocolError> {
     let dto: Envelope<ServerMessageDto> = decode_envelope(input)?;
     let message = dto.message.into_semantic()?;
@@ -293,6 +323,13 @@ struct Envelope<T> {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionCursorDto {
+    session_id: String,
+    last_sequence: String,
+}
+
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ClientMessageDto {
     ClientHello {
@@ -301,6 +338,10 @@ enum ClientMessageDto {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         version: Option<String>,
         supported_protocol_versions: Vec<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_run_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        session_cursors: Vec<SessionCursorDto>,
     },
     DiscoverSessions {
         request_id: String,
@@ -317,6 +358,10 @@ enum ClientMessageDto {
         request_id: String,
         response: Value,
     },
+    SubmitCommand {
+        request_id: String,
+        command: Value,
+    },
 }
 
 impl ClientMessageDto {
@@ -327,11 +372,21 @@ impl ClientMessageDto {
                 display_name,
                 version,
                 supported_protocol_versions,
+                host_run_id,
+                session_cursors,
             } => Self::ClientHello {
                 client_id: client_id.clone(),
                 display_name: display_name.clone(),
                 version: version.clone(),
                 supported_protocol_versions: supported_protocol_versions.clone(),
+                host_run_id: host_run_id.clone(),
+                session_cursors: session_cursors
+                    .iter()
+                    .map(|(session_id, last_sequence)| SessionCursorDto {
+                        session_id: session_id.to_string(),
+                        last_sequence: last_sequence.to_string(),
+                    })
+                    .collect(),
             },
             NativeClientMessage::Discover { request_id } => Self::DiscoverSessions {
                 request_id: request_id.clone(),
@@ -359,6 +414,13 @@ impl ClientMessageDto {
                     response.clone(),
                 ))?,
             },
+            NativeClientMessage::SubmitCommand {
+                request_id,
+                command,
+            } => Self::SubmitCommand {
+                request_id: request_id.clone(),
+                command: encode_domain_value(&ProtocolMessage::AgentCommand(command.clone()))?,
+            },
         })
     }
 
@@ -369,11 +431,15 @@ impl ClientMessageDto {
                 display_name,
                 version,
                 supported_protocol_versions,
+                host_run_id,
+                session_cursors,
             } => Ok(NativeClientMessage::Hello {
                 client_id,
                 display_name,
                 version,
                 supported_protocol_versions,
+                host_run_id,
+                session_cursors: parse_session_cursors(session_cursors)?,
             }),
             Self::DiscoverSessions { request_id } => {
                 Ok(NativeClientMessage::Discover { request_id })
@@ -408,6 +474,21 @@ impl ClientMessageDto {
                     response,
                 })
             }
+            Self::SubmitCommand {
+                request_id,
+                command,
+            } => {
+                let ProtocolMessage::AgentCommand(command) = decode_domain_value(command)? else {
+                    return Err(NativeProtocolError::InvalidDomainContext {
+                        context: "submit_command",
+                        actual: "non-agent_command",
+                    });
+                };
+                Ok(NativeClientMessage::SubmitCommand {
+                    request_id,
+                    command,
+                })
+            }
         }
     }
 }
@@ -422,6 +503,8 @@ enum ServerMessageDto {
         max_frame_bytes: usize,
         ping_interval_seconds: u64,
         idle_timeout_seconds: u64,
+        host_run_id: String,
+        resume_accepted: bool,
     },
     SyncStarted {
         request_id: String,
@@ -441,6 +524,8 @@ enum ServerMessageDto {
         status: SubscriptionStatusDto,
         baseline_sequence: String,
         pending_interaction_count: usize,
+        event_count: usize,
+        reset: bool,
     },
     UnsubscriptionResult {
         request_id: String,
@@ -451,6 +536,11 @@ enum ServerMessageDto {
         request_id: String,
         session_id: String,
         interaction_id: String,
+    },
+    CommandResult {
+        request_id: String,
+        session_id: String,
+        command_id: String,
     },
     Error {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -471,6 +561,8 @@ impl ServerMessageDto {
                 max_frame_bytes,
                 ping_interval_seconds,
                 idle_timeout_seconds,
+                host_run_id,
+                resume_accepted,
             } => Self::ServerHello {
                 connection_id: connection_id.clone(),
                 channel: encode_domain_value(&ProtocolMessage::ChannelDescriptor(channel.clone()))?,
@@ -478,6 +570,8 @@ impl ServerMessageDto {
                 max_frame_bytes: *max_frame_bytes,
                 ping_interval_seconds: *ping_interval_seconds,
                 idle_timeout_seconds: *idle_timeout_seconds,
+                host_run_id: host_run_id.clone(),
+                resume_accepted: *resume_accepted,
             },
             NativeServerMessage::SyncStarted {
                 request_id,
@@ -501,12 +595,16 @@ impl ServerMessageDto {
                 status,
                 baseline_sequence,
                 pending_interaction_count,
+                event_count,
+                reset,
             } => Self::SubscriptionResult {
                 request_id: request_id.clone(),
                 session_id: session_id.to_string(),
                 status: (*status).into(),
                 baseline_sequence: baseline_sequence.get().to_string(),
                 pending_interaction_count: *pending_interaction_count,
+                event_count: *event_count,
+                reset: *reset,
             },
             NativeServerMessage::UnsubscriptionResult {
                 request_id,
@@ -525,6 +623,15 @@ impl ServerMessageDto {
                 request_id: request_id.clone(),
                 session_id: session_id.to_string(),
                 interaction_id: interaction_id.clone(),
+            },
+            NativeServerMessage::CommandResult {
+                request_id,
+                session_id,
+                command_id,
+            } => Self::CommandResult {
+                request_id: request_id.clone(),
+                session_id: session_id.to_string(),
+                command_id: command_id.clone(),
             },
             NativeServerMessage::Error {
                 request_id,
@@ -549,6 +656,8 @@ impl ServerMessageDto {
                 max_frame_bytes,
                 ping_interval_seconds,
                 idle_timeout_seconds,
+                host_run_id,
+                resume_accepted,
             } => {
                 let ProtocolMessage::ChannelDescriptor(channel) = decode_domain_value(channel)?
                 else {
@@ -564,6 +673,8 @@ impl ServerMessageDto {
                     max_frame_bytes,
                     ping_interval_seconds,
                     idle_timeout_seconds,
+                    host_run_id,
+                    resume_accepted,
                 })
             }
             Self::SyncStarted {
@@ -588,12 +699,16 @@ impl ServerMessageDto {
                 status,
                 baseline_sequence,
                 pending_interaction_count,
+                event_count,
+                reset,
             } => Ok(NativeServerMessage::SubscriptionResult {
                 request_id,
                 session_id: parse_session_id(session_id)?,
                 status: status.into(),
                 baseline_sequence: parse_sequence(baseline_sequence)?,
                 pending_interaction_count,
+                event_count,
+                reset,
             }),
             Self::UnsubscriptionResult {
                 request_id,
@@ -612,6 +727,15 @@ impl ServerMessageDto {
                 request_id,
                 session_id: parse_session_id(session_id)?,
                 interaction_id,
+            }),
+            Self::CommandResult {
+                request_id,
+                session_id,
+                command_id,
+            } => Ok(NativeServerMessage::CommandResult {
+                request_id,
+                session_id: parse_session_id(session_id)?,
+                command_id,
             }),
             Self::Error {
                 request_id,
@@ -742,6 +866,7 @@ impl From<EventRouteDto> for NativeEventRoute {
 #[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum SubscriptionStatusDto {
+    CatchingUp,
     Subscribed,
     AlreadySubscribed,
 }
@@ -749,6 +874,7 @@ enum SubscriptionStatusDto {
 impl From<NativeSubscriptionStatus> for SubscriptionStatusDto {
     fn from(value: NativeSubscriptionStatus) -> Self {
         match value {
+            NativeSubscriptionStatus::CatchingUp => Self::CatchingUp,
             NativeSubscriptionStatus::Subscribed => Self::Subscribed,
             NativeSubscriptionStatus::AlreadySubscribed => Self::AlreadySubscribed,
         }
@@ -758,6 +884,7 @@ impl From<NativeSubscriptionStatus> for SubscriptionStatusDto {
 impl From<SubscriptionStatusDto> for NativeSubscriptionStatus {
     fn from(value: SubscriptionStatusDto) -> Self {
         match value {
+            SubscriptionStatusDto::CatchingUp => Self::CatchingUp,
             SubscriptionStatusDto::Subscribed => Self::Subscribed,
             SubscriptionStatusDto::AlreadySubscribed => Self::AlreadySubscribed,
         }
@@ -875,11 +1002,25 @@ fn validate_client_message(message: &NativeClientMessage) -> Result<(), NativePr
             display_name,
             version,
             supported_protocol_versions,
+            host_run_id,
+            session_cursors,
         } => {
             validate_uuid_v7("client_id", client_id)?;
             validate_nonblank("display_name", display_name)?;
             if let Some(version) = version {
                 validate_nonblank("version", version)?;
+            }
+            if let Some(host_run_id) = host_run_id {
+                validate_uuid_v7("host_run_id", host_run_id)?;
+            }
+            if host_run_id.is_none() && !session_cursors.is_empty() {
+                return invalid(
+                    "session_cursors",
+                    "stored Session cursors require host_run_id",
+                );
+            }
+            if session_cursors.values().any(|sequence| *sequence == 0) {
+                return invalid("session_cursors", "stored Session cursors must be positive");
             }
             if supported_protocol_versions.is_empty() {
                 return Err(NativeProtocolError::InvalidField {
@@ -900,7 +1041,8 @@ fn validate_client_message(message: &NativeClientMessage) -> Result<(), NativePr
         NativeClientMessage::Discover { request_id }
         | NativeClientMessage::Subscribe { request_id, .. }
         | NativeClientMessage::Unsubscribe { request_id, .. }
-        | NativeClientMessage::SubmitInteractionResponse { request_id, .. } => {
+        | NativeClientMessage::SubmitInteractionResponse { request_id, .. }
+        | NativeClientMessage::SubmitCommand { request_id, .. } => {
             validate_uuid_v7("request_id", request_id)?;
         }
     }
@@ -916,24 +1058,29 @@ fn validate_server_message(message: &NativeServerMessage) -> Result<(), NativePr
             max_frame_bytes,
             ping_interval_seconds,
             idle_timeout_seconds,
+            host_run_id,
             ..
         } => {
             validate_uuid_v7("connection_id", connection_id)?;
+            validate_uuid_v7("host_run_id", host_run_id)?;
             let expected_capabilities = ChannelCapabilities::NOTIFICATION
                 | ChannelCapabilities::SESSION_VIEW
                 | ChannelCapabilities::REALTIME_SYNC
-                | ChannelCapabilities::APPROVAL;
+                | ChannelCapabilities::APPROVAL
+                | ChannelCapabilities::FORM_INPUT
+                | ChannelCapabilities::TEXT_INPUT
+                | ChannelCapabilities::REMOTE_COMMAND;
             if channel.kind().as_str() != "native" {
                 return invalid("channel.kind", "server must identify a native Channel");
             }
             if channel.capabilities() != expected_capabilities {
                 return invalid(
                     "channel.capabilities",
-                    "Native v1 requires exactly notification, session_view, realtime_sync, and approval",
+                    "Native v3 requires its complete interactive command capability set",
                 );
             }
-            if *protocol_version != V1_PROTOCOL_VERSION {
-                return invalid("protocol_version", "server must select AgentPulse JSON v1");
+            if *protocol_version != V2_PROTOCOL_VERSION {
+                return invalid("protocol_version", "server must select AgentPulse JSON v2");
             }
             if *max_frame_bytes == 0 || *ping_interval_seconds == 0 || *idle_timeout_seconds == 0 {
                 return invalid(
@@ -955,6 +1102,14 @@ fn validate_server_message(message: &NativeServerMessage) -> Result<(), NativePr
         } => {
             validate_uuid_v7("request_id", request_id)?;
             validate_uuid_v7("interaction_id", interaction_id)?;
+        }
+        NativeServerMessage::CommandResult {
+            request_id,
+            command_id,
+            ..
+        } => {
+            validate_uuid_v7("request_id", request_id)?;
+            validate_uuid_v7("command_id", command_id)?;
         }
         NativeServerMessage::Domain { context, message } => {
             validate_delivery_context(context, message)?;
@@ -1058,6 +1213,30 @@ fn parse_session_id(value: String) -> Result<SessionId, NativeProtocolError> {
     })
 }
 
+fn parse_session_cursors(
+    cursors: Vec<SessionCursorDto>,
+) -> Result<BTreeMap<SessionId, u64>, NativeProtocolError> {
+    let mut parsed = BTreeMap::new();
+    for cursor in cursors {
+        let session_id = parse_session_id(cursor.session_id)?;
+        let last_sequence =
+            cursor
+                .last_sequence
+                .parse::<u64>()
+                .map_err(|_| NativeProtocolError::InvalidField {
+                    field: "last_sequence",
+                    reason: "expected a canonical positive decimal u64".to_owned(),
+                })?;
+        if last_sequence == 0 || cursor.last_sequence != last_sequence.to_string() {
+            return invalid("last_sequence", "expected a canonical positive decimal u64");
+        }
+        if parsed.insert(session_id, last_sequence).is_some() {
+            return invalid("session_cursors", "must not contain duplicate Session IDs");
+        }
+    }
+    Ok(parsed)
+}
+
 fn parse_sequence(value: String) -> Result<EventSequence, NativeProtocolError> {
     if value.is_empty()
         || !value.bytes().all(|byte| byte.is_ascii_digit())
@@ -1135,7 +1314,10 @@ mod tests {
             ChannelCapabilities::NOTIFICATION
                 | ChannelCapabilities::SESSION_VIEW
                 | ChannelCapabilities::REALTIME_SYNC
-                | ChannelCapabilities::APPROVAL,
+                | ChannelCapabilities::APPROVAL
+                | ChannelCapabilities::FORM_INPUT
+                | ChannelCapabilities::TEXT_INPUT
+                | ChannelCapabilities::REMOTE_COMMAND,
         ))
     }
 
@@ -1164,7 +1346,9 @@ mod tests {
                 client_id: CLIENT_ID.to_owned(),
                 display_name: "Fixture Native Client".to_owned(),
                 version: Some("1.0.0".to_owned()),
-                supported_protocol_versions: vec![V1_PROTOCOL_VERSION],
+                supported_protocol_versions: vec![V2_PROTOCOL_VERSION],
+                host_run_id: None,
+                session_cursors: BTreeMap::new(),
             },
             NativeClientMessage::Discover {
                 request_id: REQUEST_ID.to_owned(),
@@ -1203,10 +1387,12 @@ mod tests {
             NativeServerMessage::Hello {
                 connection_id: CLIENT_ID.to_owned(),
                 channel: channel_descriptor()?,
-                protocol_version: V1_PROTOCOL_VERSION,
+                protocol_version: V2_PROTOCOL_VERSION,
                 max_frame_bytes: 1024 * 1024,
                 ping_interval_seconds: 15,
                 idle_timeout_seconds: 45,
+                host_run_id: REQUEST_ID.to_owned(),
+                resume_accepted: false,
             },
             NativeServerMessage::SyncStarted {
                 request_id: REQUEST_ID.to_owned(),
@@ -1232,6 +1418,8 @@ mod tests {
                 status: NativeSubscriptionStatus::Subscribed,
                 baseline_sequence: EventSequence::FIRST,
                 pending_interaction_count: 0,
+                event_count: 1,
+                reset: true,
             },
             NativeServerMessage::InteractionResponseResult {
                 request_id: REQUEST_ID.to_owned(),
@@ -1249,18 +1437,18 @@ mod tests {
     #[test]
     fn codec_rejects_unknown_fields_versions_and_invalid_domain_contexts() -> TestResult {
         let unknown = format!(
-            "{{\"native_transport_version\":1,\"message\":{{\"type\":\"discover_sessions\",\"request_id\":\"{REQUEST_ID}\",\"extra\":true}}}}"
+            "{{\"native_transport_version\":3,\"message\":{{\"type\":\"discover_sessions\",\"request_id\":\"{REQUEST_ID}\",\"extra\":true}}}}"
         );
         assert!(matches!(
             decode_client_message(unknown.as_bytes()),
             Err(NativeProtocolError::Json { .. })
         ));
         let wrong_version = format!(
-            "{{\"native_transport_version\":2,\"message\":{{\"type\":\"discover_sessions\",\"request_id\":\"{REQUEST_ID}\"}}}}"
+            "{{\"native_transport_version\":1,\"message\":{{\"type\":\"discover_sessions\",\"request_id\":\"{REQUEST_ID}\"}}}}"
         );
         assert!(matches!(
             decode_client_message(wrong_version.as_bytes()),
-            Err(NativeProtocolError::UnsupportedVersion { received: 2, .. })
+            Err(NativeProtocolError::UnsupportedVersion { received: 1, .. })
         ));
         let invalid_context = NativeServerMessage::Domain {
             context: NativeDeliveryContext::LiveSession,

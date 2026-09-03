@@ -1,0 +1,13 @@
+{
+  "native_transport_version": 3,
+  "message": {
+    "type": "subscription_result",
+    "request_id": "01890f47-7c00-7000-8000-000000000005",
+    "session_id": "01890f47-7c00-7000-8000-000000000003",
+    "status": "subscribed",
+    "baseline_sequence": "7",
+    "pending_interaction_count": 0,
+    "event_count": 3,
+    "reset": false
+  }
+}

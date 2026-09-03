@@ -9,7 +9,7 @@
     "native_address": "192.168.50.4",
     "native_port": 49320,
     "access_token": "device-secret",
-    "native_transport_version": 1,
-    "domain_protocol_versions": [1]
+    "native_transport_version": 3,
+    "domain_protocol_versions": [2]
   }
 }

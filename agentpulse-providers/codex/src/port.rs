@@ -5,22 +5,29 @@ use std::sync::{Arc, Mutex};
 use agentpulse_bridge::ProviderPort;
 use agentpulse_core::{AgentCommand, InteractionResponse, ProviderDescriptor};
 
-use crate::{CodexProviderPortError, approval::ApprovalRuntimeState};
+use crate::{
+    CodexProviderPortError,
+    approval::ApprovalRuntimeState,
+    control::{ControlRuntimeState, SharedControlState},
+};
 
 /// Bridge-facing Codex Provider port.
 pub struct CodexProviderPort {
     descriptor: ProviderDescriptor,
     approvals: Arc<Mutex<ApprovalRuntimeState>>,
+    controls: SharedControlState,
 }
 
 impl CodexProviderPort {
-    pub(crate) fn with_approvals(
+    pub(crate) fn new(
         descriptor: ProviderDescriptor,
         approvals: Arc<Mutex<ApprovalRuntimeState>>,
+        controls: Arc<Mutex<ControlRuntimeState>>,
     ) -> Self {
         Self {
             descriptor,
             approvals,
+            controls,
         }
     }
 }
@@ -42,7 +49,10 @@ impl ProviderPort for CodexProviderPort {
             .claim(response)
     }
 
-    fn accept_command(&mut self, _command: AgentCommand) -> Result<(), Self::Error> {
-        Err(CodexProviderPortError::UnsupportedCommand)
+    fn accept_command(&mut self, command: AgentCommand) -> Result<(), Self::Error> {
+        self.controls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .accept(command)
     }
 }

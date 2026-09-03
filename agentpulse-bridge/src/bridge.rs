@@ -244,6 +244,121 @@ pub enum SubscribeOutcome {
     },
 }
 
+/// One retained Event and its centralized delivery route in a catch-up page.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoutedAgentEvent {
+    event: AgentEvent,
+    route: agentpulse_core::ChannelEventRoute,
+}
+
+impl RoutedAgentEvent {
+    fn new(event: AgentEvent, route: agentpulse_core::ChannelEventRoute) -> Self {
+        Self { event, route }
+    }
+
+    /// Borrows the retained Event.
+    #[must_use]
+    pub const fn event(&self) -> &AgentEvent {
+        &self.event
+    }
+
+    /// Returns the centralized route for this delivery.
+    #[must_use]
+    pub const fn route(&self) -> agentpulse_core::ChannelEventRoute {
+        self.route
+    }
+}
+
+/// One bounded, atomic in-memory catch-up page for a Session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChannelSessionSync {
+    after_sequence: u64,
+    through_sequence: u64,
+    reset: bool,
+    events: Vec<RoutedAgentEvent>,
+    baseline: Option<ChannelSessionBaseline>,
+}
+
+impl ChannelSessionSync {
+    /// Returns the client cursor preceding this page.
+    #[must_use]
+    pub const fn after_sequence(&self) -> u64 {
+        self.after_sequence
+    }
+
+    /// Returns the last Event represented by this page.
+    #[must_use]
+    pub const fn through_sequence(&self) -> u64 {
+        self.through_sequence
+    }
+
+    /// Returns whether the caller must discard its prior Session state first.
+    #[must_use]
+    pub const fn reset(&self) -> bool {
+        self.reset
+    }
+
+    /// Borrows retained Events in ascending contiguous sequence order.
+    #[must_use]
+    pub fn events(&self) -> &[RoutedAgentEvent] {
+        &self.events
+    }
+
+    /// Borrows the final current-state baseline when this page enters live mode.
+    #[must_use]
+    pub const fn baseline(&self) -> Option<&ChannelSessionBaseline> {
+        self.baseline.as_ref()
+    }
+
+    /// Returns whether this page atomically establishes the live subscription.
+    #[must_use]
+    pub const fn is_final(&self) -> bool {
+        self.baseline.is_some()
+    }
+}
+
+/// Result of one bounded Session catch-up request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionSyncOutcome {
+    through_sequence: u64,
+    event_count: usize,
+    reset: bool,
+    subscribed: bool,
+    pending_interaction_count: usize,
+}
+
+impl SessionSyncOutcome {
+    /// Returns the last Event committed by this page.
+    #[must_use]
+    pub const fn through_sequence(self) -> u64 {
+        self.through_sequence
+    }
+
+    /// Returns the number of retained Events in the page.
+    #[must_use]
+    pub const fn event_count(self) -> usize {
+        self.event_count
+    }
+
+    /// Returns whether the client cursor was rejected and reset to zero.
+    #[must_use]
+    pub const fn reset(self) -> bool {
+        self.reset
+    }
+
+    /// Returns whether the page also established the live subscription.
+    #[must_use]
+    pub const fn subscribed(self) -> bool {
+        self.subscribed
+    }
+
+    /// Returns pending interactions in the final live baseline.
+    #[must_use]
+    pub const fn pending_interaction_count(self) -> usize {
+        self.pending_interaction_count
+    }
+}
+
 /// One pending interaction and its centralized route in a subscription baseline.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoutedInteractionRequest {
@@ -399,6 +514,8 @@ pub enum SubscriptionError {
     InitialSessionHandoff(ChannelDeliveryError),
     /// A pending interaction could not be routed into the baseline.
     BaselineRoute(CapabilityRouteError),
+    /// The requested catch-up page could never make progress.
+    InvalidPageSize,
 }
 
 impl fmt::Display for SubscriptionError {
@@ -420,6 +537,7 @@ impl fmt::Display for SubscriptionError {
                 )
             }
             Self::BaselineRoute(source) => source.fmt(formatter),
+            Self::InvalidPageSize => formatter.write_str("session sync page size must be positive"),
         }
     }
 }
@@ -429,7 +547,9 @@ impl Error for SubscriptionError {
         match self {
             Self::InitialSessionHandoff(source) => Some(source),
             Self::BaselineRoute(source) => Some(source),
-            Self::ChannelNotFound { .. } | Self::SessionNotFound { .. } => None,
+            Self::ChannelNotFound { .. } | Self::SessionNotFound { .. } | Self::InvalidPageSize => {
+                None
+            }
         }
     }
 }
@@ -769,6 +889,138 @@ impl Bridge {
         self.subscriptions
             .get(&session_id)
             .is_some_and(|channels| channels.contains(&channel_id))
+    }
+
+    /// Delivers one retained Event page and atomically enters live delivery when caught up.
+    pub fn sync_session(
+        &mut self,
+        channel_id: ChannelId,
+        session_id: SessionId,
+        requested_after: u64,
+        max_events: usize,
+    ) -> Result<SessionSyncOutcome, SubscriptionError> {
+        if max_events == 0 {
+            return Err(SubscriptionError::InvalidPageSize);
+        }
+        let channel_descriptor = self
+            .channels
+            .get(&channel_id)
+            .ok_or(SubscriptionError::ChannelNotFound { channel_id })?
+            .descriptor()
+            .clone();
+        let aggregate = self
+            .sessions
+            .get(&session_id)
+            .ok_or(SubscriptionError::SessionNotFound { session_id })?;
+
+        if self.is_subscribed(channel_id, session_id) {
+            return Ok(SessionSyncOutcome {
+                through_sequence: aggregate.last_sequence().get(),
+                event_count: 0,
+                reset: false,
+                subscribed: true,
+                pending_interaction_count: 0,
+            });
+        }
+
+        let provider_descriptor = self
+            .providers
+            .get(&aggregate.session().provider_id())
+            .ok_or(SubscriptionError::SessionNotFound { session_id })?
+            .descriptor()
+            .clone();
+        let (after_sequence, reset, page_events) =
+            match aggregate.retained_event_page_after(requested_after, max_events) {
+                Some(events) => (requested_after, false, events),
+                None => (
+                    0,
+                    true,
+                    aggregate.retained_event_page_after(0, max_events).ok_or(
+                        SubscriptionError::InitialSessionHandoff(ChannelDeliveryError::new(
+                            channel_id,
+                            ChannelDeliveryKind::Event,
+                            Box::new(std::io::Error::other(
+                                "complete in-memory Session history is unavailable",
+                            )),
+                        )),
+                    )?,
+                ),
+            };
+        let through_sequence = page_events
+            .last()
+            .map_or(after_sequence, |event| event.sequence().get());
+        let final_page = through_sequence == aggregate.last_sequence().get();
+        let routed_events = page_events
+            .into_iter()
+            .map(|event| {
+                CapabilityRouter::channel_event_route(
+                    &provider_descriptor,
+                    &channel_descriptor,
+                    aggregate.session(),
+                    &event,
+                )
+                .map(|route| RoutedAgentEvent::new(event, route))
+                .map_err(SubscriptionError::BaselineRoute)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let baseline = if final_page {
+            let pending_interactions = aggregate
+                .pending_interactions()
+                .map(|request| {
+                    CapabilityRouter::interaction_route(
+                        &provider_descriptor,
+                        &channel_descriptor,
+                        aggregate.session(),
+                        request,
+                    )
+                    .map(|route| RoutedInteractionRequest::new(request.clone(), route))
+                    .map_err(SubscriptionError::BaselineRoute)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Some(ChannelSessionBaseline::new(
+                aggregate.session().clone(),
+                aggregate.last_sequence(),
+                pending_interactions,
+            ))
+        } else {
+            None
+        };
+        let pending_interaction_count = baseline
+            .as_ref()
+            .map_or(0, |baseline| baseline.pending_interactions().len());
+        let event_count = routed_events.len();
+        let sync = ChannelSessionSync {
+            after_sequence,
+            through_sequence,
+            reset,
+            events: routed_events,
+            baseline,
+        };
+        self.channels
+            .get_mut(&channel_id)
+            .ok_or(SubscriptionError::ChannelNotFound { channel_id })?
+            .deliver_session_sync(sync)
+            .map_err(|source| {
+                SubscriptionError::InitialSessionHandoff(ChannelDeliveryError::new(
+                    channel_id,
+                    ChannelDeliveryKind::Session,
+                    source,
+                ))
+            })?;
+        if final_page {
+            let _ = self
+                .subscriptions
+                .entry(session_id)
+                .or_default()
+                .insert(channel_id);
+        }
+        Ok(SessionSyncOutcome {
+            through_sequence,
+            event_count,
+            reset,
+            subscribed: final_page,
+            pending_interaction_count,
+        })
     }
 
     /// Iterates over a Session's subscribers in stable Channel-ID order.

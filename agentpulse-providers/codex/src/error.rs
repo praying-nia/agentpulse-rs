@@ -111,6 +111,26 @@ pub enum CodexProviderPortError {
     /// Agent commands are outside the Provider capability boundary.
     #[error("the Codex Provider does not accept agent commands")]
     UnsupportedCommand,
+    /// A single prompt exceeds the bounded command surface limit.
+    #[error("prompt is {bytes} bytes; maximum is {maximum}")]
+    PromptTooLarge {
+        /// UTF-8 byte length.
+        bytes: usize,
+        /// Maximum accepted UTF-8 byte length.
+        maximum: usize,
+    },
+    /// The per-session prompt queue is full.
+    #[error("prompt queue is full (capacity {capacity})")]
+    PromptQueueFull {
+        /// Fixed entry capacity.
+        capacity: usize,
+    },
+    /// The provider command handoff queue is full.
+    #[error("command queue is full (capacity {capacity})")]
+    CommandQueueFull {
+        /// Fixed entry capacity.
+        capacity: usize,
+    },
 }
 
 /// A lifecycle or live-stream failure raised by the Codex Provider Source.

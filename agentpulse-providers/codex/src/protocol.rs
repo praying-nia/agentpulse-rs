@@ -20,8 +20,19 @@ pub(crate) struct ProtocolSchema {
     jsonrpc_error: Validator,
     initialize_response: Validator,
     thread_resume_response: Validator,
+    model_list_response: Validator,
+    permission_profile_list_response: Validator,
+    thread_list_response: Validator,
+    thread_items_list_response: Validator,
+    thread_start_response: Validator,
+    thread_fork_response: Validator,
+    turn_start_response: Validator,
+    turn_steer_response: Validator,
+    empty_response: Validator,
+    review_start_response: Validator,
     command_approval_response: Validator,
     file_approval_response: Validator,
+    user_input_response: Validator,
 }
 
 impl ProtocolSchema {
@@ -41,6 +52,22 @@ impl ProtocolSchema {
             jsonrpc_error: compile_ref(&schema, "#/definitions/JSONRPCError")?,
             initialize_response: compile_ref(&schema, "#/definitions/InitializeResponse")?,
             thread_resume_response: compile_ref(&schema, "#/definitions/v2/ThreadResumeResponse")?,
+            model_list_response: compile_ref(&schema, "#/definitions/v2/ModelListResponse")?,
+            permission_profile_list_response: compile_ref(
+                &schema,
+                "#/definitions/v2/PermissionProfileListResponse",
+            )?,
+            thread_list_response: compile_ref(&schema, "#/definitions/v2/ThreadListResponse")?,
+            thread_items_list_response: compile_ref(
+                &schema,
+                "#/definitions/v2/ThreadItemsListResponse",
+            )?,
+            thread_start_response: compile_ref(&schema, "#/definitions/v2/ThreadStartResponse")?,
+            thread_fork_response: compile_ref(&schema, "#/definitions/v2/ThreadForkResponse")?,
+            turn_start_response: compile_ref(&schema, "#/definitions/v2/TurnStartResponse")?,
+            turn_steer_response: compile_ref(&schema, "#/definitions/v2/TurnSteerResponse")?,
+            empty_response: compile_ref(&schema, "#/definitions/v2/TurnInterruptResponse")?,
+            review_start_response: compile_ref(&schema, "#/definitions/v2/ReviewStartResponse")?,
             command_approval_response: compile_ref(
                 &schema,
                 "#/definitions/CommandExecutionRequestApprovalResponse",
@@ -48,6 +75,10 @@ impl ProtocolSchema {
             file_approval_response: compile_ref(
                 &schema,
                 "#/definitions/FileChangeRequestApprovalResponse",
+            )?,
+            user_input_response: compile_ref(
+                &schema,
+                "#/definitions/ToolRequestUserInputResponse",
             )?,
         })
     }
@@ -108,6 +139,18 @@ impl RequestId {
 pub(crate) enum ExpectedResponse {
     Initialize,
     ThreadResume,
+    ModelList,
+    PermissionProfileList,
+    ThreadList,
+    ThreadItemsList,
+    ThreadStart,
+    ThreadFork,
+    TurnStart,
+    TurnSteer,
+    TurnInterrupt,
+    ThreadCompact,
+    ReviewStart,
+    ThreadSetName,
 }
 
 impl ExpectedResponse {
@@ -115,6 +158,18 @@ impl ExpectedResponse {
         match self {
             Self::Initialize => "initialize",
             Self::ThreadResume => "thread/resume",
+            Self::ModelList => "model/list",
+            Self::PermissionProfileList => "permissionProfile/list",
+            Self::ThreadList => "thread/list",
+            Self::ThreadItemsList => "thread/items/list",
+            Self::ThreadStart => "thread/start",
+            Self::ThreadFork => "thread/fork",
+            Self::TurnStart => "turn/start",
+            Self::TurnSteer => "turn/steer",
+            Self::TurnInterrupt => "turn/interrupt",
+            Self::ThreadCompact => "thread/compact/start",
+            Self::ReviewStart => "review/start",
+            Self::ThreadSetName => "thread/name/set",
         }
     }
 }
@@ -216,6 +271,24 @@ impl ProtocolEngine {
         Ok((id, serialize(&value)?))
     }
 
+    pub(crate) fn request(
+        &mut self,
+        expected: ExpectedResponse,
+        params: Value,
+    ) -> Result<(RequestId, String), CodexProviderSourceError> {
+        let id = self.allocate(expected);
+        let value = json!({
+            "id": id.clone().into_value(),
+            "method": expected.method(),
+            "params": params,
+        });
+        if let Err(error) = self.validate_client_request(&value) {
+            self.cancel_pending(&id);
+            return Err(error);
+        }
+        Ok((id, serialize(&value)?))
+    }
+
     pub(crate) fn unsupported_request_response(
         &self,
         id: RequestId,
@@ -232,23 +305,23 @@ impl ProtocolEngine {
         serialize(&value)
     }
 
-    pub(crate) fn approval_response(
+    pub(crate) fn interaction_response(
         &self,
         id: RequestId,
         method: &str,
-        decision: Value,
+        result: Value,
     ) -> Result<String, CodexProviderSourceError> {
-        let result = json!({"decision": decision});
         let validator = match method {
             "item/commandExecution/requestApproval" => &self.schema.command_approval_response,
             "item/fileChange/requestApproval" => &self.schema.file_approval_response,
+            "item/tool/requestUserInput" => &self.schema.user_input_response,
             _ => {
                 return Err(CodexProviderSourceError::protocol(format!(
-                    "cannot encode a response for unsupported approval method {method}"
+                    "cannot encode a response for unsupported interaction method {method}"
                 )));
             }
         };
-        validate(validator, &result, "approval response result")?;
+        validate(validator, &result, "interaction response result")?;
         let value = json!({
             "id": id.into_value(),
             "result": result,
@@ -390,6 +463,20 @@ impl ProtocolEngine {
                 let validator = match expected {
                     ExpectedResponse::Initialize => &self.schema.initialize_response,
                     ExpectedResponse::ThreadResume => &self.schema.thread_resume_response,
+                    ExpectedResponse::ModelList => &self.schema.model_list_response,
+                    ExpectedResponse::PermissionProfileList => {
+                        &self.schema.permission_profile_list_response
+                    }
+                    ExpectedResponse::ThreadList => &self.schema.thread_list_response,
+                    ExpectedResponse::ThreadItemsList => &self.schema.thread_items_list_response,
+                    ExpectedResponse::ThreadStart => &self.schema.thread_start_response,
+                    ExpectedResponse::ThreadFork => &self.schema.thread_fork_response,
+                    ExpectedResponse::TurnStart => &self.schema.turn_start_response,
+                    ExpectedResponse::TurnSteer => &self.schema.turn_steer_response,
+                    ExpectedResponse::TurnInterrupt
+                    | ExpectedResponse::ThreadCompact
+                    | ExpectedResponse::ThreadSetName => &self.schema.empty_response,
+                    ExpectedResponse::ReviewStart => &self.schema.review_start_response,
                 };
                 validate(validator, &result, expected.method())?;
                 Ok(ServerFrame::Response {
@@ -542,39 +629,101 @@ mod tests {
             _ => return Err("expected server request".into()),
         };
         assert_eq!(params["startedAtMs"], 1_000);
-        let response = engine.approval_response(
+        let response = engine.interaction_response(
             id,
             "item/commandExecution/requestApproval",
             json!({
-                "acceptWithExecpolicyAmendment": {
-                    "execpolicy_amendment": ["cargo", "test"]
+                "decision": {
+                    "acceptWithExecpolicyAmendment": {
+                        "execpolicy_amendment": ["cargo", "test"]
+                    }
                 }
             }),
         )?;
         assert!(response.contains("acceptWithExecpolicyAmendment"));
-        let network = engine.approval_response(
+        let network = engine.interaction_response(
             RequestId::String("approval-2".to_owned()),
             "item/commandExecution/requestApproval",
             json!({
-                "applyNetworkPolicyAmendment": {
-                    "network_policy_amendment": {"action": "allow", "host": "example.com"}
+                "decision": {
+                    "applyNetworkPolicyAmendment": {
+                        "network_policy_amendment": {"action": "allow", "host": "example.com"}
+                    }
                 }
             }),
         )?;
         assert!(network.contains("applyNetworkPolicyAmendment"));
         for decision in ["accept", "acceptForSession", "decline", "cancel"] {
-            let response = engine.approval_response(
+            let response = engine.interaction_response(
                 RequestId::String(format!("command-{decision}")),
                 "item/commandExecution/requestApproval",
-                json!(decision),
+                json!({"decision": decision}),
             )?;
             assert!(response.contains(decision));
-            let response = engine.approval_response(
+            let response = engine.interaction_response(
                 RequestId::String(format!("file-{decision}")),
                 "item/fileChange/requestApproval",
-                json!(decision),
+                json!({"decision": decision}),
             )?;
             assert!(response.contains(decision));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn validates_the_bounded_remote_control_request_set() -> TestResult {
+        let mut engine = engine()?;
+        let requests = [
+            (ExpectedResponse::ModelList, json!({"limit": 50})),
+            (
+                ExpectedResponse::PermissionProfileList,
+                json!({"limit": 50}),
+            ),
+            (
+                ExpectedResponse::ThreadList,
+                json!({"limit": 50, "sortKey": "updated_at", "sortDirection": "desc"}),
+            ),
+            (
+                ExpectedResponse::ThreadItemsList,
+                json!({"threadId": "019976a4-00f0-7312-b36c-d01f9c5c06f6", "limit": 100, "sortDirection": "asc"}),
+            ),
+            (
+                ExpectedResponse::ThreadStart,
+                json!({"cwd": "/workspace", "sessionStartSource": "clear"}),
+            ),
+            (
+                ExpectedResponse::ThreadFork,
+                json!({"threadId": "019976a4-00f0-7312-b36c-d01f9c5c06f6"}),
+            ),
+            (
+                ExpectedResponse::TurnStart,
+                json!({"threadId": "019976a4-00f0-7312-b36c-d01f9c5c06f6", "input": [{"type": "text", "text": "continue"}]}),
+            ),
+            (
+                ExpectedResponse::TurnSteer,
+                json!({"threadId": "019976a4-00f0-7312-b36c-d01f9c5c06f6", "expectedTurnId": "019976a4-00f1-76c0-b845-e1509dc4e3de", "input": [{"type": "text", "text": "adjust"}]}),
+            ),
+            (
+                ExpectedResponse::TurnInterrupt,
+                json!({"threadId": "019976a4-00f0-7312-b36c-d01f9c5c06f6", "turnId": "019976a4-00f1-76c0-b845-e1509dc4e3de"}),
+            ),
+            (
+                ExpectedResponse::ThreadCompact,
+                json!({"threadId": "019976a4-00f0-7312-b36c-d01f9c5c06f6"}),
+            ),
+            (
+                ExpectedResponse::ReviewStart,
+                json!({"threadId": "019976a4-00f0-7312-b36c-d01f9c5c06f6", "target": {"type": "uncommittedChanges"}, "delivery": "inline"}),
+            ),
+            (
+                ExpectedResponse::ThreadSetName,
+                json!({"threadId": "019976a4-00f0-7312-b36c-d01f9c5c06f6", "name": "New name"}),
+            ),
+        ];
+        for (expected, params) in requests {
+            let (id, text) = engine.request(expected, params)?;
+            assert!(text.contains(expected.method()));
+            engine.cancel_pending(&id);
         }
         Ok(())
     }

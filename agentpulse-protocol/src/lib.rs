@@ -27,11 +27,11 @@
 mod codec;
 mod error;
 mod message;
-mod v1;
+mod v2;
 
 pub use codec::{decode_json, encode_json};
 pub use error::ProtocolError;
 pub use message::ProtocolMessage;
 
-/// The protocol version implemented by the initial JSON codec.
-pub const V1_PROTOCOL_VERSION: u16 = 1;
+/// The protocol version implemented by the structured form and conversation codec.
+pub const V2_PROTOCOL_VERSION: u16 = 2;

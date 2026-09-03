@@ -7,7 +7,7 @@ use agentpulse_core::{
     InteractionResponse, ProviderDescriptor, ProviderId,
 };
 
-use crate::ChannelSessionBaseline;
+use crate::{ChannelSessionBaseline, ChannelSessionSync};
 
 /// Adapter boundary for sending validated user actions toward an AI agent.
 ///
@@ -74,6 +74,17 @@ pub trait ChannelPort: Send {
         baseline: ChannelSessionBaseline,
     ) -> Result<(), Self::Error> {
         self.deliver_session(baseline.into_session())
+    }
+
+    /// Accepts one bounded historical page and an optional final live baseline.
+    fn deliver_session_sync(&mut self, sync: ChannelSessionSync) -> Result<(), Self::Error> {
+        for routed in sync.events() {
+            self.deliver_event(routed.event().clone(), routed.route())?;
+        }
+        if let Some(baseline) = sync.baseline().cloned() {
+            self.deliver_session_baseline(baseline)?;
+        }
+        Ok(())
     }
 }
 
