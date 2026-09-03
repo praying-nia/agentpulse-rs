@@ -49,7 +49,7 @@ Initial Provider targets are Codex, Claude Code, OpenCode, and DeepSeek Harness.
 
 首批 Provider 目标为 Codex、Claude Code、OpenCode 与 DeepSeek Harness。Provider 集成应优先使用官方 RPC 或 SDK，其次为 Plugin API、可回写 Hook、只读 Hook，最后才考虑 PTY/TUI 技术。
 
-The first production Provider is [`agentpulse-provider-codex`](agentpulse-providers/codex). It manages a shared Unix-socket Codex App Server, strictly validates the byte-identical generated `0.152.0`/`0.152.1` schema for explicitly verified CLI versions, and starts valid newer SemVer releases best-effort with a visible warning while preserving strict protocol failure. It can resume explicit threads or transiently follow threads opened through the same App Server, publishes live session events, correlates approvals and atomic forms, and executes the bounded common model/resume/plan/prompt control set.
+The first production Provider is [`agentpulse-provider-codex`](agentpulse-providers/codex). It manages a shared Unix-socket Codex App Server, strictly validates the generated experimental `0.153.0` schema for explicitly verified CLI versions, and starts valid newer SemVer releases best-effort with a visible warning while preserving strict protocol failure. It can resume explicit threads or transiently follow threads opened through the same App Server, publishes live session events, correlates approvals and atomic forms, and executes the bounded common model/resume/plan/prompt control set.
 
 首个正式 Provider 是 [`agentpulse-provider-codex`](agentpulse-providers/codex)。它托管共享 Unix Socket Codex App Server，针对明确验证过的 CLI 版本严格校验 `0.152.0`/`0.152.1` 生成且逐字节相同的 Schema；更高的合法 SemVer 会在明确警告后尽力启动，但协议不兼容仍严格失败。Provider 可恢复显式 Thread，也可临时跟踪同一 App Server 中打开的 Thread，发布实时 Session Event，并把命令/文件审批 Option 精确关联回 Codex Decision。
 

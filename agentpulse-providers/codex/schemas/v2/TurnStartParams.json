@@ -702,6 +702,16 @@
     }
   },
   "properties": {
+    "additionalContext": {
+      "additionalProperties": {
+        "$ref": "#/definitions/AdditionalContextEntry"
+      },
+      "description": "Optional client-provided context fragments keyed by an opaque source identifier.",
+      "type": [
+        "object",
+        "null"
+      ]
+    },
     "approvalPolicy": {
       "anyOf": [
         {
@@ -730,12 +740,34 @@
         "null"
       ]
     },
+    "collaborationMode": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CollaborationMode"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "EXPERIMENTAL - Set a pre-set collaboration mode. Takes precedence over model, reasoning_effort, and developer instructions if set.\n\nFor `collaboration_mode.settings.developer_instructions`, `null` means \"use the built-in instructions for the selected mode\"."
+    },
     "cwd": {
       "description": "Override the working directory for this turn and subsequent turns.",
       "type": [
         "string",
         "null"
       ]
+    },
+    "cyberAccessProgram": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CyberAccessProgram"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "EXPERIMENTAL - Request a workspace-authorized cyber program for this turn. Omission preserves automatic behavior. This does not grant access."
     },
     "effort": {
       "anyOf": [
@@ -747,6 +779,16 @@
         }
       ],
       "description": "Override the reasoning effort for this turn and subsequent turns."
+    },
+    "environments": {
+      "description": "Optional environments for this turn and subsequent turns.\n\nOmitted uses the thread sticky environments. Empty disables environment access for this turn. Non-empty selects the first environment as the current turn environment for this turn.",
+      "items": {
+        "$ref": "#/definitions/TurnEnvironmentParams"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
     },
     "input": {
       "items": {
@@ -761,8 +803,26 @@
         "null"
       ]
     },
+    "multiAgentMode": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/MultiAgentMode"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "@deprecated Ignored. Use `effort: \"ultra\"` for proactive multi-agent behavior."
+    },
     "outputSchema": {
       "description": "Optional JSON Schema used to constrain the final assistant message for this turn."
+    },
+    "permissions": {
+      "description": "Select a named permissions profile id for this turn and subsequent turns. Cannot be combined with `sandboxPolicy`.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "personality": {
       "anyOf": [
@@ -774,6 +834,26 @@
         }
       ],
       "description": "Override the personality for this turn and subsequent turns."
+    },
+    "responsesapiClientMetadata": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Optional metadata to enrich Codex's ResponsesAPI turn metadata.\n\nEntries are flattened into the JSON string sent as `client_metadata[\"x-codex-turn-metadata\"]` on ResponsesAPI HTTP and websocket requests.\n\nThey are not sent as top-level ResponsesAPI `client_metadata` keys, and reserved keys such as `session_id`, `thread_id`, `turn_id`, and `window_id` cannot be overridden.",
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "runtimeWorkspaceRoots": {
+      "description": "Replace the thread's runtime workspace roots for this turn and subsequent turns. Paths must be absolute.",
+      "items": {
+        "$ref": "#/definitions/AbsolutePathBuf"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
     },
     "sandboxPolicy": {
       "anyOf": [

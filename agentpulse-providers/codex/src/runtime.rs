@@ -55,7 +55,7 @@ const STDERR_LIMIT: usize = 64 * 1024;
 #[cfg(unix)]
 const MAX_PROXY_CONNECTIONS: usize = 16;
 #[cfg(unix)]
-const LATEST_VERIFIED_CODEX_CLI_CORE: (u64, u64, u64) = (0, 152, 1);
+const LATEST_VERIFIED_CODEX_CLI_CORE: (u64, u64, u64) = (0, 153, 0);
 
 #[cfg(unix)]
 #[derive(Debug, Eq, PartialEq)]
@@ -591,13 +591,21 @@ fn flush_control_commands(
     events: &ProviderEventHandle,
     pending: &mut BTreeMap<crate::protocol::RequestId, PendingControl>,
 ) -> Result<(), CodexProviderSourceError> {
-    for session_id in lock_controls(controls).inflight_sessions() {
+    let inflight_sessions = { lock_controls(controls).inflight_sessions() };
+    for session_id in inflight_sessions {
         let active = lock_mapper(mapper)
             .command_context(session_id)
             .is_some_and(|(_, turn, _)| turn.is_some());
         lock_controls(controls).observe_turn(session_id, active);
     }
-    while let Some(command) = lock_controls(controls).pop_command() {
+    loop {
+        // Keep the controls mutex out of the command body. Some commands publish
+        // events through the Bridge, while another Bridge caller may concurrently
+        // be waiting to enqueue a command under this mutex.
+        let command = { lock_controls(controls).pop_command() };
+        let Some(command) = command else {
+            break;
+        };
         let session_id = command.session_id();
         let context = lock_mapper(mapper)
             .command_context(session_id)
@@ -839,26 +847,23 @@ fn flush_control_commands(
         }
     }
 
-    for session_id in lock_controls(controls).queued_sessions() {
+    let queued_sessions = { lock_controls(controls).queued_sessions() };
+    for session_id in queued_sessions {
         let context = lock_mapper(mapper)
             .command_context(session_id)
             .map(|(thread, turn, state)| (thread.to_owned(), turn.map(str::to_owned), state));
-        let Some((thread_id, None, state)) = context else {
+        let Some((thread_id, None, _)) = context else {
             continue;
         };
-        if matches!(
-            state,
-            AgentState::Completed | AgentState::Failed | AgentState::Cancelled
-        ) {
-            continue;
-        }
         let Some(prompt) = lock_controls(controls).front_prompt(session_id) else {
             continue;
         };
         let defaults = lock_controls(controls).defaults(session_id);
-        let mut params =
-            json!({"threadId": thread_id, "input": turn_input(prompt.as_str(), &defaults)});
-        apply_turn_defaults(&mut params, &defaults);
+        let thread_settings = lock_mapper(mapper)
+            .model_settings_for_session(session_id)
+            .map(|(model, effort)| (model.to_owned(), effort.map(str::to_owned)));
+        let mut params = json!({"threadId": thread_id, "input": turn_input(prompt.as_str())});
+        apply_turn_defaults(&mut params, &defaults, thread_settings.as_ref())?;
         send_control_request(
             io,
             protocol,
@@ -897,28 +902,51 @@ fn text_input(text: &str) -> serde_json::Value {
     json!({"type": "text", "text": text})
 }
 
-fn turn_input(text: &str, defaults: &TurnDefaults) -> serde_json::Value {
-    if defaults.plan_mode {
-        json!([
-            text_input(
-                "Work in Plan mode: inspect and reason, ask for any required choices, and do not modify files until Plan mode is disabled."
-            ),
-            text_input(text),
-        ])
-    } else {
-        json!([text_input(text)])
-    }
+fn turn_input(text: &str) -> serde_json::Value {
+    json!([text_input(text)])
 }
 
-fn apply_turn_defaults(params: &mut serde_json::Value, defaults: &TurnDefaults) {
+fn apply_turn_defaults(
+    params: &mut serde_json::Value,
+    defaults: &TurnDefaults,
+    thread_settings: Option<&(String, Option<String>)>,
+) -> Result<(), CodexProviderSourceError> {
     let Some(object) = params.as_object_mut() else {
-        return;
+        return Err(CodexProviderSourceError::protocol(
+            "turn/start params must be an object",
+        ));
     };
     if let Some(model) = &defaults.model {
         object.insert("model".to_owned(), json!(model));
     }
     if let Some(effort) = &defaults.effort {
         object.insert("effort".to_owned(), json!(effort));
+    }
+    let effective_model = defaults
+        .model
+        .as_ref()
+        .or_else(|| thread_settings.map(|(model, _)| model));
+    let effective_effort = defaults
+        .effort
+        .as_ref()
+        .or_else(|| thread_settings.and_then(|(_, effort)| effort.as_ref()));
+    if defaults.plan_mode && effective_model.is_none() {
+        return Err(CodexProviderSourceError::protocol(
+            "cannot start a Plan turn before Codex reports the thread model",
+        ));
+    }
+    if let Some(model) = effective_model {
+        object.insert(
+            "collaborationMode".to_owned(),
+            json!({
+                "mode": if defaults.plan_mode { "plan" } else { "default" },
+                "settings": {
+                    "model": model,
+                    "reasoning_effort": effective_effort,
+                    "developer_instructions": null
+                }
+            }),
+        );
     }
     if let Some(profile) = defaults.permission_profile.as_deref() {
         let policy = match profile {
@@ -933,6 +961,7 @@ fn apply_turn_defaults(params: &mut serde_json::Value, defaults: &TurnDefaults) 
             object.insert("sandboxPolicy".to_owned(), policy);
         }
     }
+    Ok(())
 }
 
 fn apply_thread_defaults(params: &mut serde_json::Value, defaults: &TurnDefaults) {
@@ -941,9 +970,6 @@ fn apply_thread_defaults(params: &mut serde_json::Value, defaults: &TurnDefaults
     };
     if let Some(model) = &defaults.model {
         object.insert("model".to_owned(), json!(model));
-    }
-    if defaults.plan_mode {
-        object.insert("config".to_owned(), json!({"collaboration_mode": "plan"}));
     }
 }
 
@@ -2547,7 +2573,7 @@ mod tests {
         fmt,
         net::TcpStream,
         str::FromStr,
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, TryLockError},
         thread,
         time::{Duration, Instant},
     };
@@ -2834,7 +2860,9 @@ mod tests {
             NonEmptyText::new("Codex Test")?,
             ProviderCapabilities::SESSION_STATE
                 | ProviderCapabilities::APPROVAL_REQUEST
-                | ProviderCapabilities::APPROVAL_RESPONSE,
+                | ProviderCapabilities::APPROVAL_RESPONSE
+                | ProviderCapabilities::PROMPT_SUBMIT
+                | ProviderCapabilities::CONTROL,
         ))
     }
 
@@ -3324,6 +3352,44 @@ mod tests {
         }
     }
 
+    struct ControlLockCheckingChannel {
+        descriptor: ChannelDescriptor,
+        controls: SharedControlState,
+        status_delivery_released_controls: Arc<Mutex<Option<bool>>>,
+    }
+
+    impl ChannelPort for ControlLockCheckingChannel {
+        type Error = TestChannelError;
+
+        fn descriptor(&self) -> &ChannelDescriptor {
+            &self.descriptor
+        }
+
+        fn deliver_event(
+            &mut self,
+            event: AgentEvent,
+            _route: ChannelEventRoute,
+        ) -> Result<(), Self::Error> {
+            let AgentEventPayload::Message(message) = event.payload() else {
+                return Ok(());
+            };
+            if !message.content().as_str().starts_with("State: ") {
+                return Ok(());
+            }
+            let released = match self.controls.try_lock() {
+                Ok(_) => true,
+                Err(TryLockError::WouldBlock) => false,
+                Err(TryLockError::Poisoned(_)) => true,
+            };
+            *locked(&self.status_delivery_released_controls) = Some(released);
+            Ok(())
+        }
+
+        fn deliver_session(&mut self, _session: AgentSession) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
     struct CapturingChannelSource {
         handle: Arc<Mutex<Option<ChannelActionHandle>>>,
     }
@@ -3340,6 +3406,218 @@ mod tests {
             *locked(&self.handle) = None;
             Ok(())
         }
+    }
+
+    #[test]
+    fn status_event_delivery_does_not_hold_control_state() -> TestResult {
+        let app_server = Arc::new(FakeControl::default());
+        seed_lines(&app_server, LIVE_FIXTURE.lines().take(2));
+        let provider_id = ProviderId::new();
+        let config = CodexProviderConfig::new(provider_id, "/tmp/ap-test", [THREAD_ID])?;
+        let schema = ProtocolSchema::compile()?;
+        let mapper = CodexEventMapper::new(provider_id, &config.threads, config.discover_threads);
+        let status = Arc::new(Mutex::new(Default::default()));
+        let approvals = Arc::new(Mutex::new(ApprovalRuntimeState::new()));
+        let controls = Arc::new(Mutex::new(ControlRuntimeState::new()));
+        let source = CodexProviderSource::with_runtime_and_states(
+            config,
+            schema,
+            mapper,
+            Arc::clone(&status),
+            Arc::clone(&approvals),
+            Arc::clone(&controls),
+            Box::new(FakeRuntime {
+                control: app_server,
+            }),
+        );
+        let provider = CodexProviderPort::new(
+            ProviderDescriptor::new(
+                provider_id,
+                ProviderKind::new("codex")?,
+                NonEmptyText::new("Codex Test")?,
+                ProviderCapabilities::SESSION_STATE | ProviderCapabilities::CONTROL,
+            ),
+            approvals,
+            Arc::clone(&controls),
+        );
+        let session_id = SessionId::from_str(THREAD_ID)?;
+        let channel_id = ChannelId::new();
+        let actions = Arc::new(Mutex::new(None));
+        let lock_was_released = Arc::new(Mutex::new(None));
+        let channel = ControlLockCheckingChannel {
+            descriptor: ChannelDescriptor::new(
+                channel_id,
+                ChannelKind::new("test")?,
+                NonEmptyText::new("Control Lock Test Channel")?,
+                ChannelCapabilities::SESSION_VIEW | ChannelCapabilities::REMOTE_COMMAND,
+            ),
+            controls,
+            status_delivery_released_controls: Arc::clone(&lock_was_released),
+        };
+        let mut host = RuntimeHost::new();
+        host.register_provider(provider, source)?;
+        host.register_channel(
+            channel,
+            CapturingChannelSource {
+                handle: Arc::clone(&actions),
+            },
+        )?;
+        let _ = host.start()?;
+        let _ = host.subscribe(channel_id, session_id)?;
+        locked(&actions)
+            .as_ref()
+            .ok_or("channel action handle was not started")?
+            .submit_command(agentpulse_core::AgentCommand::new(
+                agentpulse_core::CommandId::new(),
+                session_id,
+                channel_id,
+                Timestamp::now_utc(),
+                AgentCommandPayload::Status,
+            ))?;
+
+        wait_until(|| locked(&lock_was_released).is_some())?;
+        assert_eq!(*locked(&lock_was_released), Some(true));
+        let _ = host.stop()?;
+        Ok(())
+    }
+
+    #[test]
+    fn completed_session_starts_another_prompt() -> TestResult {
+        let control = Arc::new(FakeControl::default());
+        seed_lines(&control, LIVE_FIXTURE.lines());
+        let (_provider_id, provider, source, status) = test_provider(Arc::clone(&control))?;
+        let session_id = SessionId::from_str(THREAD_ID)?;
+        let channel_id = ChannelId::new();
+        let actions = Arc::new(Mutex::new(None));
+        let channel = AcceptingChannel {
+            descriptor: ChannelDescriptor::new(
+                channel_id,
+                ChannelKind::new("test")?,
+                NonEmptyText::new("Follow-up Prompt Channel")?,
+                ChannelCapabilities::SESSION_VIEW
+                    | ChannelCapabilities::REMOTE_COMMAND
+                    | ChannelCapabilities::TEXT_INPUT,
+            ),
+        };
+        let mut host = RuntimeHost::new();
+        host.register_provider(provider, source)?;
+        host.register_channel(
+            channel,
+            CapturingChannelSource {
+                handle: Arc::clone(&actions),
+            },
+        )?;
+        let _ = host.start()?;
+        let _ = host.subscribe(channel_id, session_id)?;
+        wait_until(|| snapshot(&status).mapped_events() == 6)?;
+        let completed = host.inspect_bridge(|bridge| {
+            bridge
+                .session_aggregate(session_id)
+                .map(|aggregate| aggregate.session().state())
+        })?;
+        assert_eq!(completed, Some(AgentState::Completed));
+
+        locked(&actions)
+            .as_ref()
+            .ok_or("channel action handle was not started")?
+            .submit_command(agentpulse_core::AgentCommand::new(
+                agentpulse_core::CommandId::new(),
+                session_id,
+                channel_id,
+                Timestamp::now_utc(),
+                AgentCommandPayload::SubmitPrompt {
+                    text: NonEmptyText::new("follow-up after completion")?,
+                    delivery: PromptDelivery::Queue,
+                },
+            ))?;
+
+        wait_until(|| {
+            locked(&control.outgoing).iter().any(|frame| {
+                frame.contains("\"method\":\"turn/start\"")
+                    && frame.contains("follow-up after completion")
+            })
+        })?;
+        let _ = host.stop()?;
+        Ok(())
+    }
+
+    #[test]
+    fn plan_mode_uses_turn_collaboration_mode_without_forged_input() -> TestResult {
+        let control = Arc::new(FakeControl::default());
+        seed_lines(&control, LIVE_FIXTURE.lines().take(2));
+        let (_provider_id, provider, source, _status) = test_provider(Arc::clone(&control))?;
+        let session_id = SessionId::from_str(THREAD_ID)?;
+        let channel_id = ChannelId::new();
+        let actions = Arc::new(Mutex::new(None));
+        let channel = AcceptingChannel {
+            descriptor: ChannelDescriptor::new(
+                channel_id,
+                ChannelKind::new("test")?,
+                NonEmptyText::new("Plan Mode Channel")?,
+                ChannelCapabilities::SESSION_VIEW
+                    | ChannelCapabilities::REMOTE_COMMAND
+                    | ChannelCapabilities::TEXT_INPUT,
+            ),
+        };
+        let mut host = RuntimeHost::new();
+        host.register_provider(provider, source)?;
+        host.register_channel(
+            channel,
+            CapturingChannelSource {
+                handle: Arc::clone(&actions),
+            },
+        )?;
+        let _ = host.start()?;
+        let _ = host.subscribe(channel_id, session_id)?;
+        let handle = locked(&actions)
+            .clone()
+            .ok_or("channel action handle was not started")?;
+        handle.submit_command(agentpulse_core::AgentCommand::new(
+            agentpulse_core::CommandId::new(),
+            session_id,
+            channel_id,
+            Timestamp::now_utc(),
+            AgentCommandPayload::SetPlanMode { enabled: true },
+        ))?;
+        handle.submit_command(agentpulse_core::AgentCommand::new(
+            agentpulse_core::CommandId::new(),
+            session_id,
+            channel_id,
+            Timestamp::now_utc(),
+            AgentCommandPayload::SubmitPrompt {
+                text: NonEmptyText::new("choose a release strategy")?,
+                delivery: PromptDelivery::Queue,
+            },
+        ))?;
+
+        wait_until(|| {
+            locked(&control.outgoing)
+                .iter()
+                .any(|frame| frame.contains("choose a release strategy"))
+        })?;
+        let frame = locked(&control.outgoing)
+            .iter()
+            .find(|frame| frame.contains("choose a release strategy"))
+            .cloned()
+            .ok_or("turn/start request was not captured")?;
+        let request: serde_json::Value = serde_json::from_str(&frame)?;
+        assert_eq!(request["method"], "turn/start");
+        assert_eq!(
+            request["params"]["input"],
+            json!([{"type": "text", "text": "choose a release strategy"}])
+        );
+        assert_eq!(request["params"]["collaborationMode"]["mode"], "plan");
+        assert_eq!(
+            request["params"]["collaborationMode"]["settings"],
+            json!({
+                "model": "gpt-5",
+                "reasoning_effort": null,
+                "developer_instructions": null
+            })
+        );
+        assert!(request["params"].get("config").is_none());
+        let _ = host.stop()?;
+        Ok(())
     }
 
     #[test]
@@ -3745,7 +4023,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn newer_codex_versions_are_accepted_as_unverified() -> TestResult {
-        for version in ["0.152.2", "0.153.0-beta.1", "1.0.0"] {
+        for version in ["0.153.1", "0.154.0-beta.1", "1.0.0"] {
             let actual = format!("codex-cli {version}");
             assert_eq!(
                 classify_codex_version(&actual)?,
@@ -3797,7 +4075,7 @@ mod tests {
     #[test]
     fn managed_runtime_allows_newer_version_past_version_gate() -> TestResult {
         let provider_id = ProviderId::new();
-        let (root, executable) = fake_codex_script("0.152.2")?;
+        let (root, executable) = fake_codex_script("0.153.1")?;
         let config = CodexProviderConfig::new(provider_id, &root, [THREAD_ID])?
             .with_codex_executable(&executable);
         let runtime_directory = config.runtime_directory.clone();

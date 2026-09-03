@@ -141,6 +141,19 @@ fn wait_until_listening(handle: &agentpulse_channel_native::NativeChannelHandle)
     Ok(())
 }
 
+fn wait_until_connected(handle: &agentpulse_channel_native::NativeChannelHandle) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while handle.snapshot().health != agentpulse_channel_native::NativeChannelHealth::Connected
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(20));
+    }
+    if handle.snapshot().health != agentpulse_channel_native::NativeChannelHealth::Connected {
+        return Err("Native Channel did not reach connected state".into());
+    }
+    Ok(())
+}
+
 fn send_client(socket: &mut WebSocket<TcpStream>, message: &NativeClientMessage) -> TestResult {
     let bytes = encode_client_message(message)?;
     let text = String::from_utf8(bytes)?;
@@ -449,6 +462,75 @@ fn independent_client_discovers_subscribes_streams_and_reconnects() -> TestResul
     let snapshot = channel_handle.snapshot();
     assert!(snapshot.connections >= 2);
     assert!(snapshot.disconnects >= 1);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires loopback socket access"]
+fn abrupt_disconnect_with_queued_output_releases_the_client() -> TestResult {
+    let provider_id = ProviderId::new();
+    let channel_id = ChannelId::new();
+    let session_id = SessionId::new();
+    let source_handle = Arc::new(Mutex::new(None));
+    let provider = FakeProviderPort {
+        descriptor: ProviderDescriptor::new(
+            provider_id,
+            ProviderKind::new("native-disconnect-test")?,
+            NonEmptyText::new("Native Disconnect Provider")?,
+            ProviderCapabilities::SESSION_STATE,
+        ),
+    };
+    let provider_source = FakeProviderSource {
+        handle: Arc::clone(&source_handle),
+    };
+    let parts = NativeChannel::build(NativeChannelConfig::new(channel_id))?;
+    let (channel, channel_source, channel_handle) = parts.into_parts();
+    let mut host = RuntimeHost::new();
+    host.register_provider(provider, provider_source)?;
+    host.register_channel(channel, channel_source)?;
+    let _ = host.start()?;
+    let provider_events = locked(&source_handle)
+        .clone()
+        .ok_or("Provider Event handle was not started")?;
+    let session = AgentSession::builder(session_id, provider_id, timestamp(100)?).build()?;
+    let _ = provider_events.publish_event(AgentEvent::new(
+        EventId::new(),
+        session_id,
+        EventSequence::FIRST,
+        timestamp(100)?,
+        AgentEventPayload::SessionStarted(session),
+    )?)?;
+    let address = channel_handle
+        .snapshot()
+        .local_address
+        .ok_or("Native listener did not expose its address")?;
+
+    let mut client = connect_client(address)?;
+    let _ = hello(&mut client, Uuid::now_v7().to_string())?;
+    discover_and_subscribe(
+        &mut client,
+        provider_id,
+        session_id,
+        EventSequence::FIRST,
+        1,
+    )?;
+    wait_until_connected(&channel_handle)?;
+    client.get_mut().shutdown(std::net::Shutdown::Both)?;
+    let _ = provider_events.publish_event(event(
+        session_id,
+        2,
+        AgentEventPayload::Message(AgentMessage::new(
+            AgentMessageLevel::Info,
+            NonEmptyText::new("queued across abrupt disconnect")?,
+        )),
+    )?)?;
+
+    wait_until_listening(&channel_handle)?;
+    let mut reconnected = connect_client(address)?;
+    let _ = hello(&mut reconnected, Uuid::now_v7().to_string())?;
+    wait_until_connected(&channel_handle)?;
+    reconnected.close(None)?;
+    let _ = host.stop()?;
     Ok(())
 }
 

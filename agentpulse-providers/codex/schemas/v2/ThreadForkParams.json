@@ -104,6 +104,13 @@
         "null"
       ]
     },
+    "beforeTurnId": {
+      "description": "Optional turn id to fork before, excluding that turn and all later turns. Cannot be combined with `last_turn_id`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "config": {
       "additionalProperties": true,
       "type": [
@@ -116,6 +123,10 @@
         "string",
         "null"
       ]
+    },
+    "deferGoalContinuation": {
+      "description": "When true, carry the source thread's current goal into the fork without starting its initial automatic continuation. The next explicit turn owns the goal lifecycle, and normal automatic continuation resumes after it.",
+      "type": "boolean"
     },
     "developerInstructions": {
       "type": [
@@ -147,6 +158,31 @@
     "modelProvider": {
       "type": [
         "string",
+        "null"
+      ]
+    },
+    "path": {
+      "default": null,
+      "description": "[UNSTABLE] Specify the rollout path to fork from. If specified, the thread_id param will be ignored.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "permissions": {
+      "description": "Named profile id for the forked thread. Cannot be combined with `sandbox`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "runtimeWorkspaceRoots": {
+      "description": "Replace the thread's runtime workspace roots. Paths must be absolute.",
+      "items": {
+        "$ref": "#/definitions/AbsolutePathBuf"
+      },
+      "type": [
+        "array",
         "null"
       ]
     },

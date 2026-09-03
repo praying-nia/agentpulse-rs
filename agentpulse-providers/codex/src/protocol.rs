@@ -240,7 +240,8 @@ impl ProtocolEngine {
                     "name": "agentpulse",
                     "title": "AgentPulse Codex Provider",
                     "version": env!("CARGO_PKG_VERSION")
-                }
+                },
+                "capabilities": {"experimentalApi": true}
             }
         });
         self.validate_client_request(&value)?;
@@ -574,6 +575,7 @@ mod tests {
         let mut engine = engine()?;
         let (_, request) = engine.initialize_request()?;
         assert!(request.contains("\"method\":\"initialize\""));
+        assert!(request.contains("\"experimentalApi\":true"));
 
         let frame = engine
             .parse_server_text(

@@ -339,6 +339,15 @@
         "modelProvider": {
           "type": "string"
         },
+        "multiAgentMode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/MultiAgentMode"
+            }
+          ],
+          "default": "explicitRequestOnly",
+          "description": "@deprecated Always `explicitRequestOnly`. Use `effort` for Ultra behavior."
+        },
         "personality": {
           "anyOf": [
             {

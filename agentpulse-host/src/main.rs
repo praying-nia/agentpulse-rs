@@ -541,8 +541,7 @@ fn serve(paths: &HostPaths, args: ServeArgs) -> AppResult<()> {
     );
     stop_requested.store(true, Ordering::Release);
     if let Some(relay_connector) = relay_thread
-        && let Err(error) =
-            relay_connector.cancel_and_join(RELAY_CONNECTOR_SHUTDOWN_TIMEOUT)
+        && let Err(error) = relay_connector.cancel_and_join(RELAY_CONNECTOR_SHUTDOWN_TIMEOUT)
     {
         eprintln!("warning: {error}");
     }

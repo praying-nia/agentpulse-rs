@@ -334,7 +334,8 @@ fn run_worker(
             continue;
         }
 
-        if let Some(reason) = lock_delivery(&state).abort_reason.clone() {
+        let abort_reason = { lock_delivery(&state).abort_reason.clone() };
+        if let Some(reason) = abort_reason {
             record_error(&status, reason.clone());
             let _ = active.socket.close(CloseCode::Error, reason);
             disconnect(&actions, &state, &status);
@@ -342,7 +343,11 @@ fn run_worker(
             continue;
         }
 
-        while let Some(frame) = lock_delivery(&state).outgoing.pop_front() {
+        loop {
+            let frame = { lock_delivery(&state).outgoing.pop_front() };
+            let Some(frame) = frame else {
+                break;
+            };
             if let Err(error) = active.socket.send_text(frame) {
                 record_error(&status, error.to_string());
                 disconnect(&actions, &state, &status);
@@ -882,7 +887,8 @@ fn process_command(
             command_id,
         },
     )
-    .map_err(ConnectionFailure::Fatal)
+    .map_err(ConnectionFailure::Fatal)?;
+    Ok(())
 }
 
 fn process_unsubscribe(

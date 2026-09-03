@@ -34,6 +34,8 @@ struct ThreadMapping {
     state: AgentState,
     connection: ConnectionState,
     cwd: Option<NonEmptyText>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
     active_turn_id: Option<String>,
     last_message: Option<NonEmptyText>,
     last_final_message: Option<NonEmptyText>,
@@ -81,6 +83,9 @@ impl CodexEventMapper {
     ) -> Result<(), CodexProviderSourceError> {
         let thread = object_field(result, "thread")?;
         let thread_id = string_field(thread, "id")?;
+        let model = optional_string(result, "model")?.or(optional_string(thread, "model")?);
+        let reasoning_effort = optional_string(result, "reasoningEffort")?
+            .or(optional_string(thread, "reasoningEffort")?);
         let configured_session = self.configured.get(thread_id).copied().ok_or_else(|| {
             CodexProviderSourceError::protocol(format!(
                 "thread/resume returned unconfigured thread {thread_id}"
@@ -115,6 +120,8 @@ impl CodexEventMapper {
                 )?;
             }
             if let Some(mapping) = self.threads.get_mut(thread_id) {
+                mapping.model = model;
+                mapping.reasoning_effort = reasoning_effort;
                 mapping.active_turn_id = latest_in_progress_turn(thread)?;
                 if mapping.active_turn_id.is_none() {
                     mapping.last_message = None;
@@ -160,6 +167,8 @@ impl CodexEventMapper {
                 state,
                 connection,
                 cwd,
+                model,
+                reasoning_effort,
                 active_turn_id: latest_in_progress_turn(thread)?,
                 last_message: None,
                 last_final_message: None,
@@ -257,6 +266,21 @@ impl CodexEventMapper {
             .map(NonEmptyText::as_str)
     }
 
+    pub(crate) fn model_settings_for_session(
+        &self,
+        session_id: SessionId,
+    ) -> Option<(&str, Option<&str>)> {
+        self.threads
+            .values()
+            .find(|mapping| mapping.session_id == session_id)
+            .and_then(|mapping| {
+                mapping
+                    .model
+                    .as_deref()
+                    .map(|model| (model, mapping.reasoning_effort.as_deref()))
+            })
+    }
+
     pub(crate) fn begin_reconnect(
         &mut self,
         events: &ProviderEventHandle,
@@ -338,6 +362,7 @@ impl CodexEventMapper {
         }
 
         let disposition = match method {
+            "thread/settings/updated" => self.thread_settings_updated(thread_id, params)?,
             "thread/status/changed" => {
                 self.status_changed(thread_id, object_field(params, "status")?, events, status)?
             }
@@ -373,6 +398,23 @@ impl CodexEventMapper {
             self.remember_key(key);
         }
         Ok(disposition)
+    }
+
+    fn thread_settings_updated(
+        &mut self,
+        thread_id: &str,
+        params: &Value,
+    ) -> Result<MappingDisposition, CodexProviderSourceError> {
+        let settings = object_field(params, "threadSettings")?;
+        let model = string_field(settings, "model")?.to_owned();
+        let reasoning_effort = optional_string(settings, "effort")?;
+        let mapping = self
+            .threads
+            .get_mut(thread_id)
+            .ok_or_else(|| CodexProviderSourceError::protocol("tracked thread disappeared"))?;
+        mapping.model = Some(model);
+        mapping.reasoning_effort = reasoning_effort;
+        Ok(MappingDisposition::ValidatedUnmapped)
     }
 
     fn item_started(
@@ -848,6 +890,19 @@ fn optional_non_empty_string(
         Some(Value::String(text)) => NonEmptyText::new(text.clone())
             .map(Some)
             .map_err(Into::into),
+        Some(_) => Err(CodexProviderSourceError::protocol(format!(
+            "{field} must be a string or null"
+        ))),
+    }
+}
+
+fn optional_string(
+    value: &Value,
+    field: &'static str,
+) -> Result<Option<String>, CodexProviderSourceError> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.clone())),
         Some(_) => Err(CodexProviderSourceError::protocol(format!(
             "{field} must be a string or null"
         ))),
