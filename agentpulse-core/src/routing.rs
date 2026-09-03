@@ -134,7 +134,10 @@ impl CapabilityRouter {
             .capabilities()
             .contains(request.required_channel_response_capability());
 
-        if provider_accepts_response && channel_collects_response {
+        if request.payload().is_actionable()
+            && provider_accepts_response
+            && channel_collects_response
+        {
             Ok(InteractionRoute::Interactive)
         } else {
             Ok(InteractionRoute::ReadOnly)

@@ -5,6 +5,7 @@
     "request_id": "01890f47-7c00-7000-8000-000000000005",
     "session_id": "01890f47-7c00-7000-8000-000000000003",
     "status": "subscribed",
-    "baseline_sequence": "7"
+    "baseline_sequence": "7",
+    "pending_interaction_count": 0
   }
 }

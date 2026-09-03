@@ -1,4 +1,4 @@
-//! Complete local read-only Native Channel for AgentPulse.
+//! Complete local Native Channel for AgentPulse.
 //!
 //! The Channel serves one explicitly handshaken client over a loopback-only
 //! WebSocket, exposes current Provider/Session discovery, establishes an exact
@@ -76,7 +76,7 @@ impl NativeChannelParts {
     }
 }
 
-/// Factory for the local read-only Native Channel.
+/// Factory for the local Native Channel.
 pub struct NativeChannel;
 
 impl NativeChannel {
@@ -91,7 +91,8 @@ impl NativeChannel {
             NonEmptyText::new("Native Local")?,
             ChannelCapabilities::NOTIFICATION
                 | ChannelCapabilities::SESSION_VIEW
-                | ChannelCapabilities::REALTIME_SYNC,
+                | ChannelCapabilities::REALTIME_SYNC
+                | ChannelCapabilities::APPROVAL,
         )
         .with_version(NonEmptyText::new(env!("CARGO_PKG_VERSION"))?);
         let status = Arc::new(Mutex::new(NativeChannelSnapshot::default()));
@@ -123,7 +124,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn factory_declares_the_exact_read_only_contract() -> Result<(), Box<dyn Error>> {
+    fn factory_declares_the_exact_approval_contract() -> Result<(), Box<dyn Error>> {
         let parts = NativeChannel::build(NativeChannelConfig::new(ChannelId::new()))?;
         let descriptor = parts.port.descriptor();
         assert_eq!(descriptor.kind().as_str(), "native");
@@ -132,6 +133,7 @@ mod tests {
             ChannelCapabilities::NOTIFICATION
                 | ChannelCapabilities::SESSION_VIEW
                 | ChannelCapabilities::REALTIME_SYNC
+                | ChannelCapabilities::APPROVAL
         );
         Ok(())
     }

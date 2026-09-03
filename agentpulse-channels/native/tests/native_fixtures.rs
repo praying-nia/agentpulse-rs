@@ -9,19 +9,22 @@ use serde_json::Value;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
-const CLIENT_FIXTURES: [&str; 4] = [
+const CLIENT_FIXTURES: [&str; 5] = [
     "client_hello.json",
     "discover_sessions.json",
     "subscribe_session.json",
     "unsubscribe_session.json",
+    "submit_interaction_response.json",
 ];
 
-const SERVER_FIXTURES: [&str; 7] = [
+const SERVER_FIXTURES: [&str; 9] = [
     "server_hello.json",
     "sync_started.json",
     "discovery_session.json",
     "sync_completed.json",
     "subscription_result.json",
+    "subscription_interaction.json",
+    "interaction_response_result.json",
     "unsubscription_result.json",
     "error.json",
 ];

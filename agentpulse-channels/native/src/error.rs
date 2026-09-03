@@ -50,9 +50,9 @@ pub enum NativeChannelPortError {
         /// The unexpected Session.
         session_id: SessionId,
     },
-    /// The read-only Channel received an interactive route.
-    #[error("read-only Native Channel received an interactive event route")]
-    InteractiveRoute,
+    /// The Channel received a future event route it cannot encode.
+    #[error("Native Channel received an unsupported future event route")]
+    UnsupportedEventRoute,
     /// Domain JSON encoding failed.
     #[error("failed to encode Native domain delivery: {0}")]
     Protocol(#[from] NativeProtocolError),

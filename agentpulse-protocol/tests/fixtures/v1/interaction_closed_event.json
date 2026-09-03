@@ -1,0 +1,20 @@
+{
+  "protocol_version": 1,
+  "message": {
+    "type": "agent_event",
+    "payload": {
+      "id": "01890f47-7c00-7000-8000-00000000000b",
+      "session_id": "01890f47-7c00-7000-8000-000000000003",
+      "sequence": "8",
+      "occurred_at": "2026-08-29T00:05:00Z",
+      "payload": {
+        "type": "interaction_closed",
+        "interaction": {
+          "request_id": "01890f47-7c00-7000-8000-000000000005",
+          "session_id": "01890f47-7c00-7000-8000-000000000003",
+          "reason": "resolved_elsewhere"
+        }
+      }
+    }
+  }
+}

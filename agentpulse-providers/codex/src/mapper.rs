@@ -11,7 +11,7 @@ use agentpulse_core::{
     ConnectionState, EventId, EventSequence, NonEmptyText, ProviderId, Revision, SessionId,
     SessionOutcome, Timestamp, WorkspaceRef,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
     CodexProviderSourceError,
@@ -43,6 +43,7 @@ pub(crate) struct CodexEventMapper {
     discover_threads: bool,
     configured: BTreeMap<String, SessionId>,
     threads: BTreeMap<String, ThreadMapping>,
+    items: BTreeMap<(String, String, String), Value>,
     recent_keys: BTreeSet<String>,
     recent_order: VecDeque<String>,
 }
@@ -61,6 +62,7 @@ impl CodexEventMapper {
                 .map(|thread| (thread.external_id.as_str().to_owned(), thread.session_id))
                 .collect(),
             threads: BTreeMap::new(),
+            items: BTreeMap::new(),
             recent_keys: BTreeSet::new(),
             recent_order: VecDeque::new(),
         }
@@ -262,6 +264,8 @@ impl CodexEventMapper {
                 }
             }
             "turn/started" => self.turn_started(thread_id, params, events, status)?,
+            "item/started" => self.item_started(thread_id, params)?,
+            "item/fileChange/patchUpdated" => self.file_change_patch_updated(thread_id, params)?,
             "item/completed" => self.item_completed(thread_id, params, events, status)?,
             "turn/completed" => self.turn_completed(thread_id, params, events, status)?,
             _ => MappingDisposition::ValidatedUnmapped,
@@ -273,6 +277,49 @@ impl CodexEventMapper {
             self.remember_key(key);
         }
         Ok(disposition)
+    }
+
+    fn item_started(
+        &mut self,
+        thread_id: &str,
+        params: &Value,
+    ) -> Result<MappingDisposition, CodexProviderSourceError> {
+        let turn_id = string_field(params, "turnId")?;
+        self.ensure_active_turn(thread_id, turn_id)?;
+        let item = object_field(params, "item")?;
+        let item_id = string_field(item, "id")?;
+        self.items.insert(
+            (thread_id.to_owned(), turn_id.to_owned(), item_id.to_owned()),
+            item.clone(),
+        );
+        Ok(MappingDisposition::ValidatedUnmapped)
+    }
+
+    fn file_change_patch_updated(
+        &mut self,
+        thread_id: &str,
+        params: &Value,
+    ) -> Result<MappingDisposition, CodexProviderSourceError> {
+        let turn_id = string_field(params, "turnId")?;
+        let item_id = string_field(params, "itemId")?;
+        self.ensure_active_turn(thread_id, turn_id)?;
+        let changes = params
+            .get("changes")
+            .filter(|value| value.is_array())
+            .ok_or_else(|| CodexProviderSourceError::protocol("changes must be an array"))?
+            .clone();
+        let key = (thread_id.to_owned(), turn_id.to_owned(), item_id.to_owned());
+        let item = self.items.entry(key).or_insert_with(|| {
+            json!({
+                "id": item_id,
+                "type": "fileChange",
+                "changes": [],
+            })
+        });
+        item.as_object_mut()
+            .ok_or_else(|| CodexProviderSourceError::protocol("cached item must be an object"))?
+            .insert("changes".to_owned(), changes);
+        Ok(MappingDisposition::ValidatedUnmapped)
     }
 
     fn status_changed(
@@ -387,6 +434,9 @@ impl CodexEventMapper {
         let turn_id = string_field(params, "turnId")?;
         self.ensure_active_turn(thread_id, turn_id)?;
         let item = object_field(params, "item")?;
+        let item_id = string_field(item, "id")?;
+        self.items
+            .remove(&(thread_id.to_owned(), turn_id.to_owned(), item_id.to_owned()));
         if string_field(item, "type")? != "agentMessage" {
             return Ok(MappingDisposition::ValidatedUnmapped);
         }
@@ -470,7 +520,32 @@ impl CodexEventMapper {
         if let Some(mapping) = self.threads.get_mut(thread_id) {
             mapping.active_turn_id = None;
         }
+        self.items.retain(|(item_thread_id, item_turn_id, _), _| {
+            item_thread_id != thread_id || item_turn_id != turn_id
+        });
         Ok(MappingDisposition::Mapped)
+    }
+
+    pub(crate) fn approval_context(
+        &mut self,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+    ) -> Result<Option<(SessionId, Option<Value>)>, CodexProviderSourceError> {
+        if !self.configured.contains_key(thread_id) || !self.threads.contains_key(thread_id) {
+            return Ok(None);
+        }
+        self.ensure_active_turn(thread_id, turn_id)?;
+        let session_id = self
+            .threads
+            .get(thread_id)
+            .map(|mapping| mapping.session_id)
+            .ok_or_else(|| CodexProviderSourceError::protocol("tracked thread disappeared"))?;
+        let item = self
+            .items
+            .get(&(thread_id.to_owned(), turn_id.to_owned(), item_id.to_owned()))
+            .cloned();
+        Ok(Some((session_id, item)))
     }
 
     fn ensure_active_turn(
@@ -494,7 +569,7 @@ impl CodexEventMapper {
         }
     }
 
-    fn publish_payload(
+    pub(crate) fn publish_payload(
         &mut self,
         thread_id: &str,
         occurred_at: Timestamp,

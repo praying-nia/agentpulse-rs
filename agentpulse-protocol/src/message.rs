@@ -1,8 +1,8 @@
 //! Transport-independent protocol messages.
 
 use agentpulse_core::{
-    AgentCommand, AgentEvent, AgentSession, ChannelDescriptor, InteractionResponse,
-    ProviderDescriptor,
+    AgentCommand, AgentEvent, AgentSession, ChannelDescriptor, InteractionRequest,
+    InteractionResponse, ProviderDescriptor,
 };
 
 /// A validated semantic message carried by a versioned protocol envelope.
@@ -17,6 +17,8 @@ pub enum ProtocolMessage {
     AgentSession(AgentSession),
     /// Carries one normalized, ordered Agent event.
     AgentEvent(AgentEvent),
+    /// Carries one current Provider-originated interaction request.
+    InteractionRequest(InteractionRequest),
     /// Carries a Channel-originated interaction response.
     InteractionResponse(InteractionResponse),
     /// Carries a Channel-originated command toward a Provider.

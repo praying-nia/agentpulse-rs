@@ -1,8 +1,8 @@
 # AgentPulse Codex Provider
 
-`agentpulse-provider-codex` is a complete read-only Provider for Codex threads. It owns a schema-pinned Codex App Server, exposes that server over a private Unix socket, validates the complete raw protocol, and maps live thread activity into AgentPulse sessions.
+`agentpulse-provider-codex` observes Codex threads and writes command/file approval decisions back to Codex. It owns a schema-pinned Codex App Server and a private Unix WebSocket proxy for `codex --remote` clients. The proxy preserves the desktop fallback while allowing a phone decision to return on the exact connection that owns the approval request.
 
-`agentpulse-provider-codex` 是面向 Codex Thread 的完整只读 Provider。它托管固定 Schema 的 Codex App Server，通过私有 Unix Socket 暴露共享端点，校验完整原始协议，并将实时 Thread 活动映射为 AgentPulse Session。
+`agentpulse-provider-codex` 观察 Codex Thread，并把命令/文件审批决定回写给 Codex。它托管固定 Schema 的 Codex App Server，并为 `codex --remote` 客户端提供私有 Unix WebSocket 代理。代理保留桌面审批兜底，同时让手机决定回到拥有该审批请求的原始连接。
 
 ## Compatibility / 兼容范围
 
@@ -10,7 +10,7 @@
 - Platforms: Linux and macOS managed Unix sockets / Linux 与 macOS 受管 Unix Socket。
 - Input: explicitly configured UUIDv7 thread IDs, or ephemeral discovery of threads opened through the same managed App Server / 显式配置的 UUIDv7 Thread ID，或对同一受管 App Server 中已打开 Thread 的临时发现。
 - Events: live state, agent messages, connection changes, and turn outcomes / 实时状态、Agent 消息、连接变化与 Turn 结果。
-- Write-back: unsupported; server requests receive an explicit JSON-RPC read-only error / 不支持回写；服务端请求会收到明确的 JSON-RPC 只读错误。
+- Write-back: command execution and file change approvals, including the exact session and policy-amendment decisions offered by Codex; Agent commands remain unsupported / 支持命令执行与文件修改审批，包括 Codex 实际提供的 Session 与策略 Amendment 决定；Agent Command 仍不支持。
 
 The bundled schema was generated with:
 
@@ -51,7 +51,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 ```
 
-Start RuntimeHost before connecting another client with `codex --remote <uri>`. The Provider resumes every configured thread before reporting startup success. It does not replay turns included in `thread/resume`; only notifications observed after the subscription boundary become AgentPulse events.
+Start RuntimeHost before connecting another client with `codex --remote <uri>`. The URI names the Provider-owned proxy, not the App Server's upstream socket. The Provider resumes every configured thread before reporting startup success. It does not replay turns included in `thread/resume`; only notifications observed after the subscription boundary become AgentPulse events.
+
+Approvals are correlated entirely in runtime memory. AgentPulse adds no approval timeout: a request stays pending until Codex resolves it or its owning item, turn, thread, connection, or Provider runtime ends. A restart never restores pending approvals.
 
 Use `CodexProviderConfig::discovering` instead when the Provider must start with
 no saved Thread IDs and follow `thread/started` events from a Remote TUI. That

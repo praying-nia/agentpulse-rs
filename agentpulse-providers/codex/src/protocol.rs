@@ -20,6 +20,8 @@ pub(crate) struct ProtocolSchema {
     jsonrpc_error: Validator,
     initialize_response: Validator,
     thread_resume_response: Validator,
+    command_approval_response: Validator,
+    file_approval_response: Validator,
 }
 
 impl ProtocolSchema {
@@ -39,6 +41,14 @@ impl ProtocolSchema {
             jsonrpc_error: compile_ref(&schema, "#/definitions/JSONRPCError")?,
             initialize_response: compile_ref(&schema, "#/definitions/InitializeResponse")?,
             thread_resume_response: compile_ref(&schema, "#/definitions/v2/ThreadResumeResponse")?,
+            command_approval_response: compile_ref(
+                &schema,
+                "#/definitions/CommandExecutionRequestApprovalResponse",
+            )?,
+            file_approval_response: compile_ref(
+                &schema,
+                "#/definitions/FileChangeRequestApprovalResponse",
+            )?,
         })
     }
 }
@@ -74,7 +84,7 @@ pub(crate) enum RequestId {
 }
 
 impl RequestId {
-    fn from_value(value: &Value) -> Result<Self, CodexProviderSourceError> {
+    pub(crate) fn from_value(value: &Value) -> Result<Self, CodexProviderSourceError> {
         if let Some(value) = value.as_i64() {
             Ok(Self::Number(value))
         } else if let Some(value) = value.as_str() {
@@ -118,6 +128,7 @@ pub(crate) enum ServerFrame {
     Request {
         id: RequestId,
         method: String,
+        params: Value,
     },
     Response {
         id: RequestId,
@@ -130,6 +141,20 @@ pub(crate) enum ServerFrame {
         code: i64,
         message: String,
     },
+}
+
+#[derive(Debug)]
+pub(crate) enum ObservedServerFrame {
+    Notification {
+        method: String,
+        params: Value,
+    },
+    Request {
+        id: RequestId,
+        method: String,
+        params: Value,
+    },
+    PassThrough,
 }
 
 #[derive(Clone)]
@@ -200,10 +225,39 @@ impl ProtocolEngine {
             "id": id.into_value(),
             "error": {
                 "code": -32601,
-                "message": format!("AgentPulse read-only client does not implement {method}")
+                "message": format!("AgentPulse does not implement {method}")
             }
         });
         validate(&self.schema.jsonrpc_error, &value, "client error response")?;
+        serialize(&value)
+    }
+
+    pub(crate) fn approval_response(
+        &self,
+        id: RequestId,
+        method: &str,
+        decision: Value,
+    ) -> Result<String, CodexProviderSourceError> {
+        let result = json!({"decision": decision});
+        let validator = match method {
+            "item/commandExecution/requestApproval" => &self.schema.command_approval_response,
+            "item/fileChange/requestApproval" => &self.schema.file_approval_response,
+            _ => {
+                return Err(CodexProviderSourceError::protocol(format!(
+                    "cannot encode a response for unsupported approval method {method}"
+                )));
+            }
+        };
+        validate(validator, &result, "approval response result")?;
+        let value = json!({
+            "id": id.into_value(),
+            "result": result,
+        });
+        validate(
+            &self.schema.jsonrpc_response,
+            &value,
+            "client approval response",
+        )?;
         serialize(&value)
     }
 
@@ -219,6 +273,66 @@ impl ProtocolEngine {
             ))
         })?;
         self.parse_server_value(value)
+    }
+
+    pub(crate) fn parse_observed_server_text(
+        &self,
+        text: &str,
+    ) -> Result<ObservedServerFrame, CodexProviderSourceError> {
+        let value: Value = serde_json::from_str(text).map_err(|error| {
+            CodexProviderSourceError::protocol(format!(
+                "invalid JSON at line {}, column {}",
+                error.line(),
+                error.column()
+            ))
+        })?;
+        let object = value.as_object().ok_or_else(|| {
+            CodexProviderSourceError::protocol("protocol frame must be a JSON object")
+        })?;
+        let has_method = object.contains_key("method");
+        let has_id = object.contains_key("id");
+        let has_result = object.contains_key("result");
+        let has_error = object.contains_key("error");
+
+        if has_method {
+            if has_result || has_error {
+                return Err(CodexProviderSourceError::protocol(
+                    "method frame cannot also contain result or error",
+                ));
+            }
+            let method = object
+                .get("method")
+                .and_then(Value::as_str)
+                .ok_or_else(|| CodexProviderSourceError::protocol("method must be a string"))?
+                .to_owned();
+            let params = value.get("params").cloned().unwrap_or(Value::Null);
+            if has_id {
+                validate(&self.schema.server_request, &value, "server request")?;
+                Ok(ObservedServerFrame::Request {
+                    id: RequestId::from_value(&value["id"])?,
+                    method,
+                    params,
+                })
+            } else {
+                validate(
+                    &self.schema.server_notification,
+                    &value,
+                    "server notification",
+                )?;
+                Ok(ObservedServerFrame::Notification { method, params })
+            }
+        } else if has_id && has_result != has_error {
+            if has_result {
+                validate(&self.schema.jsonrpc_response, &value, "server response")?;
+            } else {
+                validate(&self.schema.jsonrpc_error, &value, "server error response")?;
+            }
+            Ok(ObservedServerFrame::PassThrough)
+        } else {
+            Err(CodexProviderSourceError::protocol(
+                "frame is not one unambiguous request, notification, response, or error",
+            ))
+        }
     }
 
     fn parse_server_value(
@@ -247,7 +361,11 @@ impl ProtocolEngine {
             if has_id {
                 validate(&self.schema.server_request, &value, "server request")?;
                 let id = RequestId::from_value(&value["id"])?;
-                Ok(ServerFrame::Request { id, method })
+                Ok(ServerFrame::Request {
+                    id,
+                    method,
+                    params: value.get("params").cloned().unwrap_or(Value::Null),
+                })
             } else {
                 validate(
                     &self.schema.server_notification,
@@ -397,19 +515,67 @@ mod tests {
     }
 
     #[test]
-    fn validates_and_rejects_supported_server_requests_explicitly() -> TestResult {
+    fn observer_validates_unowned_responses_without_correlating_them() -> TestResult {
+        let engine = engine()?;
+        assert!(matches!(
+            engine.parse_observed_server_text(r#"{"id":99,"result":{"value":true}}"#)?,
+            ObservedServerFrame::PassThrough
+        ));
+        assert!(matches!(
+            engine.parse_observed_server_text(
+                r#"{"id":"approval-1","method":"item/commandExecution/requestApproval","params":{"threadId":"019976a4-00f0-7312-b36c-d01f9c5c06f6","turnId":"019976a4-00f1-76c0-b845-e1509dc4e3de","itemId":"019976a4-00f2-741b-870f-21b4fb983746","startedAtMs":1000,"reason":null}}"#,
+            )?,
+            ObservedServerFrame::Request { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn validates_approval_requests_and_every_supported_response_shape() -> TestResult {
         let mut engine = engine()?;
         let request = engine
             .parse_server_text(
                 r#"{"id":"approval-1","method":"item/commandExecution/requestApproval","params":{"threadId":"019976a4-00f0-7312-b36c-d01f9c5c06f6","turnId":"019976a4-00f1-76c0-b845-e1509dc4e3de","itemId":"019976a4-00f2-741b-870f-21b4fb983746","startedAtMs":1000,"reason":null}}"#,
             )?;
-        let id = match request {
-            ServerFrame::Request { id, .. } => id,
+        let (id, params) = match request {
+            ServerFrame::Request { id, params, .. } => (id, params),
             _ => return Err("expected server request".into()),
         };
-        let response =
-            engine.unsupported_request_response(id, "item/commandExecution/requestApproval")?;
-        assert!(response.contains("-32601"));
+        assert_eq!(params["startedAtMs"], 1_000);
+        let response = engine.approval_response(
+            id,
+            "item/commandExecution/requestApproval",
+            json!({
+                "acceptWithExecpolicyAmendment": {
+                    "execpolicy_amendment": ["cargo", "test"]
+                }
+            }),
+        )?;
+        assert!(response.contains("acceptWithExecpolicyAmendment"));
+        let network = engine.approval_response(
+            RequestId::String("approval-2".to_owned()),
+            "item/commandExecution/requestApproval",
+            json!({
+                "applyNetworkPolicyAmendment": {
+                    "network_policy_amendment": {"action": "allow", "host": "example.com"}
+                }
+            }),
+        )?;
+        assert!(network.contains("applyNetworkPolicyAmendment"));
+        for decision in ["accept", "acceptForSession", "decline", "cancel"] {
+            let response = engine.approval_response(
+                RequestId::String(format!("command-{decision}")),
+                "item/commandExecution/requestApproval",
+                json!(decision),
+            )?;
+            assert!(response.contains(decision));
+            let response = engine.approval_response(
+                RequestId::String(format!("file-{decision}")),
+                "item/fileChange/requestApproval",
+                json!(decision),
+            )?;
+            assert!(response.contains(decision));
+        }
         Ok(())
     }
 }

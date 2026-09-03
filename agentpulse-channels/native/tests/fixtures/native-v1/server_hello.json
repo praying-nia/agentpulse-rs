@@ -12,7 +12,7 @@
           "kind": "native",
           "display_name": "Native Local",
           "version": "0.1.0",
-          "capabilities": ["notification", "session_view", "realtime_sync"]
+          "capabilities": ["notification", "session_view", "approval", "realtime_sync"]
         }
       }
     },

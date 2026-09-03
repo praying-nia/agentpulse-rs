@@ -17,9 +17,9 @@ mod runtime;
 
 pub use bridge::{
     Bridge, ChannelActionError, ChannelDeliveryError, ChannelDeliveryKind, ChannelDeliveryResult,
-    ChannelDiscoverySnapshot, DiscoveredSession, EndpointRegistrationError, ProviderEventError,
-    ProviderEventOutcome, ProviderEventReport, ProviderHandoffKind, SubscribeOutcome,
-    SubscriptionError, UnsubscribeOutcome,
+    ChannelDiscoverySnapshot, ChannelSessionBaseline, DiscoveredSession, EndpointRegistrationError,
+    ProviderEventError, ProviderEventOutcome, ProviderEventReport, ProviderHandoffKind,
+    RoutedInteractionRequest, SubscribeOutcome, SubscriptionError, UnsubscribeOutcome,
 };
 pub use port::{ChannelActionSink, ChannelPort, ProviderEventSink, ProviderPort};
 pub use runtime::{

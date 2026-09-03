@@ -23,6 +23,7 @@ pub(super) enum MessageDto {
     ChannelDescriptor(ChannelDescriptorDto),
     AgentSession(AgentSessionDto),
     AgentEvent(AgentEventDto),
+    InteractionRequest(InteractionRequestDto),
     InteractionResponse(InteractionResponseDto),
     AgentCommand(AgentCommandDto),
 }
@@ -167,6 +168,9 @@ pub(super) enum AgentEventPayloadDto {
     InteractionResponded {
         response: InteractionResponseDto,
     },
+    InteractionClosed {
+        interaction: InteractionClosedDto,
+    },
     CommandIssued {
         command: AgentCommandDto,
     },
@@ -293,7 +297,10 @@ pub(super) struct InteractionRequestDto {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum InteractionRequestPayloadDto {
     Approval {
-        allowed_scopes: Vec<ApprovalScopeDto>,
+        subject: ApprovalSubjectDto,
+        options: Vec<ApprovalOptionDto>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unavailable_reason: Option<String>,
     },
     Choice {
         options: Vec<ChoiceOptionDto>,
@@ -306,11 +313,75 @@ pub(super) enum InteractionRequestPayloadDto {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum ApprovalSubjectDto {
+    Command {
+        kind: ApprovalCommandKindDto,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        network: Option<ApprovalNetworkContextDto>,
+    },
+    FileChange {
+        changes: Vec<ApprovalFileChangeDto>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grant_root: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum ApprovalScopeDto {
-    Once,
-    Session,
+pub(super) enum ApprovalCommandKindDto {
+    Command,
+    WriteStdin,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ApprovalNetworkContextDto {
+    pub(super) host: String,
+    pub(super) protocol: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ApprovalFileChangeDto {
+    pub(super) path: String,
+    pub(super) kind: ApprovalFileChangeKindDto,
+    pub(super) diff: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ApprovalFileChangeKindDto {
+    Add,
+    Delete,
+    Update,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ApprovalOptionDto {
+    pub(super) id: String,
+    pub(super) disposition: ApprovalDispositionDto,
+    pub(super) label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) description: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ApprovalDispositionDto {
+    Approve,
+    Reject,
+    Cancel,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -335,21 +406,24 @@ pub(super) struct InteractionResponseDto {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum InteractionResponsePayloadDto {
-    Approval { decision: ApprovalDecisionDto },
+    Approval { option_id: String },
     Choice { option_ids: Vec<String> },
     Text { text: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub(super) enum ApprovalDecisionDto {
-    Approved {
-        scope: ApprovalScopeDto,
-    },
-    Rejected {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
-    },
+#[serde(deny_unknown_fields)]
+pub(super) struct InteractionClosedDto {
+    pub(super) request_id: String,
+    pub(super) session_id: String,
+    pub(super) reason: InteractionCloseReasonDto,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum InteractionCloseReasonDto {
+    ResolvedElsewhere,
+    ProviderCancelled,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

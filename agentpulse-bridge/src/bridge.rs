@@ -9,8 +9,8 @@ use std::{
 use agentpulse_core::{
     AgentCommand, AgentEvent, AgentEventPayload, AgentSession, ApplyOutcome, CapabilityRouteError,
     CapabilityRouter, ChannelCapabilities, ChannelDescriptor, ChannelId, EventSequence,
-    InteractionId, InteractionResponse, ProviderDescriptor, ProviderId, ReduceError,
-    SessionAggregate, SessionAggregateConfig, SessionId,
+    InteractionId, InteractionRequest, InteractionResponse, InteractionRoute, ProviderDescriptor,
+    ProviderId, ReduceError, SessionAggregate, SessionAggregateConfig, SessionId,
 };
 
 use crate::{
@@ -234,12 +234,85 @@ pub enum SubscribeOutcome {
         session_view_delivered: bool,
         /// The last Event already represented by the synchronized baseline.
         baseline_sequence: EventSequence,
+        /// Interactions included in the synchronized baseline.
+        pending_interaction_count: usize,
     },
     /// The exact subscription was already active; no view was redelivered.
     AlreadySubscribed {
         /// The current Aggregate cursor at the time of the repeated request.
         current_sequence: EventSequence,
     },
+}
+
+/// One pending interaction and its centralized route in a subscription baseline.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoutedInteractionRequest {
+    request: InteractionRequest,
+    route: InteractionRoute,
+}
+
+impl RoutedInteractionRequest {
+    fn new(request: InteractionRequest, route: InteractionRoute) -> Self {
+        Self { request, route }
+    }
+
+    /// Borrows the pending interaction request.
+    #[must_use]
+    pub const fn request(&self) -> &InteractionRequest {
+        &self.request
+    }
+
+    /// Returns the centralized route for this Channel.
+    #[must_use]
+    pub const fn route(&self) -> InteractionRoute {
+        self.route
+    }
+}
+
+/// Atomic current state delivered before a new live subscription becomes active.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChannelSessionBaseline {
+    session: AgentSession,
+    sequence: EventSequence,
+    pending_interactions: Vec<RoutedInteractionRequest>,
+}
+
+impl ChannelSessionBaseline {
+    fn new(
+        session: AgentSession,
+        sequence: EventSequence,
+        pending_interactions: Vec<RoutedInteractionRequest>,
+    ) -> Self {
+        Self {
+            session,
+            sequence,
+            pending_interactions,
+        }
+    }
+
+    /// Borrows the current Session snapshot.
+    #[must_use]
+    pub const fn session(&self) -> &AgentSession {
+        &self.session
+    }
+
+    /// Returns the Event cursor represented by the baseline.
+    #[must_use]
+    pub const fn sequence(&self) -> EventSequence {
+        self.sequence
+    }
+
+    /// Borrows pending interactions in stable identifier order.
+    #[must_use]
+    pub fn pending_interactions(&self) -> &[RoutedInteractionRequest] {
+        &self.pending_interactions
+    }
+
+    /// Consumes the baseline and returns its Session snapshot.
+    #[must_use]
+    pub fn into_session(self) -> AgentSession {
+        self.session
+    }
 }
 
 /// One current Session entry exposed to a Channel during discovery.
@@ -324,6 +397,8 @@ pub enum SubscriptionError {
     },
     /// The Channel rejected the initial current Session view.
     InitialSessionHandoff(ChannelDeliveryError),
+    /// A pending interaction could not be routed into the baseline.
+    BaselineRoute(CapabilityRouteError),
 }
 
 impl fmt::Display for SubscriptionError {
@@ -344,6 +419,7 @@ impl fmt::Display for SubscriptionError {
                     "initial subscription synchronization failed: {source}"
                 )
             }
+            Self::BaselineRoute(source) => source.fmt(formatter),
         }
     }
 }
@@ -352,6 +428,7 @@ impl Error for SubscriptionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InitialSessionHandoff(source) => Some(source),
+            Self::BaselineRoute(source) => Some(source),
             Self::ChannelNotFound { .. } | Self::SessionNotFound { .. } => None,
         }
     }
@@ -730,6 +807,35 @@ impl Bridge {
             });
         }
 
+        let channel_descriptor = self
+            .channels
+            .get(&channel_id)
+            .ok_or(SubscriptionError::ChannelNotFound { channel_id })?
+            .descriptor()
+            .clone();
+        let provider_descriptor = self
+            .providers
+            .get(&session.provider_id())
+            .ok_or(SubscriptionError::SessionNotFound { session_id })?
+            .descriptor()
+            .clone();
+        let pending_interactions = aggregate
+            .pending_interactions()
+            .map(|request| {
+                CapabilityRouter::interaction_route(
+                    &provider_descriptor,
+                    &channel_descriptor,
+                    &session,
+                    request,
+                )
+                .map(|route| RoutedInteractionRequest::new(request.clone(), route))
+                .map_err(SubscriptionError::BaselineRoute)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let pending_interaction_count = pending_interactions.len();
+        let baseline =
+            ChannelSessionBaseline::new(session, baseline_sequence, pending_interactions);
+
         let channel = self
             .channels
             .get_mut(&channel_id)
@@ -739,13 +845,15 @@ impl Bridge {
             .capabilities()
             .contains(ChannelCapabilities::SESSION_VIEW);
         if session_view_delivered {
-            channel.deliver_session(session).map_err(|source| {
-                SubscriptionError::InitialSessionHandoff(ChannelDeliveryError::new(
-                    channel_id,
-                    ChannelDeliveryKind::Session,
-                    source,
-                ))
-            })?;
+            channel
+                .deliver_session_baseline(baseline)
+                .map_err(|source| {
+                    SubscriptionError::InitialSessionHandoff(ChannelDeliveryError::new(
+                        channel_id,
+                        ChannelDeliveryKind::Session,
+                        source,
+                    ))
+                })?;
         }
 
         let _ = self
@@ -756,6 +864,7 @@ impl Bridge {
         Ok(SubscribeOutcome::Subscribed {
             session_view_delivered,
             baseline_sequence,
+            pending_interaction_count,
         })
     }
 

@@ -2,7 +2,7 @@
 
 use std::sync::MutexGuard;
 
-use agentpulse_bridge::ChannelPort;
+use agentpulse_bridge::{ChannelPort, ChannelSessionBaseline};
 use agentpulse_core::{AgentEvent, AgentSession, ChannelDescriptor, ChannelEventRoute, SessionId};
 use agentpulse_protocol::ProtocolMessage;
 
@@ -13,7 +13,7 @@ use crate::{
     status::lock_status,
 };
 
-/// A read-only Channel Port that queues normalized domain frames for one client.
+/// A Channel Port that queues normalized domain frames for one client.
 pub struct NativeChannelPort {
     descriptor: ChannelDescriptor,
     state: SharedDeliveryState,
@@ -41,7 +41,7 @@ impl NativeChannelPort {
             match event_route {
                 Some(route) => NativeDeliveryContext::LiveEvent {
                     route: NativeEventRoute::from_core(route)
-                        .map_err(|_| NativeChannelPortError::InteractiveRoute)?,
+                        .map_err(|_| NativeChannelPortError::UnsupportedEventRoute)?,
                 },
                 None if pending.frames.is_empty() => NativeDeliveryContext::SubscriptionSession {
                     request_id: pending.request_id.clone(),
@@ -52,7 +52,7 @@ impl NativeChannelPort {
             match event_route {
                 Some(route) => NativeDeliveryContext::LiveEvent {
                     route: NativeEventRoute::from_core(route)
-                        .map_err(|_| NativeChannelPortError::InteractiveRoute)?,
+                        .map_err(|_| NativeChannelPortError::UnsupportedEventRoute)?,
                 },
                 None => NativeDeliveryContext::LiveSession,
             }
@@ -60,7 +60,10 @@ impl NativeChannelPort {
             return Err(NativeChannelPortError::SessionNotSubscribed { session_id });
         };
 
-        let frame = encoded_text(&NativeServerMessage::Domain { context, message })?;
+        let frame = encoded_text(&NativeServerMessage::Domain {
+            context,
+            message: Box::new(message),
+        })?;
         let queue_is_full = state.queued_len() >= state.capacity;
         let capacity = state.capacity;
         if let Some(pending) = state
@@ -108,6 +111,68 @@ impl ChannelPort for NativeChannelPort {
 
     fn deliver_session(&mut self, session: AgentSession) -> Result<(), Self::Error> {
         self.deliver(session.id(), ProtocolMessage::AgentSession(session), None)
+    }
+
+    fn deliver_session_baseline(
+        &mut self,
+        baseline: ChannelSessionBaseline,
+    ) -> Result<(), Self::Error> {
+        let session_id = baseline.session().id();
+        let request_id = {
+            let state = lock_delivery(&self.state);
+            let pending = state
+                .client
+                .as_ref()
+                .and_then(|client| client.pending.as_ref())
+                .ok_or(NativeChannelPortError::NoActiveClient)?;
+            if pending.session_id != session_id {
+                return Err(NativeChannelPortError::SessionNotSubscribed { session_id });
+            }
+            pending.request_id.clone()
+        };
+
+        let mut frames = Vec::with_capacity(baseline.pending_interactions().len() + 1);
+        frames.push(encoded_text(&NativeServerMessage::Domain {
+            context: NativeDeliveryContext::SubscriptionSession {
+                request_id: request_id.clone(),
+            },
+            message: Box::new(ProtocolMessage::AgentSession(baseline.session().clone())),
+        })?);
+        for interaction in baseline.pending_interactions() {
+            frames.push(encoded_text(&NativeServerMessage::Domain {
+                context: NativeDeliveryContext::SubscriptionInteraction {
+                    request_id: request_id.clone(),
+                    route: NativeEventRoute::from_core(ChannelEventRoute::Interaction(
+                        interaction.route(),
+                    ))
+                    .map_err(|_| NativeChannelPortError::UnsupportedEventRoute)?,
+                },
+                message: Box::new(ProtocolMessage::InteractionRequest(
+                    interaction.request().clone(),
+                )),
+            })?);
+        }
+
+        let mut state = lock_delivery(&self.state);
+        let queued_len = state.queued_len();
+        let capacity = state.capacity;
+        if queued_len.saturating_add(frames.len()) > capacity {
+            state.abort_reason = Some(format!(
+                "Native client output queue reached its {}-frame limit",
+                capacity
+            ));
+            return Err(NativeChannelPortError::QueueFull { capacity });
+        }
+        let pending = state
+            .client
+            .as_mut()
+            .and_then(|client| client.pending.as_mut())
+            .filter(|pending| pending.session_id == session_id && pending.request_id == request_id)
+            .ok_or(NativeChannelPortError::NoActiveClient)?;
+        pending.frames.extend(frames);
+        lock_status(&state.status).domain_frames +=
+            1 + baseline.pending_interactions().len() as u64;
+        Ok(())
     }
 }
 

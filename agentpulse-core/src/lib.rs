@@ -48,11 +48,13 @@ pub use event::{
     ToolOutcome,
 };
 pub use id::{
-    ChannelId, ChoiceOptionId, CommandId, EventId, InteractionId, PlanItemId, ProviderId,
-    SessionId, ToolCallId,
+    ApprovalOptionId, ChannelId, ChoiceOptionId, CommandId, EventId, InteractionId, PlanItemId,
+    ProviderId, SessionId, ToolCallId,
 };
 pub use interaction::{
-    ApprovalDecision, ApprovalRequest, ApprovalScope, ChoiceOption, ChoiceRequest, ChoiceSelection,
+    ApprovalCommandKind, ApprovalDisposition, ApprovalFileChange, ApprovalFileChangeKind,
+    ApprovalNetworkContext, ApprovalOption, ApprovalRequest, ApprovalSelection, ApprovalSubject,
+    ChoiceOption, ChoiceRequest, ChoiceSelection, InteractionCloseReason, InteractionClosed,
     InteractionRequest, InteractionRequestPayload, InteractionResponse, InteractionResponsePayload,
     TextInputRequest,
 };

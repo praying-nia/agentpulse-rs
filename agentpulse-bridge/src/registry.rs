@@ -7,7 +7,7 @@ use agentpulse_core::{
     InteractionResponse, ProviderDescriptor,
 };
 
-use crate::{ChannelPort, ProviderPort};
+use crate::{ChannelPort, ChannelSessionBaseline, ProviderPort};
 
 pub(crate) type BoxAdapterError = Box<dyn Error + Send + Sync + 'static>;
 
@@ -78,6 +78,11 @@ trait ErasedChannelPort: Send {
     ) -> Result<(), BoxAdapterError>;
 
     fn deliver_session(&mut self, session: AgentSession) -> Result<(), BoxAdapterError>;
+
+    fn deliver_session_baseline(
+        &mut self,
+        baseline: ChannelSessionBaseline,
+    ) -> Result<(), BoxAdapterError>;
 }
 
 impl<C> ErasedChannelPort for C
@@ -95,6 +100,14 @@ where
 
     fn deliver_session(&mut self, session: AgentSession) -> Result<(), BoxAdapterError> {
         ChannelPort::deliver_session(self, session)
+            .map_err(|source| Box::new(source) as BoxAdapterError)
+    }
+
+    fn deliver_session_baseline(
+        &mut self,
+        baseline: ChannelSessionBaseline,
+    ) -> Result<(), BoxAdapterError> {
+        ChannelPort::deliver_session_baseline(self, baseline)
             .map_err(|source| Box::new(source) as BoxAdapterError)
     }
 }
@@ -129,5 +142,12 @@ impl RegisteredChannel {
 
     pub(crate) fn deliver_session(&mut self, session: AgentSession) -> Result<(), BoxAdapterError> {
         self.port.deliver_session(session)
+    }
+
+    pub(crate) fn deliver_session_baseline(
+        &mut self,
+        baseline: ChannelSessionBaseline,
+    ) -> Result<(), BoxAdapterError> {
+        self.port.deliver_session_baseline(baseline)
     }
 }

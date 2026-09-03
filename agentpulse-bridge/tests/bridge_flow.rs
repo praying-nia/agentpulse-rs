@@ -564,6 +564,7 @@ fn subscriptions_sync_current_views_and_are_idempotent() -> TestResult {
         SubscribeOutcome::Subscribed {
             session_view_delivered: true,
             baseline_sequence: EventSequence::FIRST,
+            pending_interaction_count: 0,
         }
     );
     assert_eq!(
@@ -571,6 +572,7 @@ fn subscriptions_sync_current_views_and_are_idempotent() -> TestResult {
         SubscribeOutcome::Subscribed {
             session_view_delivered: false,
             baseline_sequence: EventSequence::FIRST,
+            pending_interaction_count: 0,
         }
     );
     assert_eq!(
@@ -636,6 +638,7 @@ fn failed_initial_sync_does_not_activate_a_subscription() -> TestResult {
         SubscribeOutcome::Subscribed {
             session_view_delivered: true,
             baseline_sequence: EventSequence::FIRST,
+            pending_interaction_count: 0,
         }
     );
     assert!(bridge.is_subscribed(channel_id, session_id));

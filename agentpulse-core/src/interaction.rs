@@ -3,62 +3,263 @@
 use std::collections::HashSet;
 
 use crate::{
-    ChannelCapabilities, ChannelId, ChoiceOptionId, DomainError, InteractionId, NonEmptyText,
-    ProviderCapabilities, SessionId, Timestamp,
+    ApprovalOptionId, ChannelCapabilities, ChannelId, ChoiceOptionId, DomainError, InteractionId,
+    NonEmptyText, ProviderCapabilities, SessionId, Timestamp,
 };
 
-/// How long an approval decision applies.
+/// The user-visible effect of one Provider-issued approval option.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
-pub enum ApprovalScope {
-    /// Approve only the requested operation.
-    Once,
-    /// Approve matching operations for the current session.
-    Session,
+pub enum ApprovalDisposition {
+    /// Allows the requested operation, possibly with the option's described policy effect.
+    Approve,
+    /// Rejects the requested operation while allowing the run to continue.
+    Reject,
+    /// Rejects the requested operation and cancels the active run.
+    Cancel,
 }
 
-/// A validated set of approval scopes offered to a user.
+/// Distinguishes a new command from input written to an existing process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ApprovalCommandKind {
+    /// A command that has not started yet.
+    Command,
+    /// Input sent to an already running process.
+    WriteStdin,
+}
+
+/// Network target associated with a command approval.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalNetworkContext {
+    host: NonEmptyText,
+    protocol: NonEmptyText,
+}
+
+impl ApprovalNetworkContext {
+    /// Creates a network approval context.
+    #[must_use]
+    pub const fn new(host: NonEmptyText, protocol: NonEmptyText) -> Self {
+        Self { host, protocol }
+    }
+
+    /// Borrows the requested host.
+    #[must_use]
+    pub const fn host(&self) -> &NonEmptyText {
+        &self.host
+    }
+
+    /// Borrows the requested network protocol.
+    #[must_use]
+    pub const fn protocol(&self) -> &NonEmptyText {
+        &self.protocol
+    }
+}
+
+/// The kind of one proposed file change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ApprovalFileChangeKind {
+    /// Creates a file.
+    Add,
+    /// Deletes a file.
+    Delete,
+    /// Updates an existing file.
+    Update,
+}
+
+/// One exact file change shown for approval.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalFileChange {
+    path: NonEmptyText,
+    kind: ApprovalFileChangeKind,
+    diff: String,
+}
+
+impl ApprovalFileChange {
+    /// Creates a proposed file change. An empty diff is preserved exactly.
+    #[must_use]
+    pub const fn new(path: NonEmptyText, kind: ApprovalFileChangeKind, diff: String) -> Self {
+        Self { path, kind, diff }
+    }
+
+    /// Borrows the affected path.
+    #[must_use]
+    pub const fn path(&self) -> &NonEmptyText {
+        &self.path
+    }
+
+    /// Returns the proposed change kind.
+    #[must_use]
+    pub const fn kind(&self) -> ApprovalFileChangeKind {
+        self.kind
+    }
+
+    /// Borrows the exact unified diff supplied by the Provider.
+    #[must_use]
+    pub fn diff(&self) -> &str {
+        &self.diff
+    }
+}
+
+/// Structured content of an approval request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ApprovalSubject {
+    /// A command, terminal input, or network operation.
+    Command {
+        /// Whether this is a command or terminal input.
+        kind: ApprovalCommandKind,
+        /// Exact command when supplied by the Provider.
+        command: Option<NonEmptyText>,
+        /// Exact working directory when supplied by the Provider.
+        cwd: Option<NonEmptyText>,
+        /// Provider explanation for the request.
+        reason: Option<NonEmptyText>,
+        /// Optional network target under review.
+        network: Option<ApprovalNetworkContext>,
+    },
+    /// One or more proposed file changes.
+    FileChange {
+        /// Exact changes in Provider display order.
+        changes: Vec<ApprovalFileChange>,
+        /// Optional root requested for session-scoped write access.
+        grant_root: Option<NonEmptyText>,
+        /// Provider explanation for the request.
+        reason: Option<NonEmptyText>,
+    },
+}
+
+/// One opaque, Provider-issued choice in an approval request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalOption {
+    id: ApprovalOptionId,
+    disposition: ApprovalDisposition,
+    label: NonEmptyText,
+    description: Option<NonEmptyText>,
+}
+
+impl ApprovalOption {
+    /// Creates an approval option.
+    #[must_use]
+    pub const fn new(
+        id: ApprovalOptionId,
+        disposition: ApprovalDisposition,
+        label: NonEmptyText,
+    ) -> Self {
+        Self {
+            id,
+            disposition,
+            label,
+            description: None,
+        }
+    }
+
+    /// Adds an exact user-facing explanation of the option's effect.
+    #[must_use]
+    pub fn with_description(mut self, description: NonEmptyText) -> Self {
+        self.description = Some(description);
+        self
+    }
+
+    /// Returns the opaque option identifier.
+    #[must_use]
+    pub const fn id(&self) -> ApprovalOptionId {
+        self.id
+    }
+
+    /// Returns the broad user-visible disposition.
+    #[must_use]
+    pub const fn disposition(&self) -> ApprovalDisposition {
+        self.disposition
+    }
+
+    /// Borrows the option label.
+    #[must_use]
+    pub const fn label(&self) -> &NonEmptyText {
+        &self.label
+    }
+
+    /// Borrows the optional effect description.
+    #[must_use]
+    pub const fn description(&self) -> Option<&NonEmptyText> {
+        self.description.as_ref()
+    }
+}
+
+/// A structured approval request and its exact Provider-issued options.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovalRequest {
-    allowed_scopes: Vec<ApprovalScope>,
+    subject: ApprovalSubject,
+    options: Vec<ApprovalOption>,
+    unavailable_reason: Option<NonEmptyText>,
 }
 
 impl ApprovalRequest {
-    /// Creates an approval request with at least one unique allowed scope.
-    pub fn new(allowed_scopes: Vec<ApprovalScope>) -> Result<Self, DomainError> {
-        if allowed_scopes.is_empty() {
+    /// Creates an actionable request with at least one uniquely identified option.
+    pub fn actionable(
+        subject: ApprovalSubject,
+        options: Vec<ApprovalOption>,
+    ) -> Result<Self, DomainError> {
+        if options.is_empty() {
             return Err(DomainError::EmptyCollection {
-                field: "approval scopes",
+                field: "approval options",
             });
         }
 
-        let mut unique = HashSet::with_capacity(allowed_scopes.len());
-        for scope in &allowed_scopes {
-            if !unique.insert(*scope) {
-                let value = match scope {
-                    ApprovalScope::Once => "once",
-                    ApprovalScope::Session => "session",
-                };
-                return Err(DomainError::DuplicateValue {
-                    field: "approval scopes",
-                    value,
+        let mut unique = HashSet::with_capacity(options.len());
+        for option in &options {
+            if !unique.insert(option.id()) {
+                return Err(DomainError::DuplicateId {
+                    field: "approval options",
+                    value: option.id().to_string(),
                 });
             }
         }
 
-        Ok(Self { allowed_scopes })
+        Ok(Self {
+            subject,
+            options,
+            unavailable_reason: None,
+        })
     }
 
-    /// Borrows the offered approval scopes.
+    /// Creates a visible but non-actionable request with an explicit reason.
     #[must_use]
-    pub fn allowed_scopes(&self) -> &[ApprovalScope] {
-        &self.allowed_scopes
+    pub const fn unavailable(subject: ApprovalSubject, reason: NonEmptyText) -> Self {
+        Self {
+            subject,
+            options: Vec::new(),
+            unavailable_reason: Some(reason),
+        }
     }
 
-    /// Returns whether a scope was offered.
+    /// Borrows the structured operation under review.
     #[must_use]
-    pub fn allows(&self, scope: ApprovalScope) -> bool {
-        self.allowed_scopes.contains(&scope)
+    pub const fn subject(&self) -> &ApprovalSubject {
+        &self.subject
+    }
+
+    /// Borrows the offered options in display order.
+    #[must_use]
+    pub fn options(&self) -> &[ApprovalOption] {
+        &self.options
+    }
+
+    /// Borrows the reason this request is read-only, when it is unavailable.
+    #[must_use]
+    pub const fn unavailable_reason(&self) -> Option<&NonEmptyText> {
+        self.unavailable_reason.as_ref()
+    }
+
+    /// Returns whether the request exposes a response action.
+    #[must_use]
+    pub const fn is_actionable(&self) -> bool {
+        !self.options.is_empty()
+    }
+
+    fn contains(&self, option_id: ApprovalOptionId) -> bool {
+        self.options.iter().any(|option| option.id() == option_id)
     }
 }
 
@@ -230,6 +431,15 @@ impl InteractionRequestPayload {
             Self::Text(_) => ChannelCapabilities::TEXT_INPUT,
         }
     }
+
+    /// Returns whether the request itself offers at least one valid response.
+    #[must_use]
+    pub const fn is_actionable(&self) -> bool {
+        match self {
+            Self::Approval(request) => request.is_actionable(),
+            Self::Choice(_) | Self::Text(_) => true,
+        }
+    }
 }
 
 /// A Provider-originated request for one correlated user response.
@@ -361,8 +571,16 @@ impl InteractionRequest {
         match (&self.payload, &response.payload) {
             (
                 InteractionRequestPayload::Approval(request),
-                InteractionResponsePayload::Approval(ApprovalDecision::Approved(scope)),
-            ) if !request.allows(*scope) => Err(DomainError::ApprovalScopeNotAllowed),
+                InteractionResponsePayload::Approval(_selection),
+            ) if !request.is_actionable() => Err(DomainError::ApprovalUnavailable),
+            (
+                InteractionRequestPayload::Approval(request),
+                InteractionResponsePayload::Approval(selection),
+            ) if !request.contains(selection.option_id()) => {
+                Err(DomainError::UnknownApprovalOption {
+                    option: selection.option_id().to_string(),
+                })
+            }
             (InteractionRequestPayload::Approval(_), InteractionResponsePayload::Approval(_))
             | (InteractionRequestPayload::Text(_), InteractionResponsePayload::Text(_)) => Ok(()),
             (
@@ -388,17 +606,76 @@ impl InteractionRequest {
     }
 }
 
-/// A user decision for an approval request.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Why a pending interaction disappeared without a Channel response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-pub enum ApprovalDecision {
-    /// Approve using one of the scopes offered by the request.
-    Approved(ApprovalScope),
-    /// Reject the operation with an optional reason.
-    Rejected {
-        /// A user-facing rejection reason.
-        reason: Option<NonEmptyText>,
-    },
+pub enum InteractionCloseReason {
+    /// Codex or another attached client resolved the request.
+    ResolvedElsewhere,
+    /// The Provider cancelled the request because its owning operation ended.
+    ProviderCancelled,
+}
+
+/// Provider-originated closure of one pending interaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InteractionClosed {
+    request_id: InteractionId,
+    session_id: SessionId,
+    reason: InteractionCloseReason,
+}
+
+impl InteractionClosed {
+    /// Creates a correlated interaction closure.
+    #[must_use]
+    pub const fn new(
+        request_id: InteractionId,
+        session_id: SessionId,
+        reason: InteractionCloseReason,
+    ) -> Self {
+        Self {
+            request_id,
+            session_id,
+            reason,
+        }
+    }
+
+    /// Returns the closed request identifier.
+    #[must_use]
+    pub const fn request_id(&self) -> InteractionId {
+        self.request_id
+    }
+
+    /// Returns the owning session identifier.
+    #[must_use]
+    pub const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    /// Returns why the request was closed.
+    #[must_use]
+    pub const fn reason(&self) -> InteractionCloseReason {
+        self.reason
+    }
+}
+
+/// A selection of one opaque option from an approval request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalSelection {
+    option_id: ApprovalOptionId,
+}
+
+impl ApprovalSelection {
+    /// Selects one Provider-issued approval option.
+    #[must_use]
+    pub const fn new(option_id: ApprovalOptionId) -> Self {
+        Self { option_id }
+    }
+
+    /// Returns the selected option identifier.
+    #[must_use]
+    pub const fn option_id(&self) -> ApprovalOptionId {
+        self.option_id
+    }
 }
 
 /// A non-empty set of uniquely selected choice option identifiers.
@@ -439,7 +716,7 @@ impl ChoiceSelection {
 #[non_exhaustive]
 pub enum InteractionResponsePayload {
     /// Answers an approval request.
-    Approval(ApprovalDecision),
+    Approval(ApprovalSelection),
     /// Answers a choice request.
     Choice(ChoiceSelection),
     /// Answers a text-input request.

@@ -507,6 +507,7 @@ fn controlled_ingress_drives_bridge_and_survives_restart_without_stale_handles()
         SubscribeOutcome::Subscribed {
             session_view_delivered: true,
             baseline_sequence: EventSequence::FIRST,
+            pending_interaction_count: 0,
         }
     );
     old_channel_handle.submit_command(cancel_command(session_id, channel_id)?)?;
@@ -828,6 +829,7 @@ fn channel_handle_discovers_sessions_and_source_generation_stop_clears_subscript
         SubscribeOutcome::Subscribed {
             session_view_delivered: true,
             baseline_sequence: EventSequence::FIRST,
+            pending_interaction_count: 0,
         }
     );
     assert_eq!(locked(&channel_port).sessions.len(), 1);

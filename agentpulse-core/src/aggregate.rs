@@ -393,6 +393,12 @@ impl SessionAggregate {
                 })?;
                 let _ = self.pending_interactions.remove(&interaction_id);
             }
+            AgentEventPayload::InteractionClosed(closed) => {
+                let interaction_id = closed.request_id();
+                if self.pending_interactions.remove(&interaction_id).is_none() {
+                    return Err(ReduceError::InteractionNotPending { interaction_id });
+                }
+            }
             AgentEventPayload::SessionEnded(outcome) => {
                 let revision = self.next_session_revision()?;
                 self.session.observe_state(

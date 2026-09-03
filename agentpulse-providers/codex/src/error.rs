@@ -2,7 +2,7 @@
 
 use std::{path::PathBuf, time::Duration};
 
-use agentpulse_core::DomainError;
+use agentpulse_core::{ApprovalOptionId, DomainError, InteractionId, SessionId};
 use thiserror::Error;
 
 /// An error raised while validating configuration or building a Codex Provider.
@@ -67,16 +67,50 @@ pub enum CodexProviderBuildError {
     },
 }
 
-/// An error returned when a write action is sent to the read-only Provider.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+/// An error returned when a write action cannot be routed to Codex.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[non_exhaustive]
 pub enum CodexProviderPortError {
-    /// Interaction responses are outside the Provider capability boundary.
-    #[error("the Codex Provider is read-only and cannot accept interaction responses")]
-    ReadOnlyInteractionResponse,
+    /// The approval request no longer exists in this Provider runtime.
+    #[error("interaction {interaction_id} is not pending")]
+    InteractionNotPending {
+        /// The missing interaction identifier.
+        interaction_id: InteractionId,
+    },
+    /// The response does not belong to the pending request's session.
+    #[error("interaction response session {actual} does not match {expected}")]
+    SessionMismatch {
+        /// The pending request's session.
+        expected: SessionId,
+        /// The response session.
+        actual: SessionId,
+    },
+    /// Another response has already claimed the approval request.
+    #[error("interaction {interaction_id} already has a response")]
+    InteractionAlreadyClaimed {
+        /// The claimed interaction identifier.
+        interaction_id: InteractionId,
+    },
+    /// This Provider only accepts approval interaction responses.
+    #[error("the Codex Provider only accepts approval interaction responses")]
+    UnsupportedInteractionResponse,
+    /// The opaque option does not belong to this approval request.
+    #[error("approval option {option_id} does not belong to interaction {interaction_id}")]
+    UnknownApprovalOption {
+        /// The pending interaction identifier.
+        interaction_id: InteractionId,
+        /// The rejected opaque option identifier.
+        option_id: ApprovalOptionId,
+    },
+    /// The bounded runtime queue cannot accept another response yet.
+    #[error("approval response queue is full (capacity {capacity})")]
+    OutboundQueueFull {
+        /// The fixed queue capacity.
+        capacity: usize,
+    },
     /// Agent commands are outside the Provider capability boundary.
-    #[error("the Codex Provider is read-only and cannot accept agent commands")]
-    ReadOnlyCommand,
+    #[error("the Codex Provider does not accept agent commands")]
+    UnsupportedCommand,
 }
 
 /// A lifecycle or live-stream failure raised by the Codex Provider Source.

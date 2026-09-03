@@ -2,8 +2,8 @@
 
 use crate::{
     AgentCommand, AgentSession, AgentState, ConnectionState, DomainError, EventId, EventSequence,
-    InteractionRequest, InteractionResponse, NonEmptyText, PlanSnapshot, ProgressSnapshot,
-    ProviderCapabilities, SessionId, Timestamp, ToolCallId,
+    InteractionClosed, InteractionRequest, InteractionResponse, NonEmptyText, PlanSnapshot,
+    ProgressSnapshot, ProviderCapabilities, SessionId, Timestamp, ToolCallId,
 };
 
 /// Severity of a normalized user-facing agent message.
@@ -124,6 +124,8 @@ pub enum AgentEventPayload {
     InteractionRequested(InteractionRequest),
     /// Records a correlated interaction response.
     InteractionResponded(InteractionResponse),
+    /// Closes a pending interaction without a Channel response.
+    InteractionClosed(InteractionClosed),
     /// Records a remote command.
     CommandIssued(AgentCommand),
     /// Records the latest run outcome.
@@ -148,6 +150,7 @@ impl AgentEventPayload {
             Self::ProgressUpdated(_) => ProviderCapabilities::PROGRESS,
             Self::InteractionRequested(request) => request.required_provider_request_capability(),
             Self::InteractionResponded(response) => response.required_provider_capability(),
+            Self::InteractionClosed(_) => ProviderCapabilities::APPROVAL_REQUEST,
             Self::CommandIssued(command) => command.required_provider_capability(),
         }
     }
@@ -176,6 +179,7 @@ impl AgentEvent {
             AgentEventPayload::SessionStarted(session) => Some(session.id()),
             AgentEventPayload::InteractionRequested(request) => Some(request.session_id()),
             AgentEventPayload::InteractionResponded(response) => Some(response.session_id()),
+            AgentEventPayload::InteractionClosed(closed) => Some(closed.session_id()),
             AgentEventPayload::CommandIssued(command) => Some(command.session_id()),
             _ => None,
         };

@@ -4,12 +4,17 @@ use std::{
     collections::VecDeque,
     io::{self, Read},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::{Arc, Mutex, MutexGuard, mpsc},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 use agentpulse_bridge::{ProviderEventHandle, ProviderEventSource};
+use agentpulse_core::{AgentEventPayload, InteractionCloseReason, InteractionClosed, Timestamp};
 use tungstenite::{Message, WebSocket};
 
 #[cfg(unix)]
@@ -17,19 +22,30 @@ use semver::Version;
 #[cfg(unix)]
 use std::{
     fs,
-    os::unix::{fs::PermissionsExt, net::UnixStream},
+    os::unix::{
+        fs::PermissionsExt,
+        net::{UnixListener, UnixStream},
+    },
 };
 
 use crate::{
     CodexProviderConfig, CodexProviderHealth, CodexProviderSourceError,
+    approval::{
+        ApprovalRoute, ApprovalRuntimeState, ClosedApproval, ResolvedApproval, SharedApprovalState,
+        prepare_approval,
+    },
     mapper::{CodexEventMapper, MappingDisposition},
-    protocol::{ExpectedResponse, ProtocolEngine, ProtocolSchema, ServerFrame},
+    protocol::{
+        ExpectedResponse, ObservedServerFrame, ProtocolEngine, ProtocolSchema, ServerFrame,
+    },
     status::{SharedStatus, lock_status},
 };
 
 const IO_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const STDERR_LIMIT: usize = 64 * 1024;
+#[cfg(unix)]
+const MAX_PROXY_CONNECTIONS: usize = 16;
 #[cfg(unix)]
 const LATEST_VERIFIED_CODEX_CLI_CORE: (u64, u64, u64) = (0, 152, 1);
 
@@ -67,9 +83,13 @@ pub struct CodexProviderSource {
     schema: ProtocolSchema,
     mapper: Arc<Mutex<CodexEventMapper>>,
     status: SharedStatus,
+    approvals: SharedApprovalState,
     runtime: Box<dyn AppServerRuntime>,
     stop_sender: Option<mpsc::Sender<()>>,
     worker: Option<JoinHandle<WorkerExit>>,
+    client_proxy_enabled: bool,
+    proxy_stop: Option<Arc<AtomicBool>>,
+    proxy_worker: Option<JoinHandle<ProxyExit>>,
     resources_acquired: bool,
 }
 
@@ -79,21 +99,26 @@ impl CodexProviderSource {
         schema: ProtocolSchema,
         mapper: CodexEventMapper,
         status: SharedStatus,
+        approvals: SharedApprovalState,
     ) -> Self {
-        Self::with_runtime(
+        let mut source = Self::with_runtime_and_approvals(
             config,
             schema,
             mapper,
             status,
+            approvals,
             Box::new(ManagedCodexRuntime::default()),
-        )
+        );
+        source.client_proxy_enabled = true;
+        source
     }
 
-    pub(crate) fn with_runtime(
+    pub(crate) fn with_runtime_and_approvals(
         config: CodexProviderConfig,
         schema: ProtocolSchema,
         mapper: CodexEventMapper,
         status: SharedStatus,
+        approvals: SharedApprovalState,
         runtime: Box<dyn AppServerRuntime>,
     ) -> Self {
         Self {
@@ -101,9 +126,13 @@ impl CodexProviderSource {
             schema,
             mapper: Arc::new(Mutex::new(mapper)),
             status,
+            approvals,
             runtime,
             stop_sender: None,
             worker: None,
+            client_proxy_enabled: false,
+            proxy_stop: None,
+            proxy_worker: None,
             resources_acquired: false,
         }
     }
@@ -195,9 +224,20 @@ impl CodexProviderSource {
         let mapper = Arc::clone(&self.mapper);
         let status = Arc::clone(&self.status);
         let worker_events = events.clone();
+        let approvals = Arc::clone(&self.approvals);
         let worker = thread::Builder::new()
             .name("agentpulse-codex-reader".to_owned())
-            .spawn(move || run_worker(io, protocol, mapper, status, worker_events, stop_receiver))
+            .spawn(move || {
+                run_worker(
+                    io,
+                    protocol,
+                    mapper,
+                    status,
+                    approvals,
+                    worker_events,
+                    stop_receiver,
+                )
+            })
             .map_err(|error| {
                 self.record_start_failure(
                     CodexProviderSourceError::runtime("reader thread spawn", error),
@@ -206,14 +246,43 @@ impl CodexProviderSource {
             })?;
         self.stop_sender = Some(stop_sender);
         self.worker = Some(worker);
+        if self.client_proxy_enabled {
+            match start_client_proxy(
+                &self.config,
+                self.schema.clone(),
+                Arc::clone(&self.mapper),
+                Arc::clone(&self.status),
+                Arc::clone(&self.approvals),
+                events.clone(),
+            ) {
+                Ok((stop, worker)) => {
+                    self.proxy_stop = Some(stop);
+                    self.proxy_worker = Some(worker);
+                }
+                Err(error) => {
+                    let _ = self.stop_inner();
+                    return Err(self.record_start_failure(error, &events));
+                }
+            }
+        }
         lock_status(&self.status).health = CodexProviderHealth::Running;
         Ok(())
     }
 
     fn stop_inner(&mut self) -> Result<(), CodexProviderSourceError> {
         let mut cleanup_failures = Vec::new();
+        if let Some(stop) = self.proxy_stop.take() {
+            stop.store(true, Ordering::Release);
+        }
         if let Some(sender) = self.stop_sender.take() {
             let _ = sender.send(());
+        }
+        if let Some(worker) = self.proxy_worker.take() {
+            match worker.join() {
+                Ok(ProxyExit::Stopped(Ok(()))) | Ok(ProxyExit::Failed) => {}
+                Ok(ProxyExit::Stopped(Err(error))) => cleanup_failures.push(error),
+                Err(_) => cleanup_failures.push("client proxy thread panicked".to_owned()),
+            }
         }
         if let Some(worker) = self.worker.take() {
             match worker.join() {
@@ -365,7 +434,7 @@ fn wait_for_response(
                     expected.method()
                 )));
             }
-            ServerFrame::Request { id, method } => {
+            ServerFrame::Request { id, method, .. } => {
                 io.write_text(protocol.unsupported_request_response(id, &method)?)?;
                 lock_status(context.status).rejected_server_requests += 1;
             }
@@ -389,32 +458,59 @@ enum WorkerExit {
     Failed,
 }
 
+enum ProxyExit {
+    Stopped(Result<(), String>),
+    Failed,
+}
+
 fn run_worker(
     mut io: Box<dyn AppServerIo>,
     mut protocol: ProtocolEngine,
     mapper: Arc<Mutex<CodexEventMapper>>,
     status: SharedStatus,
+    approvals: SharedApprovalState,
     events: ProviderEventHandle,
     stop_receiver: mpsc::Receiver<()>,
 ) -> WorkerExit {
     loop {
         if stop_receiver.try_recv().is_ok() {
+            close_all_approvals(&approvals, &mapper, &events, &status);
             return WorkerExit::Stopped(io.close().map_err(|error| error.to_string()));
+        }
+        let result =
+            flush_approval_responses(&mut *io, &protocol, &approvals, ApprovalRoute::Observer);
+        if let Err(error) = result {
+            close_all_approvals(&approvals, &mapper, &events, &status);
+            lock_mapper(&mapper).disconnect_all(&events, &status);
+            let message = error.to_string();
+            let mut current = lock_status(&status);
+            current.health = CodexProviderHealth::Failed;
+            current.last_error = Some(message);
+            return WorkerExit::Failed;
         }
         let result = match io.read() {
             Ok(ReadOutcome::Timeout) => continue,
             Ok(ReadOutcome::Closed) => Err(CodexProviderSourceError::transport(
                 "App Server closed the WebSocket",
             )),
-            Ok(ReadOutcome::Text(text)) => {
-                process_live_frame(&mut *io, &mut protocol, &mapper, &status, &events, &text)
-            }
+            Ok(ReadOutcome::Text(text)) => process_live_frame(
+                &mut *io,
+                &mut protocol,
+                &mapper,
+                &status,
+                &approvals,
+                &events,
+                &text,
+                ApprovalRoute::Observer,
+            ),
             Err(error) => Err(error),
         };
         if let Err(error) = result {
             if stop_receiver.try_recv().is_ok() {
+                close_all_approvals(&approvals, &mapper, &events, &status);
                 return WorkerExit::Stopped(io.close().map_err(|close| close.to_string()));
             }
+            close_all_approvals(&approvals, &mapper, &events, &status);
             lock_mapper(&mapper).disconnect_all(&events, &status);
             let message = error.to_string();
             let mut current = lock_status(&status);
@@ -425,28 +521,51 @@ fn run_worker(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_live_frame(
     io: &mut dyn AppServerIo,
     protocol: &mut ProtocolEngine,
     mapper: &Arc<Mutex<CodexEventMapper>>,
     status: &SharedStatus,
+    approvals: &SharedApprovalState,
     events: &ProviderEventHandle,
     text: &str,
+    route: ApprovalRoute,
 ) -> Result<(), CodexProviderSourceError> {
     let frame = protocol.parse_server_text(text)?;
     lock_status(status).validated_frames += 1;
     match frame {
         ServerFrame::Notification { method, params } => {
+            if method == "serverRequest/resolved" {
+                process_resolved_notification(&params, route, mapper, status, approvals, events)?;
+                return Ok(());
+            }
+            close_approvals_for_lifecycle(&method, &params, mapper, status, approvals, events)?;
             let disposition = lock_mapper(mapper).notification(&method, &params, events, status)?;
             if disposition == MappingDisposition::ValidatedUnmapped {
                 lock_status(status).validated_unmapped_frames += 1;
             }
             Ok(())
         }
-        ServerFrame::Request { id, method } => {
-            io.write_text(protocol.unsupported_request_response(id, &method)?)?;
-            lock_status(status).rejected_server_requests += 1;
-            Ok(())
+        ServerFrame::Request { id, method, params } => {
+            if is_approval_method(&method) {
+                process_approval_request(
+                    Some(io),
+                    protocol,
+                    route,
+                    id,
+                    method,
+                    params,
+                    mapper,
+                    status,
+                    approvals,
+                    events,
+                )
+            } else {
+                io.write_text(protocol.unsupported_request_response(id, &method)?)?;
+                lock_status(status).rejected_server_requests += 1;
+                Ok(())
+            }
         }
         ServerFrame::Response { expected, .. } | ServerFrame::Error { expected, .. } => {
             Err(CodexProviderSourceError::protocol(format!(
@@ -455,6 +574,628 @@ fn process_live_frame(
             )))
         }
     }
+}
+
+fn is_approval_method(method: &str) -> bool {
+    matches!(
+        method,
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_approval_request(
+    mut io: Option<&mut dyn AppServerIo>,
+    protocol: &ProtocolEngine,
+    route: ApprovalRoute,
+    id: crate::protocol::RequestId,
+    method: String,
+    params: serde_json::Value,
+    mapper: &Arc<Mutex<CodexEventMapper>>,
+    status: &SharedStatus,
+    approvals: &SharedApprovalState,
+    events: &ProviderEventHandle,
+) -> Result<(), CodexProviderSourceError> {
+    let thread_id = protocol_string(&params, "threadId")?;
+    let turn_id = protocol_string(&params, "turnId")?;
+    let item_id = protocol_string(&params, "itemId")?;
+    let context = lock_mapper(mapper).approval_context(thread_id, turn_id, item_id)?;
+    let Some((session_id, item)) = context else {
+        if let Some(io) = io.as_mut() {
+            io.write_text(protocol.unsupported_request_response(id, &method)?)?;
+        }
+        lock_status(status).rejected_server_requests += 1;
+        return Ok(());
+    };
+    let prepared = prepare_approval(&method, &params, item.as_ref(), session_id)?;
+    let interaction_id = prepared.request.id();
+    {
+        let mut state = lock_approvals(approvals);
+        state.register(route, id, method, &prepared)?;
+    }
+    let publish = lock_mapper(mapper).publish_payload(
+        &prepared.thread_id,
+        prepared.request.requested_at(),
+        AgentEventPayload::InteractionRequested(prepared.request),
+        events,
+        status,
+    );
+    if publish.is_err() {
+        lock_approvals(approvals).remove(interaction_id);
+    }
+    publish
+}
+
+fn flush_approval_responses(
+    io: &mut dyn AppServerIo,
+    protocol: &ProtocolEngine,
+    approvals: &SharedApprovalState,
+    route: ApprovalRoute,
+) -> Result<(), CodexProviderSourceError> {
+    loop {
+        let Some(outbound) = lock_approvals(approvals).pop_outbound_for(route) else {
+            return Ok(());
+        };
+        io.write_text(protocol.approval_response(
+            outbound.request_id,
+            &outbound.method,
+            outbound.decision,
+        )?)?;
+        lock_approvals(approvals).mark_sent(outbound.interaction_id)?;
+    }
+}
+
+fn process_resolved_notification(
+    params: &serde_json::Value,
+    route: ApprovalRoute,
+    mapper: &Arc<Mutex<CodexEventMapper>>,
+    status: &SharedStatus,
+    approvals: &SharedApprovalState,
+    events: &ProviderEventHandle,
+) -> Result<(), CodexProviderSourceError> {
+    let thread_id = protocol_string(params, "threadId")?;
+    let request_id = params
+        .get("requestId")
+        .ok_or_else(|| CodexProviderSourceError::protocol("requestId is required"))
+        .and_then(crate::protocol::RequestId::from_value)?;
+    match lock_approvals(approvals).resolve(route, &request_id, thread_id)? {
+        Some(ResolvedApproval::Responded {
+            thread_id,
+            response,
+        }) => {
+            let occurred_at = response.responded_at();
+            lock_mapper(mapper).publish_payload(
+                &thread_id,
+                occurred_at,
+                AgentEventPayload::InteractionResponded(response),
+                events,
+                status,
+            )?;
+        }
+        Some(ResolvedApproval::Closed {
+            thread_id,
+            session_id,
+            interaction_id,
+        }) => {
+            publish_closed(
+                ClosedApproval {
+                    thread_id,
+                    session_id,
+                    interaction_id,
+                },
+                InteractionCloseReason::ResolvedElsewhere,
+                mapper,
+                events,
+                status,
+            )?;
+        }
+        None => lock_status(status).validated_unmapped_frames += 1,
+    }
+    Ok(())
+}
+
+fn close_approvals_for_lifecycle(
+    method: &str,
+    params: &serde_json::Value,
+    mapper: &Arc<Mutex<CodexEventMapper>>,
+    status: &SharedStatus,
+    approvals: &SharedApprovalState,
+    events: &ProviderEventHandle,
+) -> Result<(), CodexProviderSourceError> {
+    let closed = match method {
+        "item/completed" => {
+            let thread_id = protocol_string(params, "threadId")?;
+            let turn_id = protocol_string(params, "turnId")?;
+            let item_id = params
+                .get("item")
+                .and_then(|item| item.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| CodexProviderSourceError::protocol("item.id must be a string"))?;
+            lock_approvals(approvals).close_item(thread_id, turn_id, item_id)
+        }
+        "turn/completed" => {
+            let thread_id = protocol_string(params, "threadId")?;
+            let turn_id = params
+                .get("turn")
+                .and_then(|turn| turn.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| CodexProviderSourceError::protocol("turn.id must be a string"))?;
+            lock_approvals(approvals).close_turn(thread_id, turn_id)
+        }
+        "thread/closed" => {
+            let thread_id = protocol_string(params, "threadId")?;
+            lock_approvals(approvals).close_thread(thread_id)
+        }
+        "thread/status/changed"
+            if params
+                .get("status")
+                .and_then(|value| value.get("type"))
+                .and_then(serde_json::Value::as_str)
+                == Some("notLoaded") =>
+        {
+            let thread_id = protocol_string(params, "threadId")?;
+            lock_approvals(approvals).close_thread(thread_id)
+        }
+        _ => Vec::new(),
+    };
+    for closed in closed {
+        publish_closed(
+            closed,
+            InteractionCloseReason::ProviderCancelled,
+            mapper,
+            events,
+            status,
+        )?;
+    }
+    Ok(())
+}
+
+fn close_all_approvals(
+    approvals: &SharedApprovalState,
+    mapper: &Arc<Mutex<CodexEventMapper>>,
+    events: &ProviderEventHandle,
+    status: &SharedStatus,
+) {
+    let closed = lock_approvals(approvals).close_all();
+    for closed in closed {
+        let _ = publish_closed(
+            closed,
+            InteractionCloseReason::ProviderCancelled,
+            mapper,
+            events,
+            status,
+        );
+    }
+}
+
+fn publish_closed(
+    closed: ClosedApproval,
+    reason: InteractionCloseReason,
+    mapper: &Arc<Mutex<CodexEventMapper>>,
+    events: &ProviderEventHandle,
+    status: &SharedStatus,
+) -> Result<(), CodexProviderSourceError> {
+    lock_mapper(mapper).publish_payload(
+        &closed.thread_id,
+        Timestamp::now_utc(),
+        AgentEventPayload::InteractionClosed(InteractionClosed::new(
+            closed.interaction_id,
+            closed.session_id,
+            reason,
+        )),
+        events,
+        status,
+    )
+}
+
+fn protocol_string<'a>(
+    value: &'a serde_json::Value,
+    field: &'static str,
+) -> Result<&'a str, CodexProviderSourceError> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| CodexProviderSourceError::protocol(format!("{field} must be a string")))
+}
+
+#[cfg(unix)]
+fn start_client_proxy(
+    config: &CodexProviderConfig,
+    schema: ProtocolSchema,
+    mapper: Arc<Mutex<CodexEventMapper>>,
+    status: SharedStatus,
+    approvals: SharedApprovalState,
+    events: ProviderEventHandle,
+) -> Result<(Arc<AtomicBool>, JoinHandle<ProxyExit>), CodexProviderSourceError> {
+    let listener = UnixListener::bind(&config.proxy_socket_path)
+        .map_err(|error| CodexProviderSourceError::runtime("client proxy bind", error))?;
+    if let Err(error) =
+        fs::set_permissions(&config.proxy_socket_path, fs::Permissions::from_mode(0o600))
+    {
+        let _ = fs::remove_file(&config.proxy_socket_path);
+        return Err(CodexProviderSourceError::runtime(
+            "client proxy permissions",
+            error,
+        ));
+    }
+    if let Err(error) = listener.set_nonblocking(true) {
+        let _ = fs::remove_file(&config.proxy_socket_path);
+        return Err(CodexProviderSourceError::runtime(
+            "client proxy nonblocking mode",
+            error,
+        ));
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = Arc::clone(&stop);
+    let app_server_socket_path = config.socket_path.clone();
+    let proxy_socket_path = config.proxy_socket_path.clone();
+    let worker = thread::Builder::new()
+        .name("agentpulse-codex-proxy".to_owned())
+        .spawn(move || {
+            run_client_proxy(
+                listener,
+                app_server_socket_path,
+                proxy_socket_path,
+                schema,
+                mapper,
+                status,
+                approvals,
+                events,
+                worker_stop,
+            )
+        })
+        .map_err(|error| {
+            let _ = fs::remove_file(&config.proxy_socket_path);
+            CodexProviderSourceError::runtime("client proxy thread spawn", error)
+        })?;
+    Ok((stop, worker))
+}
+
+#[cfg(not(unix))]
+fn start_client_proxy(
+    _config: &CodexProviderConfig,
+    _schema: ProtocolSchema,
+    _mapper: Arc<Mutex<CodexEventMapper>>,
+    _status: SharedStatus,
+    _approvals: SharedApprovalState,
+    _events: ProviderEventHandle,
+) -> Result<(Arc<AtomicBool>, JoinHandle<ProxyExit>), CodexProviderSourceError> {
+    Err(CodexProviderSourceError::UnsupportedPlatform)
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_client_proxy(
+    listener: UnixListener,
+    app_server_socket_path: std::path::PathBuf,
+    proxy_socket_path: std::path::PathBuf,
+    schema: ProtocolSchema,
+    mapper: Arc<Mutex<CodexEventMapper>>,
+    status: SharedStatus,
+    approvals: SharedApprovalState,
+    events: ProviderEventHandle,
+    stop: Arc<AtomicBool>,
+) -> ProxyExit {
+    let mut next_route = 1_u64;
+    let mut clients: Vec<JoinHandle<()>> = Vec::new();
+    while !stop.load(Ordering::Acquire) {
+        let mut index = 0;
+        while index < clients.len() {
+            if clients[index].is_finished() {
+                let worker = clients.swap_remove(index);
+                let _ = worker.join();
+            } else {
+                index += 1;
+            }
+        }
+
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if clients.len() >= MAX_PROXY_CONNECTIONS {
+                    drop(stream);
+                    continue;
+                }
+                let route = ApprovalRoute::Proxy(next_route);
+                next_route = next_route.saturating_add(1);
+                let worker_path = app_server_socket_path.clone();
+                let worker_schema = schema.clone();
+                let worker_mapper = Arc::clone(&mapper);
+                let worker_status = Arc::clone(&status);
+                let worker_approvals = Arc::clone(&approvals);
+                let worker_events = events.clone();
+                let worker_stop = Arc::clone(&stop);
+                match thread::Builder::new()
+                    .name(format!("agentpulse-codex-client-{}", route_number(route)))
+                    .spawn(move || {
+                        run_proxy_connection(
+                            stream,
+                            &worker_path,
+                            worker_schema,
+                            worker_mapper,
+                            worker_status,
+                            worker_approvals,
+                            worker_events,
+                            worker_stop,
+                            route,
+                        );
+                    }) {
+                    Ok(worker) => clients.push(worker),
+                    Err(error) => {
+                        eprintln!("warning: failed to spawn Codex client proxy: {error}");
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(PROCESS_POLL_INTERVAL);
+            }
+            Err(error) => {
+                let message = format!("Codex client proxy accept failed: {error}");
+                let mut current = lock_status(&status);
+                current.health = CodexProviderHealth::Failed;
+                current.last_error = Some(message);
+                stop.store(true, Ordering::Release);
+                for worker in clients {
+                    let _ = worker.join();
+                }
+                let _ = fs::remove_file(proxy_socket_path);
+                return ProxyExit::Failed;
+            }
+        }
+    }
+
+    for worker in clients {
+        let _ = worker.join();
+    }
+    let cleanup = match fs::remove_file(proxy_socket_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("client proxy socket removal: {error}")),
+    };
+    ProxyExit::Stopped(cleanup)
+}
+
+#[cfg(unix)]
+const fn route_number(route: ApprovalRoute) -> u64 {
+    match route {
+        ApprovalRoute::Proxy(number) => number,
+        ApprovalRoute::Observer => 0,
+    }
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_proxy_connection(
+    downstream_stream: UnixStream,
+    app_server_socket_path: &std::path::Path,
+    schema: ProtocolSchema,
+    mapper: Arc<Mutex<CodexEventMapper>>,
+    status: SharedStatus,
+    approvals: SharedApprovalState,
+    events: ProviderEventHandle,
+    stop: Arc<AtomicBool>,
+    route: ApprovalRoute,
+) {
+    let result = proxy_connection_loop(
+        downstream_stream,
+        app_server_socket_path,
+        &schema,
+        &mapper,
+        &status,
+        &approvals,
+        &events,
+        &stop,
+        route,
+    );
+    let closed = lock_approvals(&approvals).close_route(route);
+    for approval in closed {
+        let _ = publish_closed(
+            approval,
+            InteractionCloseReason::ProviderCancelled,
+            &mapper,
+            &events,
+            &status,
+        );
+    }
+    if let Err(error) = result
+        && !stop.load(Ordering::Acquire)
+    {
+        eprintln!("warning: Codex client proxy connection ended: {error}");
+    }
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn proxy_connection_loop(
+    downstream_stream: UnixStream,
+    app_server_socket_path: &std::path::Path,
+    schema: &ProtocolSchema,
+    mapper: &Arc<Mutex<CodexEventMapper>>,
+    status: &SharedStatus,
+    approvals: &SharedApprovalState,
+    events: &ProviderEventHandle,
+    stop: &AtomicBool,
+    route: ApprovalRoute,
+) -> Result<(), CodexProviderSourceError> {
+    downstream_stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| CodexProviderSourceError::runtime("client handshake timeout", error))?;
+    downstream_stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| CodexProviderSourceError::runtime("client write timeout", error))?;
+    let mut downstream = tungstenite::accept(downstream_stream).map_err(|error| {
+        CodexProviderSourceError::transport(format!("client WebSocket handshake failed: {error}"))
+    })?;
+    configure_proxy_stream(downstream.get_mut())?;
+
+    let upstream_stream = UnixStream::connect(app_server_socket_path)
+        .map_err(|error| CodexProviderSourceError::runtime("proxy upstream connection", error))?;
+    configure_proxy_stream(&upstream_stream)?;
+    let (mut upstream, _) =
+        tungstenite::client("ws://localhost/", upstream_stream).map_err(|error| {
+            CodexProviderSourceError::transport(format!(
+                "proxy upstream WebSocket handshake failed: {error}"
+            ))
+        })?;
+    let protocol = ProtocolEngine::new(schema.clone());
+
+    while !stop.load(Ordering::Acquire) {
+        flush_approval_responses(
+            &mut UnixWebSocketRef(&mut upstream),
+            &protocol,
+            approvals,
+            route,
+        )?;
+
+        match downstream.read() {
+            Ok(Message::Text(text)) => upstream
+                .send(Message::Text(text))
+                .map_err(proxy_transport_error)?,
+            Ok(Message::Binary(bytes)) => upstream
+                .send(Message::Binary(bytes))
+                .map_err(proxy_transport_error)?,
+            Ok(Message::Ping(_) | Message::Pong(_)) => {
+                downstream.flush().map_err(proxy_transport_error)?;
+            }
+            Ok(Message::Close(frame)) => {
+                let _ = upstream.close(frame);
+                return Ok(());
+            }
+            Ok(Message::Frame(_)) => {}
+            Err(tungstenite::Error::Io(error)) if is_timeout(&error) => {}
+            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                return Ok(());
+            }
+            Err(error) => return Err(proxy_transport_error(error)),
+        }
+
+        match upstream.read() {
+            Ok(Message::Text(text)) => {
+                if let Err(error) = observe_proxy_server_text(
+                    &protocol, route, mapper, status, approvals, events, &text,
+                ) {
+                    eprintln!(
+                        "warning: Codex client frame was not mirrored to AgentPulse: {error}"
+                    );
+                }
+                downstream
+                    .send(Message::Text(text))
+                    .map_err(proxy_transport_error)?;
+            }
+            Ok(Message::Binary(bytes)) => downstream
+                .send(Message::Binary(bytes))
+                .map_err(proxy_transport_error)?,
+            Ok(Message::Ping(_) | Message::Pong(_)) => {
+                upstream.flush().map_err(proxy_transport_error)?;
+            }
+            Ok(Message::Close(frame)) => {
+                let _ = downstream.close(frame);
+                return Ok(());
+            }
+            Ok(Message::Frame(_)) => {}
+            Err(tungstenite::Error::Io(error)) if is_timeout(&error) => {}
+            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                return Ok(());
+            }
+            Err(error) => return Err(proxy_transport_error(error)),
+        }
+    }
+
+    let _ = downstream.close(None);
+    let _ = upstream.close(None);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn configure_proxy_stream(stream: &UnixStream) -> Result<(), CodexProviderSourceError> {
+    stream
+        .set_read_timeout(Some(IO_POLL_INTERVAL))
+        .map_err(|error| CodexProviderSourceError::runtime("proxy socket read timeout", error))?;
+    stream
+        .set_write_timeout(Some(IO_POLL_INTERVAL))
+        .map_err(|error| CodexProviderSourceError::runtime("proxy socket write timeout", error))
+}
+
+#[cfg(unix)]
+fn proxy_transport_error(error: tungstenite::Error) -> CodexProviderSourceError {
+    CodexProviderSourceError::transport(format!("client proxy: {error}"))
+}
+
+#[cfg(unix)]
+fn is_timeout(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn observe_proxy_server_text(
+    protocol: &ProtocolEngine,
+    route: ApprovalRoute,
+    mapper: &Arc<Mutex<CodexEventMapper>>,
+    status: &SharedStatus,
+    approvals: &SharedApprovalState,
+    events: &ProviderEventHandle,
+    text: &str,
+) -> Result<(), CodexProviderSourceError> {
+    let frame = protocol.parse_observed_server_text(text)?;
+    lock_status(status).validated_frames += 1;
+    match frame {
+        ObservedServerFrame::Notification { method, params } => {
+            if method == "serverRequest/resolved" {
+                return process_resolved_notification(
+                    &params, route, mapper, status, approvals, events,
+                );
+            }
+            close_approvals_for_lifecycle(&method, &params, mapper, status, approvals, events)?;
+            let disposition = lock_mapper(mapper).notification(&method, &params, events, status)?;
+            if disposition == MappingDisposition::ValidatedUnmapped {
+                lock_status(status).validated_unmapped_frames += 1;
+            }
+            Ok(())
+        }
+        ObservedServerFrame::Request { id, method, params } => {
+            if is_approval_method(&method) {
+                process_approval_request(
+                    None, protocol, route, id, method, params, mapper, status, approvals, events,
+                )
+            } else {
+                lock_status(status).validated_unmapped_frames += 1;
+                Ok(())
+            }
+        }
+        ObservedServerFrame::PassThrough => Ok(()),
+    }
+}
+
+#[cfg(unix)]
+struct UnixWebSocketRef<'a>(&'a mut WebSocket<UnixStream>);
+
+#[cfg(unix)]
+impl AppServerIo for UnixWebSocketRef<'_> {
+    fn write_text(&mut self, text: String) -> Result<(), CodexProviderSourceError> {
+        self.0
+            .send(Message::Text(text.into()))
+            .map_err(proxy_transport_error)
+    }
+
+    fn read(&mut self) -> Result<ReadOutcome, CodexProviderSourceError> {
+        Err(CodexProviderSourceError::protocol(
+            "proxy write adapter cannot read",
+        ))
+    }
+
+    fn close(&mut self) -> Result<(), CodexProviderSourceError> {
+        Ok(())
+    }
+}
+
+fn lock_approvals(approvals: &SharedApprovalState) -> MutexGuard<'_, ApprovalRuntimeState> {
+    approvals
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn lock_mapper(mapper: &Arc<Mutex<CodexEventMapper>>) -> MutexGuard<'_, CodexEventMapper> {
@@ -516,7 +1257,7 @@ impl AppServerRuntime for ManagedCodexRuntime {
             command
                 .arg("app-server")
                 .arg("--listen")
-                .arg(&config.remote_uri)
+                .arg(&config.app_server_uri)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped());
@@ -871,7 +1612,10 @@ mod tests {
     #[cfg(unix)]
     use std::{
         fs,
-        os::unix::{fs::PermissionsExt, net::UnixListener},
+        os::unix::{
+            fs::PermissionsExt,
+            net::{UnixListener, UnixStream},
+        },
         path::PathBuf,
     };
 
@@ -882,10 +1626,11 @@ mod tests {
         decode_server_message, encode_client_message,
     };
     use agentpulse_core::{
-        AgentEvent, AgentEventPayload, AgentSession, AgentState, ChannelCapabilities,
-        ChannelDescriptor, ChannelEventRoute, ChannelId, ChannelKind, ConnectionState,
-        EventSequence, NonEmptyText, ProviderCapabilities, ProviderDescriptor, ProviderId,
-        ProviderKind, SessionId, SessionOutcome,
+        AgentEvent, AgentEventPayload, AgentSession, AgentState, ApprovalSelection,
+        ChannelCapabilities, ChannelDescriptor, ChannelEventRoute, ChannelId, ChannelKind,
+        ConnectionState, EventSequence, InteractionRequestPayload, InteractionResponse,
+        InteractionResponsePayload, NonEmptyText, ProviderCapabilities, ProviderDescriptor,
+        ProviderId, ProviderKind, SessionId, SessionOutcome, Timestamp,
     };
     use agentpulse_protocol::{ProtocolMessage, V1_PROTOCOL_VERSION};
     use tungstenite::{ClientRequestBuilder, Message, WebSocket, client, http::Uri};
@@ -966,6 +1711,170 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct ProxyTestControl {
+        approval_response: Mutex<Option<String>>,
+        server_error: Mutex<Option<String>>,
+        stop: AtomicBool,
+    }
+
+    #[cfg(unix)]
+    struct ProxyTestRuntime {
+        observer: Arc<FakeControl>,
+        proxy: Arc<ProxyTestControl>,
+        worker: Option<JoinHandle<()>>,
+    }
+
+    #[cfg(unix)]
+    impl AppServerRuntime for ProxyTestRuntime {
+        fn start(
+            &mut self,
+            config: &CodexProviderConfig,
+        ) -> Result<Box<dyn AppServerIo>, CodexProviderSourceError> {
+            fs::create_dir_all(&config.runtime_directory).map_err(|error| {
+                CodexProviderSourceError::runtime("proxy test directory creation", error)
+            })?;
+            let listener = UnixListener::bind(&config.socket_path).map_err(|error| {
+                CodexProviderSourceError::runtime("proxy test upstream bind", error)
+            })?;
+            listener.set_nonblocking(true).map_err(|error| {
+                CodexProviderSourceError::runtime("proxy test upstream nonblocking mode", error)
+            })?;
+            let control = Arc::clone(&self.proxy);
+            self.worker = Some(
+                thread::Builder::new()
+                    .name("agentpulse-proxy-test-upstream".to_owned())
+                    .spawn(move || proxy_test_upstream(listener, control))
+                    .map_err(|error| {
+                        CodexProviderSourceError::runtime("proxy test upstream thread", error)
+                    })?,
+            );
+            Ok(Box::new(FakeIo {
+                control: Arc::clone(&self.observer),
+            }))
+        }
+
+        fn stop(&mut self, config: &CodexProviderConfig) -> Result<(), CodexProviderSourceError> {
+            self.proxy.stop.store(true, Ordering::Release);
+            let _ = UnixStream::connect(&config.socket_path);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+            for path in [&config.proxy_socket_path, &config.socket_path] {
+                if let Err(error) = fs::remove_file(path)
+                    && error.kind() != io::ErrorKind::NotFound
+                {
+                    return Err(CodexProviderSourceError::runtime(
+                        "proxy test socket removal",
+                        error,
+                    ));
+                }
+            }
+            if let Err(error) = fs::remove_dir(&config.runtime_directory)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                return Err(CodexProviderSourceError::runtime(
+                    "proxy test runtime directory removal",
+                    error,
+                ));
+            }
+            if let Err(error) = fs::remove_dir(&config.runtime_root)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                return Err(CodexProviderSourceError::runtime(
+                    "proxy test root removal",
+                    error,
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    fn proxy_test_upstream(listener: UnixListener, control: Arc<ProxyTestControl>) {
+        while !control.stop.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    if let Err(error) = proxy_test_exchange(stream, &control)
+                        && !control.stop.load(Ordering::Acquire)
+                    {
+                        *locked(&control.server_error) = Some(error);
+                    }
+                    return;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => {
+                    *locked(&control.server_error) = Some(error.to_string());
+                    return;
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn proxy_test_exchange(stream: UnixStream, control: &ProxyTestControl) -> Result<(), String> {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .map_err(|error| error.to_string())?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .map_err(|error| error.to_string())?;
+        let mut socket = tungstenite::accept(stream).map_err(|error| error.to_string())?;
+        let first = socket.read().map_err(|error| error.to_string())?;
+        if !matches!(first, Message::Text(_)) {
+            return Err("proxy did not forward the desktop request".to_owned());
+        }
+        let frames = [
+            r#"{"id":77,"result":{"proxied":true}}"#.to_owned(),
+            format!(
+                r#"{{"method":"turn/started","params":{{"threadId":"{THREAD_ID}","turn":{{"id":"019976a4-00f1-76c0-b845-e1509dc4e3de","items":[],"startedAt":102,"status":"inProgress"}}}}}}"#,
+            ),
+            format!(
+                r#"{{"method":"item/started","params":{{"item":{{"command":"touch /var/tmp/agentpulse-proxy-test","commandActions":[],"cwd":"/workspace","id":"019976a4-00f2-741b-870f-21b4fb983746","status":"inProgress","type":"commandExecution"}},"startedAtMs":103000,"threadId":"{THREAD_ID}","turnId":"019976a4-00f1-76c0-b845-e1509dc4e3de"}}}}"#,
+            ),
+            format!(
+                r#"{{"id":"proxy-approval","method":"item/commandExecution/requestApproval","params":{{"command":"touch /var/tmp/agentpulse-proxy-test","cwd":"/workspace","itemId":"019976a4-00f2-741b-870f-21b4fb983746","reason":"Verify proxy routing","startedAtMs":103000,"threadId":"{THREAD_ID}","turnId":"019976a4-00f1-76c0-b845-e1509dc4e3de"}}}}"#,
+            ),
+        ];
+        for frame in frames {
+            socket
+                .send(Message::Text(frame.into()))
+                .map_err(|error| error.to_string())?;
+        }
+
+        loop {
+            match socket.read() {
+                Ok(Message::Text(text)) if text.contains("\"id\":\"proxy-approval\"") => {
+                    *locked(&control.approval_response) = Some(text.to_string());
+                    socket
+                        .send(Message::Text(
+                            format!(
+                                r#"{{"method":"serverRequest/resolved","params":{{"requestId":"proxy-approval","threadId":"{THREAD_ID}"}}}}"#,
+                            )
+                            .into(),
+                        ))
+                        .map_err(|error| error.to_string())?;
+                    return Ok(());
+                }
+                Ok(Message::Ping(payload)) => socket
+                    .send(Message::Pong(payload))
+                    .map_err(|error| error.to_string())?,
+                Ok(Message::Pong(_) | Message::Frame(_)) => {}
+                Ok(Message::Close(_)) => return Err("desktop closed before approval".to_owned()),
+                Ok(Message::Text(_) | Message::Binary(_)) => {}
+                Err(tungstenite::Error::Io(error)) if is_timeout(&error) => {
+                    if control.stop.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+
     fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         match mutex.lock() {
             Ok(guard) => guard,
@@ -980,7 +1889,9 @@ mod tests {
             provider_id,
             ProviderKind::new("codex")?,
             NonEmptyText::new("Codex Test")?,
-            ProviderCapabilities::SESSION_STATE,
+            ProviderCapabilities::SESSION_STATE
+                | ProviderCapabilities::APPROVAL_REQUEST
+                | ProviderCapabilities::APPROVAL_RESPONSE,
         ))
     }
 
@@ -1016,17 +1927,19 @@ mod tests {
         let schema = ProtocolSchema::compile()?;
         let mapper = CodexEventMapper::new(provider_id, &config.threads, config.discover_threads);
         let status = Arc::new(Mutex::new(Default::default()));
-        let source = CodexProviderSource::with_runtime(
+        let approvals = Arc::new(Mutex::new(ApprovalRuntimeState::new()));
+        let source = CodexProviderSource::with_runtime_and_approvals(
             config,
             schema,
             mapper,
             Arc::clone(&status),
+            Arc::clone(&approvals),
             Box::new(FakeRuntime { control }),
         );
         let descriptor = provider_descriptor(provider_id)?;
         Ok((
             provider_id,
-            CodexProviderPort::new(descriptor),
+            CodexProviderPort::with_approvals(descriptor, approvals),
             source,
             status,
         ))
@@ -1048,17 +1961,19 @@ mod tests {
         let schema = ProtocolSchema::compile()?;
         let mapper = CodexEventMapper::new(provider_id, &config.threads, config.discover_threads);
         let status = Arc::new(Mutex::new(Default::default()));
-        let source = CodexProviderSource::with_runtime(
+        let approvals = Arc::new(Mutex::new(ApprovalRuntimeState::new()));
+        let source = CodexProviderSource::with_runtime_and_approvals(
             config,
             schema,
             mapper,
             Arc::clone(&status),
+            Arc::clone(&approvals),
             Box::new(FakeRuntime { control }),
         );
         let descriptor = provider_descriptor(provider_id)?;
         Ok((
             provider_id,
-            CodexProviderPort::new(descriptor),
+            CodexProviderPort::with_approvals(descriptor, approvals),
             source,
             status,
         ))
@@ -1155,15 +2070,16 @@ mod tests {
             native_read(socket)?,
             NativeServerMessage::Domain {
                 context: NativeDeliveryContext::DiscoveryProvider { .. },
-                message: ProtocolMessage::ProviderDescriptor(ref descriptor),
-            } if descriptor.id() == provider_id
+                message,
+            } if matches!(message.as_ref(), ProtocolMessage::ProviderDescriptor(descriptor) if descriptor.id() == provider_id)
         ));
         assert!(matches!(
             native_read(socket)?,
             NativeServerMessage::Domain {
                 context: NativeDeliveryContext::DiscoverySession { last_sequence, .. },
-                message: ProtocolMessage::AgentSession(ref session),
-            } if session.id() == session_id && last_sequence == EventSequence::FIRST
+                message,
+            } if matches!(message.as_ref(), ProtocolMessage::AgentSession(session) if session.id() == session_id)
+                && last_sequence == EventSequence::FIRST
         ));
         assert!(matches!(
             native_read(socket)?,
@@ -1190,8 +2106,8 @@ mod tests {
             native_read(socket)?,
             NativeServerMessage::Domain {
                 context: NativeDeliveryContext::SubscriptionSession { .. },
-                message: ProtocolMessage::AgentSession(ref session),
-            } if session.id() == session_id
+                message,
+            } if matches!(message.as_ref(), ProtocolMessage::AgentSession(session) if session.id() == session_id)
         ));
         Ok(())
     }
@@ -1253,8 +2169,9 @@ mod tests {
         while event_sequences.last().copied() != Some(EventSequence::new(6)?) {
             if let NativeServerMessage::Domain {
                 context: NativeDeliveryContext::LiveEvent { .. },
-                message: ProtocolMessage::AgentEvent(event),
+                message,
             } = native_read(&mut client)?
+                && let ProtocolMessage::AgentEvent(event) = *message
             {
                 if let AgentEventPayload::Message(message) = event.payload()
                     && message.content().as_str() == "Provider fixture completed"
@@ -1360,7 +2277,7 @@ mod tests {
     }
 
     #[test]
-    fn server_request_receives_read_only_error_without_stopping_stream() -> TestResult {
+    fn approval_request_remains_pending_without_an_agentpulse_timeout() -> TestResult {
         let control = Arc::new(FakeControl::default());
         seed_lines(&control, LIVE_FIXTURE.lines().take(2));
         let (_provider_id, port, source, status) = test_provider(Arc::clone(&control))?;
@@ -1369,11 +2286,18 @@ mod tests {
         let _ = host.start()?;
         control.push_text(SERVER_REQUEST.trim());
 
-        wait_until(|| snapshot(&status).rejected_server_requests() == 1)?;
+        wait_until(|| snapshot(&status).mapped_events() == 2)?;
         assert_eq!(snapshot(&status).health(), CodexProviderHealth::Running);
-        let outgoing = locked(&control.outgoing);
-        assert!(outgoing.iter().any(|frame| frame.contains("-32601")));
-        drop(outgoing);
+        assert_eq!(snapshot(&status).rejected_server_requests(), 0);
+        let session_id = SessionId::from_str(THREAD_ID)?;
+        let pending = host.inspect_bridge(|bridge| {
+            bridge
+                .session_aggregate(session_id)
+                .map(|aggregate| aggregate.pending_interactions().count())
+        })?;
+        assert_eq!(pending, Some(1));
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(locked(&control.outgoing).len(), 3);
         let _ = host.stop()?;
         Ok(())
     }
@@ -1425,6 +2349,265 @@ mod tests {
         fn stop(&mut self) -> Result<(), Self::Error> {
             Ok(())
         }
+    }
+
+    struct AcceptingChannel {
+        descriptor: ChannelDescriptor,
+    }
+
+    impl ChannelPort for AcceptingChannel {
+        type Error = TestChannelError;
+
+        fn descriptor(&self) -> &ChannelDescriptor {
+            &self.descriptor
+        }
+
+        fn deliver_event(
+            &mut self,
+            _event: AgentEvent,
+            _route: ChannelEventRoute,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn deliver_session(&mut self, _session: AgentSession) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    struct CapturingChannelSource {
+        handle: Arc<Mutex<Option<ChannelActionHandle>>>,
+    }
+
+    impl ChannelActionSource for CapturingChannelSource {
+        type Error = TestChannelError;
+
+        fn start(&mut self, actions: ChannelActionHandle) -> Result<(), Self::Error> {
+            *locked(&self.handle) = Some(actions);
+            Ok(())
+        }
+
+        fn stop(&mut self) -> Result<(), Self::Error> {
+            *locked(&self.handle) = None;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn approval_response_crosses_bridge_and_waits_for_codex_resolution() -> TestResult {
+        let control = Arc::new(FakeControl::default());
+        seed_lines(&control, LIVE_FIXTURE.lines().take(2));
+        let (_provider_id, port, source, status) = test_provider(Arc::clone(&control))?;
+        let session_id = SessionId::from_str(THREAD_ID)?;
+        let channel_id = ChannelId::new();
+        let actions = Arc::new(Mutex::new(None));
+        let channel = AcceptingChannel {
+            descriptor: ChannelDescriptor::new(
+                channel_id,
+                ChannelKind::new("test")?,
+                NonEmptyText::new("Approval Channel")?,
+                ChannelCapabilities::SESSION_VIEW | ChannelCapabilities::APPROVAL,
+            ),
+        };
+        let mut host = RuntimeHost::new();
+        host.register_provider(port, source)?;
+        host.register_channel(
+            channel,
+            CapturingChannelSource {
+                handle: Arc::clone(&actions),
+            },
+        )?;
+        let _ = host.start()?;
+        let _ = host.subscribe(channel_id, session_id)?;
+        control.push_text(format!(
+            r#"{{"id":"approval-e2e","method":"item/commandExecution/requestApproval","params":{{"itemId":"019976a4-00f2-741b-870f-21b4fb983746","command":"cargo test --workspace","cwd":"/workspace","reason":"Run tests","startedAtMs":103000,"threadId":"{THREAD_ID}","turnId":"019976a4-00f1-76c0-b845-e1509dc4e3de"}}}}"#,
+        ));
+
+        wait_until(|| snapshot(&status).mapped_events() == 2)?;
+        let request = host
+            .inspect_bridge(|bridge| {
+                bridge
+                    .session_aggregate(session_id)
+                    .and_then(|aggregate| aggregate.pending_interactions().next().cloned())
+            })?
+            .ok_or("approval request was not reduced")?;
+        let InteractionRequestPayload::Approval(approval) = request.payload() else {
+            return Err("pending request was not an approval".into());
+        };
+        let option_id = approval
+            .options()
+            .iter()
+            .find(|option| option.label().as_str() == "Approve for session")
+            .map(|option| option.id())
+            .ok_or("session approval option was not exposed")?;
+        let response = InteractionResponse::new(
+            request.id(),
+            session_id,
+            channel_id,
+            Timestamp::now_utc(),
+            InteractionResponsePayload::Approval(ApprovalSelection::new(option_id)),
+        );
+        locked(&actions)
+            .as_ref()
+            .ok_or("channel action handle was not started")?
+            .submit_interaction_response(response)?;
+
+        wait_until(|| {
+            locked(&control.outgoing)
+                .iter()
+                .any(|frame| frame.contains("\"decision\":\"acceptForSession\""))
+        })?;
+        let still_pending = host.inspect_bridge(|bridge| {
+            bridge
+                .session_aggregate(session_id)
+                .is_some_and(|aggregate| aggregate.pending_interaction(request.id()).is_some())
+        })?;
+        assert!(still_pending);
+
+        control.push_text(format!(
+            r#"{{"method":"serverRequest/resolved","params":{{"requestId":"approval-e2e","threadId":"{THREAD_ID}"}}}}"#,
+        ));
+        wait_until(|| {
+            host.inspect_bridge(|bridge| {
+                bridge
+                    .session_aggregate(session_id)
+                    .is_some_and(|aggregate| aggregate.pending_interaction(request.id()).is_none())
+            })
+            .unwrap_or(false)
+        })?;
+        assert_eq!(snapshot(&status).health(), CodexProviderHealth::Running);
+        let _ = host.stop()?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_proxy_routes_phone_approval_to_originating_connection() -> TestResult {
+        let observer = Arc::new(FakeControl::default());
+        seed_lines(&observer, LIVE_FIXTURE.lines().take(2));
+        let proxy = Arc::new(ProxyTestControl::default());
+        let provider_id = ProviderId::new();
+        let runtime_root = std::env::temp_dir().join(format!("agentpulse-proxy-{provider_id}"));
+        let config = CodexProviderConfig::new(provider_id, &runtime_root, [THREAD_ID])?;
+        let proxy_socket_path = config.proxy_socket_path.clone();
+        let schema = ProtocolSchema::compile()?;
+        let mapper = CodexEventMapper::new(provider_id, &config.threads, config.discover_threads);
+        let status = Arc::new(Mutex::new(Default::default()));
+        let approvals = Arc::new(Mutex::new(ApprovalRuntimeState::new()));
+        let mut source = CodexProviderSource::with_runtime_and_approvals(
+            config,
+            schema,
+            mapper,
+            Arc::clone(&status),
+            Arc::clone(&approvals),
+            Box::new(ProxyTestRuntime {
+                observer: Arc::clone(&observer),
+                proxy: Arc::clone(&proxy),
+                worker: None,
+            }),
+        );
+        source.client_proxy_enabled = true;
+        let port = CodexProviderPort::with_approvals(provider_descriptor(provider_id)?, approvals);
+        let session_id = SessionId::from_str(THREAD_ID)?;
+        let channel_id = ChannelId::new();
+        let actions = Arc::new(Mutex::new(None));
+        let channel = AcceptingChannel {
+            descriptor: ChannelDescriptor::new(
+                channel_id,
+                ChannelKind::new("proxy-test")?,
+                NonEmptyText::new("Proxy Approval Channel")?,
+                ChannelCapabilities::SESSION_VIEW | ChannelCapabilities::APPROVAL,
+            ),
+        };
+        let mut host = RuntimeHost::new();
+        host.register_provider(port, source)?;
+        host.register_channel(
+            channel,
+            CapturingChannelSource {
+                handle: Arc::clone(&actions),
+            },
+        )?;
+        let _ = host.start()?;
+        let _ = host.subscribe(channel_id, session_id)?;
+
+        let stream = UnixStream::connect(proxy_socket_path)?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        let (mut desktop, _) = tungstenite::client("ws://localhost/", stream)?;
+        desktop.send(Message::Text(
+            r#"{"id":77,"method":"initialize","params":{}}"#.into(),
+        ))?;
+        let mut approval_was_forwarded = false;
+        for _ in 0..4 {
+            if let Message::Text(text) = desktop.read()?
+                && text.contains("\"id\":\"proxy-approval\"")
+            {
+                approval_was_forwarded = true;
+            }
+        }
+        assert!(approval_was_forwarded);
+
+        wait_until(|| {
+            host.inspect_bridge(|bridge| {
+                bridge
+                    .session_aggregate(session_id)
+                    .is_some_and(|aggregate| aggregate.pending_interactions().next().is_some())
+            })
+            .unwrap_or(false)
+        })?;
+        let request = host
+            .inspect_bridge(|bridge| {
+                bridge
+                    .session_aggregate(session_id)
+                    .and_then(|aggregate| aggregate.pending_interactions().next().cloned())
+            })?
+            .ok_or("proxied approval request was not reduced")?;
+        let InteractionRequestPayload::Approval(approval) = request.payload() else {
+            return Err("proxied interaction was not an approval".into());
+        };
+        let option_id = approval
+            .options()
+            .iter()
+            .find(|option| option.label().as_str() == "Approve for session")
+            .map(|option| option.id())
+            .ok_or("session approval option was not exposed")?;
+        let response = InteractionResponse::new(
+            request.id(),
+            session_id,
+            channel_id,
+            Timestamp::now_utc(),
+            InteractionResponsePayload::Approval(ApprovalSelection::new(option_id)),
+        );
+        locked(&actions)
+            .as_ref()
+            .ok_or("channel action handle was not started")?
+            .submit_interaction_response(response)?;
+
+        wait_until(|| locked(&proxy.approval_response).is_some())?;
+        let response_text = locked(&proxy.approval_response)
+            .clone()
+            .ok_or("proxy upstream did not capture the response")?;
+        let response_value: serde_json::Value = serde_json::from_str(&response_text)?;
+        assert_eq!(response_value["id"], "proxy-approval");
+        assert_eq!(response_value["result"]["decision"], "acceptForSession");
+        let resolved = desktop.read()?;
+        assert!(matches!(
+            resolved,
+            Message::Text(text) if text.contains("serverRequest/resolved")
+        ));
+        wait_until(|| {
+            host.inspect_bridge(|bridge| {
+                bridge
+                    .session_aggregate(session_id)
+                    .is_some_and(|aggregate| aggregate.pending_interaction(request.id()).is_none())
+            })
+            .unwrap_or(false)
+        })?;
+        assert!(locked(&proxy.server_error).is_none());
+        assert_eq!(snapshot(&status).health(), CodexProviderHealth::Running);
+        let _ = desktop.close(None);
+        let _ = host.stop()?;
+        Ok(())
     }
 
     #[test]
@@ -1724,7 +2907,7 @@ mod tests {
                             io.close()?;
                             return Ok(());
                         }
-                        ServerFrame::Request { id, method } => {
+                        ServerFrame::Request { id, method, .. } => {
                             io.write_text(protocol.unsupported_request_response(id, &method)?)?
                         }
                         ServerFrame::Notification { .. } => {}

@@ -17,7 +17,7 @@ use crate::{NATIVE_WEBSOCKET_PATH, NATIVE_WEBSOCKET_SUBPROTOCOL, NativeChannelBu
 /// Default maximum number of unsent frames retained per active client.
 pub const DEFAULT_OUTBOUND_CAPACITY: usize = 256;
 
-/// Configuration for one local read-only Native Channel.
+/// Configuration for one local Native Channel.
 #[derive(Clone, Debug)]
 pub(crate) enum NativeTransportConfig {
     Loopback,
@@ -27,7 +27,7 @@ pub(crate) enum NativeTransportConfig {
     },
 }
 
-/// Configuration for one local or authenticated-LAN read-only Native Channel.
+/// Configuration for one local or authenticated-LAN Native Channel.
 #[derive(Clone, Debug)]
 pub struct NativeChannelConfig {
     pub(crate) channel_id: ChannelId,

@@ -59,7 +59,7 @@ impl CodexProviderSnapshot {
         self.validated_unmapped_frames
     }
 
-    /// Returns the number of server requests rejected by the read-only client.
+    /// Returns the number of unsupported server requests rejected by this client.
     #[must_use]
     pub const fn rejected_server_requests(&self) -> u64 {
         self.rejected_server_requests

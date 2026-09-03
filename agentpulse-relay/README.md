@@ -1,6 +1,6 @@
 # agentpulse-relay
 
-Authenticated public tunnel for QR-only first pairing and the read-only
+Authenticated public tunnel for QR-only first pairing and the approval-capable
 AgentPulse Native path. Relay terminates publicly trusted outer TLS,
 authenticates disjoint Host registrations and stable/ephemeral routes, then
 pumps opaque inner Host TLS bytes with fixed buffers and deadlines. It does not

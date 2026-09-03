@@ -3,8 +3,8 @@
 use std::str::FromStr;
 
 use agentpulse_core::{
-    ChannelCapabilities, ChannelDescriptor, ChannelEventRoute, EventSequence, InteractionRoute,
-    SessionId,
+    ChannelCapabilities, ChannelDescriptor, ChannelEventRoute, EventSequence, InteractionResponse,
+    InteractionRoute, SessionId,
 };
 use agentpulse_protocol::{ProtocolMessage, V1_PROTOCOL_VERSION, decode_json, encode_json};
 use serde::{Deserialize, Serialize};
@@ -47,6 +47,13 @@ pub enum NativeClientMessage {
         /// Target AgentPulse Session.
         session_id: SessionId,
     },
+    /// Submits one response to an interaction in an actively subscribed Session.
+    SubmitInteractionResponse {
+        /// UUIDv7 transport request correlation identity.
+        request_id: String,
+        /// Strict AgentPulse domain response.
+        response: InteractionResponse,
+    },
 }
 
 /// Context attached to one nested AgentPulse JSON v1 domain envelope.
@@ -70,7 +77,14 @@ pub enum NativeDeliveryContext {
         /// The matching subscription request.
         request_id: String,
     },
-    /// A live normalized Event and its centralized read-only route.
+    /// One interaction captured in the same subscription baseline.
+    SubscriptionInteraction {
+        /// The matching subscription request.
+        request_id: String,
+        /// Centralized route for the receiving Channel.
+        route: NativeEventRoute,
+    },
+    /// A live normalized Event and its centralized interaction route.
     LiveEvent {
         /// The route decision consumed by the Native Channel.
         route: NativeEventRoute,
@@ -79,7 +93,7 @@ pub enum NativeDeliveryContext {
     LiveSession,
 }
 
-/// Read-only event presentation metadata carried to Native clients.
+/// Event presentation and interaction metadata carried to Native clients.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum NativeEventRoute {
@@ -87,6 +101,8 @@ pub enum NativeEventRoute {
     ObserveOnly,
     /// The Event contains an interaction that must not expose input controls.
     InteractionReadOnly,
+    /// The Event contains an interaction that may accept a response.
+    InteractionInteractive,
 }
 
 impl NativeEventRoute {
@@ -97,10 +113,7 @@ impl NativeEventRoute {
                 Ok(Self::InteractionReadOnly)
             }
             ChannelEventRoute::Interaction(InteractionRoute::Interactive) => {
-                Err(NativeProtocolError::InvalidField {
-                    field: "event route",
-                    reason: "read-only Native Channel cannot carry an interactive route".to_owned(),
-                })
+                Ok(Self::InteractionInteractive)
             }
             _ => Err(NativeProtocolError::InvalidField {
                 field: "event route",
@@ -144,10 +157,16 @@ pub enum NativeErrorCode {
     SessionNotDiscovered,
     /// RuntimeHost no longer contains the requested Session.
     SessionNotFound,
-    /// The Channel intentionally rejects user Action submission.
-    ReadOnly,
     /// An internal runtime operation failed.
     Internal,
+    /// The complete Provider-to-Channel capability route is unavailable.
+    CapabilityUnavailable,
+    /// The interaction no longer exists in the current Session.
+    InteractionNotPending,
+    /// The submitting client does not own an active Session subscription.
+    SessionNotSubscribed,
+    /// The Provider declined an otherwise valid handoff.
+    ProviderRejected,
 }
 
 /// Server-originated Native Transport control or domain-delivery messages.
@@ -183,7 +202,7 @@ pub enum NativeServerMessage {
         /// Native delivery metadata outside the domain protocol.
         context: NativeDeliveryContext,
         /// The validated domain message.
-        message: ProtocolMessage,
+        message: Box<ProtocolMessage>,
     },
     /// Completes one discovery batch.
     SyncCompleted {
@@ -200,6 +219,8 @@ pub enum NativeServerMessage {
         status: NativeSubscriptionStatus,
         /// Last Event already represented by the synchronized baseline.
         baseline_sequence: EventSequence,
+        /// Number of pending interaction frames in this baseline.
+        pending_interaction_count: usize,
     },
     /// Reports an idempotent unsubscription result.
     UnsubscriptionResult {
@@ -209,6 +230,15 @@ pub enum NativeServerMessage {
         session_id: SessionId,
         /// Whether an active subscription was removed.
         status: NativeUnsubscriptionStatus,
+    },
+    /// Confirms that an interaction response was accepted by the Provider queue.
+    InteractionResponseResult {
+        /// Matching transport request.
+        request_id: String,
+        /// Target Session.
+        session_id: SessionId,
+        /// Correlated AgentPulse interaction identifier.
+        interaction_id: String,
     },
     /// Reports a connection-level or request-level failure.
     Error {
@@ -228,7 +258,7 @@ pub fn encode_client_message(
     message: &NativeClientMessage,
 ) -> Result<Vec<u8>, NativeProtocolError> {
     validate_client_message(message)?;
-    encode_envelope(ClientMessageDto::from_semantic(message))
+    encode_envelope(ClientMessageDto::from_semantic(message)?)
 }
 
 /// Decodes and validates one strict Native Transport v1 client control frame.
@@ -283,11 +313,15 @@ enum ClientMessageDto {
         request_id: String,
         session_id: String,
     },
+    SubmitInteractionResponse {
+        request_id: String,
+        response: Value,
+    },
 }
 
 impl ClientMessageDto {
-    fn from_semantic(message: &NativeClientMessage) -> Self {
-        match message {
+    fn from_semantic(message: &NativeClientMessage) -> Result<Self, NativeProtocolError> {
+        Ok(match message {
             NativeClientMessage::Hello {
                 client_id,
                 display_name,
@@ -316,7 +350,16 @@ impl ClientMessageDto {
                 request_id: request_id.clone(),
                 session_id: session_id.to_string(),
             },
-        }
+            NativeClientMessage::SubmitInteractionResponse {
+                request_id,
+                response,
+            } => Self::SubmitInteractionResponse {
+                request_id: request_id.clone(),
+                response: encode_domain_value(&ProtocolMessage::InteractionResponse(
+                    response.clone(),
+                ))?,
+            },
+        })
     }
 
     fn into_semantic(self) -> Result<NativeClientMessage, NativeProtocolError> {
@@ -349,6 +392,22 @@ impl ClientMessageDto {
                 request_id,
                 session_id: parse_session_id(session_id)?,
             }),
+            Self::SubmitInteractionResponse {
+                request_id,
+                response,
+            } => {
+                let ProtocolMessage::InteractionResponse(response) = decode_domain_value(response)?
+                else {
+                    return Err(NativeProtocolError::InvalidDomainContext {
+                        context: "submit_interaction_response",
+                        actual: "non-interaction_response",
+                    });
+                };
+                Ok(NativeClientMessage::SubmitInteractionResponse {
+                    request_id,
+                    response,
+                })
+            }
         }
     }
 }
@@ -381,11 +440,17 @@ enum ServerMessageDto {
         session_id: String,
         status: SubscriptionStatusDto,
         baseline_sequence: String,
+        pending_interaction_count: usize,
     },
     UnsubscriptionResult {
         request_id: String,
         session_id: String,
         status: UnsubscriptionStatusDto,
+    },
+    InteractionResponseResult {
+        request_id: String,
+        session_id: String,
+        interaction_id: String,
     },
     Error {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -435,11 +500,13 @@ impl ServerMessageDto {
                 session_id,
                 status,
                 baseline_sequence,
+                pending_interaction_count,
             } => Self::SubscriptionResult {
                 request_id: request_id.clone(),
                 session_id: session_id.to_string(),
                 status: (*status).into(),
                 baseline_sequence: baseline_sequence.get().to_string(),
+                pending_interaction_count: *pending_interaction_count,
             },
             NativeServerMessage::UnsubscriptionResult {
                 request_id,
@@ -449,6 +516,15 @@ impl ServerMessageDto {
                 request_id: request_id.clone(),
                 session_id: session_id.to_string(),
                 status: (*status).into(),
+            },
+            NativeServerMessage::InteractionResponseResult {
+                request_id,
+                session_id,
+                interaction_id,
+            } => Self::InteractionResponseResult {
+                request_id: request_id.clone(),
+                session_id: session_id.to_string(),
+                interaction_id: interaction_id.clone(),
             },
             NativeServerMessage::Error {
                 request_id,
@@ -501,7 +577,7 @@ impl ServerMessageDto {
             }),
             Self::DomainMessage { context, domain } => Ok(NativeServerMessage::Domain {
                 context: context.into_semantic()?,
-                message: decode_domain_value(domain)?,
+                message: Box::new(decode_domain_value(domain)?),
             }),
             Self::SyncCompleted { request_id } => {
                 Ok(NativeServerMessage::SyncCompleted { request_id })
@@ -511,11 +587,13 @@ impl ServerMessageDto {
                 session_id,
                 status,
                 baseline_sequence,
+                pending_interaction_count,
             } => Ok(NativeServerMessage::SubscriptionResult {
                 request_id,
                 session_id: parse_session_id(session_id)?,
                 status: status.into(),
                 baseline_sequence: parse_sequence(baseline_sequence)?,
+                pending_interaction_count,
             }),
             Self::UnsubscriptionResult {
                 request_id,
@@ -525,6 +603,15 @@ impl ServerMessageDto {
                 request_id,
                 session_id: parse_session_id(session_id)?,
                 status: status.into(),
+            }),
+            Self::InteractionResponseResult {
+                request_id,
+                session_id,
+                interaction_id,
+            } => Ok(NativeServerMessage::InteractionResponseResult {
+                request_id,
+                session_id: parse_session_id(session_id)?,
+                interaction_id,
             }),
             Self::Error {
                 request_id,
@@ -554,6 +641,10 @@ enum DeliveryContextDto {
     SubscriptionSession {
         request_id: String,
     },
+    SubscriptionInteraction {
+        request_id: String,
+        route: EventRouteDto,
+    },
     LiveEvent {
         route: EventRouteDto,
     },
@@ -578,6 +669,12 @@ impl DeliveryContextDto {
                     request_id: request_id.clone(),
                 }
             }
+            NativeDeliveryContext::SubscriptionInteraction { request_id, route } => {
+                Self::SubscriptionInteraction {
+                    request_id: request_id.clone(),
+                    route: (*route).into(),
+                }
+            }
             NativeDeliveryContext::LiveEvent { route } => Self::LiveEvent {
                 route: (*route).into(),
             },
@@ -600,6 +697,12 @@ impl DeliveryContextDto {
             Self::SubscriptionSession { request_id } => {
                 Ok(NativeDeliveryContext::SubscriptionSession { request_id })
             }
+            Self::SubscriptionInteraction { request_id, route } => {
+                Ok(NativeDeliveryContext::SubscriptionInteraction {
+                    request_id,
+                    route: route.into(),
+                })
+            }
             Self::LiveEvent { route } => Ok(NativeDeliveryContext::LiveEvent {
                 route: route.into(),
             }),
@@ -613,6 +716,7 @@ impl DeliveryContextDto {
 enum EventRouteDto {
     ObserveOnly,
     InteractionReadOnly,
+    InteractionInteractive,
 }
 
 impl From<NativeEventRoute> for EventRouteDto {
@@ -620,6 +724,7 @@ impl From<NativeEventRoute> for EventRouteDto {
         match value {
             NativeEventRoute::ObserveOnly => Self::ObserveOnly,
             NativeEventRoute::InteractionReadOnly => Self::InteractionReadOnly,
+            NativeEventRoute::InteractionInteractive => Self::InteractionInteractive,
         }
     }
 }
@@ -629,6 +734,7 @@ impl From<EventRouteDto> for NativeEventRoute {
         match value {
             EventRouteDto::ObserveOnly => Self::ObserveOnly,
             EventRouteDto::InteractionReadOnly => Self::InteractionReadOnly,
+            EventRouteDto::InteractionInteractive => Self::InteractionInteractive,
         }
     }
 }
@@ -691,8 +797,11 @@ enum ErrorCodeDto {
     InvalidRequest,
     SessionNotDiscovered,
     SessionNotFound,
-    ReadOnly,
     Internal,
+    CapabilityUnavailable,
+    InteractionNotPending,
+    SessionNotSubscribed,
+    ProviderRejected,
 }
 
 impl From<NativeErrorCode> for ErrorCodeDto {
@@ -703,8 +812,11 @@ impl From<NativeErrorCode> for ErrorCodeDto {
             NativeErrorCode::InvalidRequest => Self::InvalidRequest,
             NativeErrorCode::SessionNotDiscovered => Self::SessionNotDiscovered,
             NativeErrorCode::SessionNotFound => Self::SessionNotFound,
-            NativeErrorCode::ReadOnly => Self::ReadOnly,
             NativeErrorCode::Internal => Self::Internal,
+            NativeErrorCode::CapabilityUnavailable => Self::CapabilityUnavailable,
+            NativeErrorCode::InteractionNotPending => Self::InteractionNotPending,
+            NativeErrorCode::SessionNotSubscribed => Self::SessionNotSubscribed,
+            NativeErrorCode::ProviderRejected => Self::ProviderRejected,
         }
     }
 }
@@ -717,8 +829,11 @@ impl From<ErrorCodeDto> for NativeErrorCode {
             ErrorCodeDto::InvalidRequest => Self::InvalidRequest,
             ErrorCodeDto::SessionNotDiscovered => Self::SessionNotDiscovered,
             ErrorCodeDto::SessionNotFound => Self::SessionNotFound,
-            ErrorCodeDto::ReadOnly => Self::ReadOnly,
             ErrorCodeDto::Internal => Self::Internal,
+            ErrorCodeDto::CapabilityUnavailable => Self::CapabilityUnavailable,
+            ErrorCodeDto::InteractionNotPending => Self::InteractionNotPending,
+            ErrorCodeDto::SessionNotSubscribed => Self::SessionNotSubscribed,
+            ErrorCodeDto::ProviderRejected => Self::ProviderRejected,
         }
     }
 }
@@ -784,7 +899,8 @@ fn validate_client_message(message: &NativeClientMessage) -> Result<(), NativePr
         }
         NativeClientMessage::Discover { request_id }
         | NativeClientMessage::Subscribe { request_id, .. }
-        | NativeClientMessage::Unsubscribe { request_id, .. } => {
+        | NativeClientMessage::Unsubscribe { request_id, .. }
+        | NativeClientMessage::SubmitInteractionResponse { request_id, .. } => {
             validate_uuid_v7("request_id", request_id)?;
         }
     }
@@ -805,14 +921,15 @@ fn validate_server_message(message: &NativeServerMessage) -> Result<(), NativePr
             validate_uuid_v7("connection_id", connection_id)?;
             let expected_capabilities = ChannelCapabilities::NOTIFICATION
                 | ChannelCapabilities::SESSION_VIEW
-                | ChannelCapabilities::REALTIME_SYNC;
+                | ChannelCapabilities::REALTIME_SYNC
+                | ChannelCapabilities::APPROVAL;
             if channel.kind().as_str() != "native" {
                 return invalid("channel.kind", "server must identify a native Channel");
             }
             if channel.capabilities() != expected_capabilities {
                 return invalid(
                     "channel.capabilities",
-                    "Native v1 requires exactly notification, session_view, and realtime_sync",
+                    "Native v1 requires exactly notification, session_view, realtime_sync, and approval",
                 );
             }
             if *protocol_version != V1_PROTOCOL_VERSION {
@@ -830,6 +947,14 @@ fn validate_server_message(message: &NativeServerMessage) -> Result<(), NativePr
         | NativeServerMessage::SubscriptionResult { request_id, .. }
         | NativeServerMessage::UnsubscriptionResult { request_id, .. } => {
             validate_uuid_v7("request_id", request_id)?;
+        }
+        NativeServerMessage::InteractionResponseResult {
+            request_id,
+            interaction_id,
+            ..
+        } => {
+            validate_uuid_v7("request_id", request_id)?;
+            validate_uuid_v7("interaction_id", interaction_id)?;
         }
         NativeServerMessage::Domain { context, message } => {
             validate_delivery_context(context, message)?;
@@ -872,6 +997,13 @@ fn validate_delivery_context(
             (
                 "subscription_session",
                 matches!(message, ProtocolMessage::AgentSession(_)),
+            )
+        }
+        NativeDeliveryContext::SubscriptionInteraction { request_id, .. } => {
+            validate_uuid_v7("request_id", request_id)?;
+            (
+                "subscription_interaction",
+                matches!(message, ProtocolMessage::InteractionRequest(_)),
             )
         }
         NativeDeliveryContext::LiveEvent { .. } => (
@@ -965,6 +1097,7 @@ const fn protocol_message_type(message: &ProtocolMessage) -> &'static str {
         ProtocolMessage::ChannelDescriptor(_) => "channel_descriptor",
         ProtocolMessage::AgentSession(_) => "agent_session",
         ProtocolMessage::AgentEvent(_) => "agent_event",
+        ProtocolMessage::InteractionRequest(_) => "interaction_request",
         ProtocolMessage::InteractionResponse(_) => "interaction_response",
         ProtocolMessage::AgentCommand(_) => "agent_command",
         _ => "future_domain_message",
@@ -976,8 +1109,10 @@ mod tests {
     use std::{error::Error, str::FromStr};
 
     use agentpulse_core::{
-        AgentSession, ChannelCapabilities, ChannelDescriptor, ChannelId, ChannelKind, NonEmptyText,
-        ProviderCapabilities, ProviderDescriptor, ProviderId, ProviderKind, SessionId, Timestamp,
+        AgentSession, ApprovalOptionId, ApprovalSelection, ChannelCapabilities, ChannelDescriptor,
+        ChannelId, ChannelKind, InteractionId, InteractionResponse, InteractionResponsePayload,
+        NonEmptyText, ProviderCapabilities, ProviderDescriptor, ProviderId, ProviderKind,
+        SessionId, Timestamp,
     };
 
     use super::*;
@@ -989,6 +1124,8 @@ mod tests {
     const CHANNEL_ID: &str = "019976a4-00f6-7d6d-b866-90ddbec53537";
     const PROVIDER_ID: &str = "019976a4-00f7-7ab4-b04d-41a21b57c2ab";
     const SESSION_ID: &str = "019976a4-00f0-7312-b36c-d01f9c5c06f6";
+    const INTERACTION_ID: &str = "019976a4-00f8-7025-9f29-55c05d8d9120";
+    const OPTION_ID: &str = "019976a4-00f9-7211-a5d4-e68ac2f32176";
 
     fn channel_descriptor() -> Result<ChannelDescriptor, Box<dyn Error>> {
         Ok(ChannelDescriptor::new(
@@ -997,7 +1134,8 @@ mod tests {
             NonEmptyText::new("Native Local")?,
             ChannelCapabilities::NOTIFICATION
                 | ChannelCapabilities::SESSION_VIEW
-                | ChannelCapabilities::REALTIME_SYNC,
+                | ChannelCapabilities::REALTIME_SYNC
+                | ChannelCapabilities::APPROVAL,
         ))
     }
 
@@ -1039,6 +1177,18 @@ mod tests {
                 request_id: REQUEST_ID.to_owned(),
                 session_id: SessionId::from_str(SESSION_ID)?,
             },
+            NativeClientMessage::SubmitInteractionResponse {
+                request_id: REQUEST_ID.to_owned(),
+                response: InteractionResponse::new(
+                    InteractionId::from_str(INTERACTION_ID)?,
+                    SessionId::from_str(SESSION_ID)?,
+                    ChannelId::from_str(CHANNEL_ID)?,
+                    Timestamp::from_unix_timestamp_nanos(200)?,
+                    InteractionResponsePayload::Approval(ApprovalSelection::new(
+                        ApprovalOptionId::from_str(OPTION_ID)?,
+                    )),
+                ),
+            },
         ];
         for message in messages {
             let encoded = encode_client_message(&message)?;
@@ -1067,20 +1217,26 @@ mod tests {
                 context: NativeDeliveryContext::DiscoveryProvider {
                     request_id: REQUEST_ID.to_owned(),
                 },
-                message: ProtocolMessage::ProviderDescriptor(provider_descriptor()?),
+                message: Box::new(ProtocolMessage::ProviderDescriptor(provider_descriptor()?)),
             },
             NativeServerMessage::Domain {
                 context: NativeDeliveryContext::DiscoverySession {
                     request_id: REQUEST_ID.to_owned(),
                     last_sequence: EventSequence::FIRST,
                 },
-                message: ProtocolMessage::AgentSession(session()?),
+                message: Box::new(ProtocolMessage::AgentSession(session()?)),
             },
             NativeServerMessage::SubscriptionResult {
                 request_id: REQUEST_ID.to_owned(),
                 session_id: SessionId::from_str(SESSION_ID)?,
                 status: NativeSubscriptionStatus::Subscribed,
                 baseline_sequence: EventSequence::FIRST,
+                pending_interaction_count: 0,
+            },
+            NativeServerMessage::InteractionResponseResult {
+                request_id: REQUEST_ID.to_owned(),
+                session_id: SessionId::from_str(SESSION_ID)?,
+                interaction_id: INTERACTION_ID.to_owned(),
             },
         ];
         for message in messages {
@@ -1108,7 +1264,7 @@ mod tests {
         ));
         let invalid_context = NativeServerMessage::Domain {
             context: NativeDeliveryContext::LiveSession,
-            message: ProtocolMessage::ProviderDescriptor(provider_descriptor()?),
+            message: Box::new(ProtocolMessage::ProviderDescriptor(provider_descriptor()?)),
         };
         assert!(matches!(
             encode_server_message(&invalid_context),
@@ -1118,7 +1274,7 @@ mod tests {
             NativeEventRoute::from_core(ChannelEventRoute::Interaction(
                 InteractionRoute::Interactive
             )),
-            Err(NativeProtocolError::InvalidField { .. })
+            Ok(NativeEventRoute::InteractionInteractive)
         ));
         Ok(())
     }

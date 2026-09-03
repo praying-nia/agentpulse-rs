@@ -1,0 +1,23 @@
+{
+  "native_transport_version": 1,
+  "message": {
+    "type": "submit_interaction_response",
+    "request_id": "01890f47-7c00-7000-8000-00000000000c",
+    "response": {
+      "protocol_version": 1,
+      "message": {
+        "type": "interaction_response",
+        "payload": {
+          "request_id": "01890f47-7c00-7000-8000-000000000005",
+          "session_id": "01890f47-7c00-7000-8000-000000000003",
+          "channel_id": "01890f47-7c00-7000-8000-000000000002",
+          "responded_at": "2026-08-29T00:04:00Z",
+          "payload": {
+            "type": "approval",
+            "option_id": "01890f47-7c00-7000-8000-000000000008"
+          }
+        }
+      }
+    }
+  }
+}

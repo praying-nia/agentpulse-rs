@@ -114,9 +114,16 @@ pub enum DomainError {
     #[error("interaction response was produced after the request expired")]
     InteractionExpired,
 
-    /// An approval used a scope that the request did not offer.
-    #[error("approval scope is not allowed by the request")]
-    ApprovalScopeNotAllowed,
+    /// A response attempted to act on a read-only approval request.
+    #[error("approval request is unavailable for response")]
+    ApprovalUnavailable,
+
+    /// An approval response selected an option absent from the request.
+    #[error("approval option is not present in the request: {option}")]
+    UnknownApprovalOption {
+        /// The unrecognized option identifier.
+        option: String,
+    },
 
     /// A choice response selected an option absent from the request.
     #[error("choice option is not present in the request: {option}")]

@@ -4,7 +4,8 @@ use std::str::FromStr;
 
 use agentpulse_core::{
     AgentCommand, AgentCommandPayload, AgentEvent, AgentEventPayload, AgentSession, AgentState,
-    ApprovalDecision, ApprovalRequest, ApprovalScope, ChannelCapabilities, ChannelId, ChoiceOption,
+    ApprovalCommandKind, ApprovalDisposition, ApprovalOption, ApprovalOptionId, ApprovalRequest,
+    ApprovalSelection, ApprovalSubject, ChannelCapabilities, ChannelId, ChoiceOption,
     ChoiceOptionId, ChoiceRequest, ChoiceSelection, CommandId, ConnectionState,
     DeterminateProgress, DomainError, EventId, EventSequence, InteractionId, InteractionRequest,
     InteractionRequestPayload, InteractionResponse, InteractionResponsePayload, NonEmptyText,
@@ -103,10 +104,24 @@ fn progress_supports_indeterminate_and_validated_determinate_values() -> Result<
 }
 
 #[test]
-fn approval_responses_must_use_an_offered_scope() -> Result<(), DomainError> {
+fn approval_responses_must_use_an_offered_option() -> Result<(), DomainError> {
+    let offered_id = ApprovalOptionId::new();
+    let subject = ApprovalSubject::Command {
+        kind: ApprovalCommandKind::Command,
+        command: Some(text("cargo test")?),
+        cwd: None,
+        reason: None,
+        network: None,
+    };
     assert!(matches!(
-        ApprovalRequest::new(vec![ApprovalScope::Once, ApprovalScope::Once]),
-        Err(DomainError::DuplicateValue { .. })
+        ApprovalRequest::actionable(
+            subject.clone(),
+            vec![
+                ApprovalOption::new(offered_id, ApprovalDisposition::Approve, text("Approve")?,),
+                ApprovalOption::new(offered_id, ApprovalDisposition::Reject, text("Reject")?,),
+            ],
+        ),
+        Err(DomainError::DuplicateId { .. })
     ));
 
     let session_id = SessionId::new();
@@ -115,20 +130,27 @@ fn approval_responses_must_use_an_offered_scope() -> Result<(), DomainError> {
         session_id,
         timestamp(100)?,
         text("Allow this operation?")?,
-        InteractionRequestPayload::Approval(ApprovalRequest::new(vec![ApprovalScope::Once])?),
+        InteractionRequestPayload::Approval(ApprovalRequest::actionable(
+            subject,
+            vec![ApprovalOption::new(
+                offered_id,
+                ApprovalDisposition::Approve,
+                text("Approve")?,
+            )],
+        )?),
     );
     let response = InteractionResponse::new(
         request.id(),
         session_id,
         ChannelId::new(),
         timestamp(110)?,
-        InteractionResponsePayload::Approval(ApprovalDecision::Approved(ApprovalScope::Session)),
+        InteractionResponsePayload::Approval(ApprovalSelection::new(ApprovalOptionId::new())),
     );
 
-    assert_eq!(
+    assert!(matches!(
         request.validate_response(&response),
-        Err(DomainError::ApprovalScopeNotAllowed)
-    );
+        Err(DomainError::UnknownApprovalOption { .. })
+    ));
     assert_eq!(
         request.required_provider_request_capability(),
         ProviderCapabilities::APPROVAL_REQUEST
@@ -228,7 +250,7 @@ fn interactions_reject_mismatched_types_and_expired_responses() -> Result<(), Do
         session_id,
         ChannelId::new(),
         timestamp(110)?,
-        InteractionResponsePayload::Approval(ApprovalDecision::Rejected { reason: None }),
+        InteractionResponsePayload::Approval(ApprovalSelection::new(ApprovalOptionId::new())),
     );
     assert_eq!(
         request.validate_response(&mismatched),

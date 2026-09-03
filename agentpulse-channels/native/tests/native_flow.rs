@@ -206,15 +206,16 @@ fn discover_and_subscribe(
         read_server(socket)?,
         NativeServerMessage::Domain {
             context: NativeDeliveryContext::DiscoveryProvider { .. },
-            message: ProtocolMessage::ProviderDescriptor(ref descriptor),
-        } if descriptor.id() == provider_id
+            message,
+        } if matches!(message.as_ref(), ProtocolMessage::ProviderDescriptor(descriptor) if descriptor.id() == provider_id)
     ));
     assert!(matches!(
         read_server(socket)?,
         NativeServerMessage::Domain {
             context: NativeDeliveryContext::DiscoverySession { last_sequence, .. },
-            message: ProtocolMessage::AgentSession(ref session),
-        } if session.id() == session_id && last_sequence == expected_cursor
+            message,
+        } if matches!(message.as_ref(), ProtocolMessage::AgentSession(session) if session.id() == session_id)
+            && last_sequence == expected_cursor
     ));
     assert!(matches!(
         read_server(socket)?,
@@ -243,8 +244,9 @@ fn discover_and_subscribe(
         read_server(socket)?,
         NativeServerMessage::Domain {
             context: NativeDeliveryContext::SubscriptionSession { ref request_id },
-            message: ProtocolMessage::AgentSession(ref session),
-        } if request_id == &subscription_id && session.id() == session_id
+            message,
+        } if request_id == &subscription_id
+            && matches!(message.as_ref(), ProtocolMessage::AgentSession(session) if session.id() == session_id)
     ));
     Ok(())
 }
@@ -293,6 +295,41 @@ fn independent_client_discovers_subscribes_streams_and_reconnects() -> TestResul
     hello(&mut client, Uuid::now_v7().to_string())?;
     discover_and_subscribe(&mut client, provider_id, session_id, EventSequence::FIRST)?;
 
+    let refresh_id = Uuid::now_v7().to_string();
+    send_client(
+        &mut client,
+        &NativeClientMessage::Discover {
+            request_id: refresh_id.clone(),
+        },
+    )?;
+    assert!(matches!(
+        read_server(&mut client)?,
+        NativeServerMessage::SyncStarted {
+            ref request_id,
+            provider_count: 1,
+            session_count: 1,
+        } if request_id == &refresh_id
+    ));
+    assert!(matches!(
+        read_server(&mut client)?,
+        NativeServerMessage::Domain {
+            context: NativeDeliveryContext::DiscoveryProvider { ref request_id },
+            ..
+        } if request_id == &refresh_id
+    ));
+    assert!(matches!(
+        read_server(&mut client)?,
+        NativeServerMessage::Domain {
+            context: NativeDeliveryContext::DiscoverySession { ref request_id, .. },
+            ..
+        } if request_id == &refresh_id
+    ));
+    assert!(matches!(
+        read_server(&mut client)?,
+        NativeServerMessage::SyncCompleted { ref request_id }
+            if request_id == &refresh_id
+    ));
+
     let _ = provider_events.publish_event(event(
         session_id,
         2,
@@ -305,8 +342,8 @@ fn independent_client_discovers_subscribes_streams_and_reconnects() -> TestResul
         read_server(&mut client)?,
         NativeServerMessage::Domain {
             context: NativeDeliveryContext::LiveEvent { .. },
-            message: ProtocolMessage::AgentEvent(ref event),
-        } if event.sequence() == EventSequence::new(2)?
+            message,
+        } if matches!(message.as_ref(), ProtocolMessage::AgentEvent(event) if event.sequence() == EventSequence::new(2)?)
     ));
 
     let _ = provider_events.publish_event(event(
@@ -318,15 +355,15 @@ fn independent_client_discovers_subscribes_streams_and_reconnects() -> TestResul
         read_server(&mut client)?,
         NativeServerMessage::Domain {
             context: NativeDeliveryContext::LiveEvent { .. },
-            message: ProtocolMessage::AgentEvent(ref event),
-        } if event.sequence() == EventSequence::new(3)?
+            message,
+        } if matches!(message.as_ref(), ProtocolMessage::AgentEvent(event) if event.sequence() == EventSequence::new(3)?)
     ));
     assert!(matches!(
         read_server(&mut client)?,
         NativeServerMessage::Domain {
             context: NativeDeliveryContext::LiveSession,
-            message: ProtocolMessage::AgentSession(ref session),
-        } if session.state() == AgentState::Running
+            message,
+        } if matches!(message.as_ref(), ProtocolMessage::AgentSession(session) if session.state() == AgentState::Running)
     ));
 
     client.close(None)?;

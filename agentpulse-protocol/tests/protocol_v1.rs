@@ -4,7 +4,8 @@ use std::{error::Error, fs, path::Path, str::FromStr};
 
 use agentpulse_core::{
     AgentCommand, AgentCommandPayload, AgentEvent, AgentEventPayload, AgentMessage,
-    AgentMessageLevel, AgentSession, AgentState, ApprovalDecision, ApprovalRequest, ApprovalScope,
+    AgentMessageLevel, AgentSession, AgentState, ApprovalCommandKind, ApprovalDisposition,
+    ApprovalOption, ApprovalOptionId, ApprovalRequest, ApprovalSelection, ApprovalSubject,
     ChannelCapabilities, ChannelDescriptor, ChannelId, ChannelKind, ChoiceOption, ChoiceOptionId,
     ChoiceRequest, ChoiceSelection, CommandId, ConnectionState, DeterminateProgress, DomainError,
     EventId, EventSequence, ExternalId, InteractionId, InteractionRequest,
@@ -22,11 +23,14 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
-const FIXTURES: [&str; 6] = [
+const FIXTURES: [&str; 9] = [
     "provider_descriptor.json",
     "channel_descriptor.json",
     "agent_session.json",
     "agent_event.json",
+    "approval_request.json",
+    "approval_response.json",
+    "interaction_closed_event.json",
     "interaction_response.json",
     "agent_command.json",
 ];
@@ -132,6 +136,28 @@ fn every_top_level_message_round_trips() -> TestResult {
     )?;
     round_trip(ProtocolMessage::AgentEvent(event))?;
 
+    let request = InteractionRequest::new(
+        fixed_id::<InteractionId>(5)?,
+        session_id,
+        timestamp("2026-08-29T00:03:00Z")?,
+        text("Approve command execution")?,
+        InteractionRequestPayload::Approval(ApprovalRequest::actionable(
+            ApprovalSubject::Command {
+                kind: ApprovalCommandKind::Command,
+                command: Some(text("cargo test --workspace")?),
+                cwd: Some(text("/workspace/agentpulse")?),
+                reason: Some(text("Run the workspace checks")?),
+                network: None,
+            },
+            vec![ApprovalOption::new(
+                fixed_id::<ApprovalOptionId>(7)?,
+                ApprovalDisposition::Approve,
+                text("Approve once")?,
+            )],
+        )?),
+    );
+    round_trip(ProtocolMessage::InteractionRequest(request))?;
+
     let response = InteractionResponse::new(
         fixed_id::<InteractionId>(5)?,
         session_id,
@@ -161,6 +187,8 @@ fn every_nested_event_variant_round_trips() -> TestResult {
     let interaction_id = fixed_id::<InteractionId>(5)?;
     let option_one = fixed_id::<ChoiceOptionId>(7)?;
     let option_two = fixed_id::<ChoiceOptionId>(8)?;
+    let approval_once = fixed_id::<ApprovalOptionId>(9)?;
+    let approval_reject = fixed_id::<ApprovalOptionId>(12)?;
     let tool_id = fixed_id::<ToolCallId>(10)?;
     let occurred_at = timestamp("2026-08-29T00:03:00Z")?;
 
@@ -245,10 +273,27 @@ fn every_nested_event_variant_round_trips() -> TestResult {
         session_id,
         occurred_at,
         text("Approve?")?,
-        InteractionRequestPayload::Approval(ApprovalRequest::new(vec![
-            ApprovalScope::Once,
-            ApprovalScope::Session,
-        ])?),
+        InteractionRequestPayload::Approval(ApprovalRequest::actionable(
+            ApprovalSubject::Command {
+                kind: ApprovalCommandKind::Command,
+                command: Some(text("cargo test --workspace")?),
+                cwd: Some(text("/workspace")?),
+                reason: Some(text("Run the test suite")?),
+                network: None,
+            },
+            vec![
+                ApprovalOption::new(
+                    approval_once,
+                    ApprovalDisposition::Approve,
+                    text("Approve once")?,
+                ),
+                ApprovalOption::new(
+                    approval_reject,
+                    ApprovalDisposition::Reject,
+                    text("Reject")?,
+                ),
+            ],
+        )?),
     );
     payloads.push(AgentEventPayload::InteractionRequested(approval));
 
@@ -279,19 +324,14 @@ fn every_nested_event_variant_round_trips() -> TestResult {
     );
     payloads.push(AgentEventPayload::InteractionRequested(text_request));
 
-    for decision in [
-        ApprovalDecision::Approved(ApprovalScope::Once),
-        ApprovalDecision::Rejected {
-            reason: Some(text("Not now")?),
-        },
-    ] {
+    for selection in [approval_once, approval_reject] {
         payloads.push(AgentEventPayload::InteractionResponded(
             InteractionResponse::new(
                 interaction_id,
                 session_id,
                 channel_id,
                 occurred_at,
-                InteractionResponsePayload::Approval(decision),
+                InteractionResponsePayload::Approval(ApprovalSelection::new(selection)),
             ),
         ));
     }
@@ -611,7 +651,19 @@ fn decoded_payloads_reapply_core_collection_and_value_invariants() -> TestResult
                 "requested_at": "2026-08-29T00:03:00Z",
                 "expires_at": "2026-08-29T00:02:00Z",
                 "prompt": "Approve?",
-                "payload": { "type": "approval", "allowed_scopes": ["once"] }
+                "payload": {
+                    "type": "approval",
+                    "subject": {
+                        "type": "command",
+                        "kind": "command",
+                        "command": "cargo test"
+                    },
+                    "options": [{
+                        "id": option_id,
+                        "disposition": "approve",
+                        "label": "Approve"
+                    }]
+                }
             }
         })),
         event(json!({
@@ -621,7 +673,18 @@ fn decoded_payloads_reapply_core_collection_and_value_invariants() -> TestResult
                 "session_id": session_id,
                 "requested_at": "2026-08-29T00:03:00Z",
                 "prompt": "Approve?",
-                "payload": { "type": "approval", "allowed_scopes": ["once", "once"] }
+                "payload": {
+                    "type": "approval",
+                    "subject": {
+                        "type": "command",
+                        "kind": "command",
+                        "command": "cargo test"
+                    },
+                    "options": [
+                        { "id": option_id, "disposition": "approve", "label": "Approve" },
+                        { "id": option_id, "disposition": "reject", "label": "Reject" }
+                    ]
+                }
             }
         })),
         json!({

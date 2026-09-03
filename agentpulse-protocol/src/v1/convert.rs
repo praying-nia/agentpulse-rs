@@ -4,10 +4,12 @@ use std::{collections::HashSet, str::FromStr};
 
 use agentpulse_core::{
     AgentCommand, AgentCommandPayload, AgentEvent, AgentEventPayload, AgentMessage,
-    AgentMessageLevel, AgentSession, AgentState, ApprovalDecision, ApprovalRequest, ApprovalScope,
-    ChannelCapabilities, ChannelDescriptor, ChannelKind, ChoiceOption, ChoiceOptionId,
-    ChoiceRequest, ChoiceSelection, ConnectionState, DeterminateProgress, DomainError,
-    EventSequence, ExternalId, InteractionRequest, InteractionRequestPayload, InteractionResponse,
+    AgentMessageLevel, AgentSession, AgentState, ApprovalCommandKind, ApprovalDisposition,
+    ApprovalFileChange, ApprovalFileChangeKind, ApprovalNetworkContext, ApprovalOption,
+    ApprovalRequest, ApprovalSelection, ApprovalSubject, ChannelCapabilities, ChannelDescriptor,
+    ChannelKind, ChoiceOption, ChoiceOptionId, ChoiceRequest, ChoiceSelection, ConnectionState,
+    DeterminateProgress, DomainError, EventSequence, ExternalId, InteractionCloseReason,
+    InteractionClosed, InteractionRequest, InteractionRequestPayload, InteractionResponse,
     InteractionResponsePayload, NonEmptyText, PlanItem, PlanItemStatus, PlanSnapshot,
     ProgressSnapshot, ProgressValue, ProviderCapabilities, ProviderDescriptor, ProviderKind,
     Revision, SessionOutcome, TextInputRequest, Timestamp, ToolActivity, ToolOutcome, WorkspaceRef,
@@ -30,6 +32,9 @@ pub(crate) fn encode_envelope(message: &ProtocolMessage) -> Result<EnvelopeDto, 
             MessageDto::AgentSession(encode_session(session)?)
         }
         ProtocolMessage::AgentEvent(event) => MessageDto::AgentEvent(encode_event(event)?),
+        ProtocolMessage::InteractionRequest(request) => {
+            MessageDto::InteractionRequest(encode_interaction_request(request)?)
+        }
         ProtocolMessage::InteractionResponse(response) => {
             MessageDto::InteractionResponse(encode_interaction_response(response)?)
         }
@@ -63,6 +68,9 @@ pub(crate) fn decode_envelope(envelope: EnvelopeDto) -> Result<ProtocolMessage, 
             decode_session(session).map(ProtocolMessage::AgentSession)
         }
         MessageDto::AgentEvent(event) => decode_event(event).map(ProtocolMessage::AgentEvent),
+        MessageDto::InteractionRequest(request) => {
+            decode_interaction_request(request).map(ProtocolMessage::InteractionRequest)
+        }
         MessageDto::InteractionResponse(response) => {
             decode_interaction_response(response).map(ProtocolMessage::InteractionResponse)
         }
@@ -231,6 +239,11 @@ fn encode_event_payload(
                 response: encode_interaction_response(response)?,
             })
         }
+        AgentEventPayload::InteractionClosed(interaction) => {
+            Ok(AgentEventPayloadDto::InteractionClosed {
+                interaction: encode_interaction_closed(interaction)?,
+            })
+        }
         AgentEventPayload::CommandIssued(command) => Ok(AgentEventPayloadDto::CommandIssued {
             command: encode_command(command)?,
         }),
@@ -269,6 +282,9 @@ fn decode_event_payload(dto: AgentEventPayloadDto) -> Result<AgentEventPayload, 
         }
         AgentEventPayloadDto::InteractionResponded { response } => {
             decode_interaction_response(response).map(AgentEventPayload::InteractionResponded)
+        }
+        AgentEventPayloadDto::InteractionClosed { interaction } => {
+            decode_interaction_closed(interaction).map(AgentEventPayload::InteractionClosed)
         }
         AgentEventPayloadDto::CommandIssued { command } => {
             decode_command(command).map(AgentEventPayload::CommandIssued)
@@ -490,13 +506,15 @@ fn encode_interaction_request_payload(
 ) -> Result<InteractionRequestPayloadDto, ProtocolError> {
     match payload {
         InteractionRequestPayload::Approval(request) => {
-            let allowed_scopes = request
-                .allowed_scopes()
-                .iter()
-                .copied()
-                .map(encode_approval_scope)
-                .collect::<Result<_, _>>()?;
-            Ok(InteractionRequestPayloadDto::Approval { allowed_scopes })
+            Ok(InteractionRequestPayloadDto::Approval {
+                subject: encode_approval_subject(request.subject())?,
+                options: request
+                    .options()
+                    .iter()
+                    .map(encode_approval_option)
+                    .collect::<Result<_, _>>()?,
+                unavailable_reason: request.unavailable_reason().map(ToString::to_string),
+            })
         }
         InteractionRequestPayload::Choice(request) => {
             let options = request
@@ -521,14 +539,36 @@ fn decode_interaction_request_payload(
     dto: InteractionRequestPayloadDto,
 ) -> Result<InteractionRequestPayload, ProtocolError> {
     match dto {
-        InteractionRequestPayloadDto::Approval { allowed_scopes } => {
-            let scopes = allowed_scopes
+        InteractionRequestPayloadDto::Approval {
+            subject,
+            options,
+            unavailable_reason,
+        } => {
+            let subject = decode_approval_subject(subject)?;
+            let options = options
                 .into_iter()
-                .map(decode_approval_scope)
-                .collect();
-            ApprovalRequest::new(scopes)
-                .map(InteractionRequestPayload::Approval)
-                .map_err(ProtocolError::from)
+                .map(decode_approval_option)
+                .collect::<Result<Vec<_>, _>>()?;
+            let request = match (options.is_empty(), unavailable_reason) {
+                (false, None) => ApprovalRequest::actionable(subject, options)?,
+                (true, Some(reason)) => {
+                    ApprovalRequest::unavailable(subject, NonEmptyText::new(reason)?)
+                }
+                (true, None) => {
+                    return Err(ProtocolError::InvalidWireValue {
+                        field: "approval",
+                        reason: "an approval without options requires unavailable_reason"
+                            .to_owned(),
+                    });
+                }
+                (false, Some(_)) => {
+                    return Err(ProtocolError::InvalidWireValue {
+                        field: "approval",
+                        reason: "an actionable approval cannot carry unavailable_reason".to_owned(),
+                    });
+                }
+            };
+            Ok(InteractionRequestPayload::Approval(request))
         }
         InteractionRequestPayloadDto::Choice { options, multiple } => {
             let options = options
@@ -570,6 +610,110 @@ fn decode_choice_option(dto: ChoiceOptionDto) -> Result<ChoiceOption, ProtocolEr
     }
 }
 
+fn encode_approval_subject(subject: &ApprovalSubject) -> Result<ApprovalSubjectDto, ProtocolError> {
+    match subject {
+        ApprovalSubject::Command {
+            kind,
+            command,
+            cwd,
+            reason,
+            network,
+        } => Ok(ApprovalSubjectDto::Command {
+            kind: encode_approval_command_kind(*kind)?,
+            command: command.as_ref().map(ToString::to_string),
+            cwd: cwd.as_ref().map(ToString::to_string),
+            reason: reason.as_ref().map(ToString::to_string),
+            network: network.as_ref().map(|context| ApprovalNetworkContextDto {
+                host: context.host().to_string(),
+                protocol: context.protocol().to_string(),
+            }),
+        }),
+        ApprovalSubject::FileChange {
+            changes,
+            grant_root,
+            reason,
+        } => Ok(ApprovalSubjectDto::FileChange {
+            changes: changes
+                .iter()
+                .map(|change| {
+                    Ok(ApprovalFileChangeDto {
+                        path: change.path().to_string(),
+                        kind: encode_approval_file_change_kind(change.kind())?,
+                        diff: change.diff().to_owned(),
+                    })
+                })
+                .collect::<Result<_, ProtocolError>>()?,
+            grant_root: grant_root.as_ref().map(ToString::to_string),
+            reason: reason.as_ref().map(ToString::to_string),
+        }),
+        _ => Err(unsupported("ApprovalSubject")),
+    }
+}
+
+fn decode_approval_subject(dto: ApprovalSubjectDto) -> Result<ApprovalSubject, ProtocolError> {
+    match dto {
+        ApprovalSubjectDto::Command {
+            kind,
+            command,
+            cwd,
+            reason,
+            network,
+        } => Ok(ApprovalSubject::Command {
+            kind: decode_approval_command_kind(kind),
+            command: decode_optional_text(command)?,
+            cwd: decode_optional_text(cwd)?,
+            reason: decode_optional_text(reason)?,
+            network: network
+                .map(|context| {
+                    Ok::<ApprovalNetworkContext, ProtocolError>(ApprovalNetworkContext::new(
+                        NonEmptyText::new(context.host)?,
+                        NonEmptyText::new(context.protocol)?,
+                    ))
+                })
+                .transpose()?,
+        }),
+        ApprovalSubjectDto::FileChange {
+            changes,
+            grant_root,
+            reason,
+        } => Ok(ApprovalSubject::FileChange {
+            changes: changes
+                .into_iter()
+                .map(|change| {
+                    Ok(ApprovalFileChange::new(
+                        NonEmptyText::new(change.path)?,
+                        decode_approval_file_change_kind(change.kind),
+                        change.diff,
+                    ))
+                })
+                .collect::<Result<_, ProtocolError>>()?,
+            grant_root: decode_optional_text(grant_root)?,
+            reason: decode_optional_text(reason)?,
+        }),
+    }
+}
+
+fn encode_approval_option(option: &ApprovalOption) -> Result<ApprovalOptionDto, ProtocolError> {
+    Ok(ApprovalOptionDto {
+        id: option.id().to_string(),
+        disposition: encode_approval_disposition(option.disposition())?,
+        label: option.label().to_string(),
+        description: option.description().map(ToString::to_string),
+    })
+}
+
+fn decode_approval_option(dto: ApprovalOptionDto) -> Result<ApprovalOption, ProtocolError> {
+    let option = ApprovalOption::new(
+        parse_id(dto.id)?,
+        decode_approval_disposition(dto.disposition),
+        NonEmptyText::new(dto.label)?,
+    );
+    match dto.description {
+        Some(description) => Ok(option.with_description(NonEmptyText::new(description)?)),
+        None => Ok(option),
+    }
+}
+
 fn encode_interaction_response(
     response: &InteractionResponse,
 ) -> Result<InteractionResponseDto, ProtocolError> {
@@ -598,9 +742,9 @@ fn encode_interaction_response_payload(
     payload: &InteractionResponsePayload,
 ) -> Result<InteractionResponsePayloadDto, ProtocolError> {
     match payload {
-        InteractionResponsePayload::Approval(decision) => {
+        InteractionResponsePayload::Approval(selection) => {
             Ok(InteractionResponsePayloadDto::Approval {
-                decision: encode_approval_decision(decision)?,
+                option_id: selection.option_id().to_string(),
             })
         }
         InteractionResponsePayload::Choice(selection) => {
@@ -623,9 +767,9 @@ fn decode_interaction_response_payload(
     dto: InteractionResponsePayloadDto,
 ) -> Result<InteractionResponsePayload, ProtocolError> {
     match dto {
-        InteractionResponsePayloadDto::Approval { decision } => {
-            decode_approval_decision(decision).map(InteractionResponsePayload::Approval)
-        }
+        InteractionResponsePayloadDto::Approval { option_id } => Ok(
+            InteractionResponsePayload::Approval(ApprovalSelection::new(parse_id(option_id)?)),
+        ),
         InteractionResponsePayloadDto::Choice { option_ids } => option_ids
             .into_iter()
             .map(parse_id::<ChoiceOptionId>)
@@ -638,29 +782,39 @@ fn decode_interaction_response_payload(
     }
 }
 
-fn encode_approval_decision(
-    decision: &ApprovalDecision,
-) -> Result<ApprovalDecisionDto, ProtocolError> {
-    match decision {
-        ApprovalDecision::Approved(scope) => Ok(ApprovalDecisionDto::Approved {
-            scope: encode_approval_scope(*scope)?,
-        }),
-        ApprovalDecision::Rejected { reason } => Ok(ApprovalDecisionDto::Rejected {
-            reason: reason.as_ref().map(ToString::to_string),
-        }),
-        _ => Err(unsupported("ApprovalDecision")),
-    }
+fn encode_interaction_closed(
+    interaction: &InteractionClosed,
+) -> Result<InteractionClosedDto, ProtocolError> {
+    Ok(InteractionClosedDto {
+        request_id: interaction.request_id().to_string(),
+        session_id: interaction.session_id().to_string(),
+        reason: match interaction.reason() {
+            InteractionCloseReason::ResolvedElsewhere => {
+                InteractionCloseReasonDto::ResolvedElsewhere
+            }
+            InteractionCloseReason::ProviderCancelled => {
+                InteractionCloseReasonDto::ProviderCancelled
+            }
+            _ => return Err(unsupported("InteractionCloseReason")),
+        },
+    })
 }
 
-fn decode_approval_decision(dto: ApprovalDecisionDto) -> Result<ApprovalDecision, ProtocolError> {
-    match dto {
-        ApprovalDecisionDto::Approved { scope } => {
-            Ok(ApprovalDecision::Approved(decode_approval_scope(scope)))
-        }
-        ApprovalDecisionDto::Rejected { reason } => Ok(ApprovalDecision::Rejected {
-            reason: decode_optional_text(reason)?,
-        }),
-    }
+fn decode_interaction_closed(
+    dto: InteractionClosedDto,
+) -> Result<InteractionClosed, ProtocolError> {
+    Ok(InteractionClosed::new(
+        parse_id(dto.request_id)?,
+        parse_id(dto.session_id)?,
+        match dto.reason {
+            InteractionCloseReasonDto::ResolvedElsewhere => {
+                InteractionCloseReason::ResolvedElsewhere
+            }
+            InteractionCloseReasonDto::ProviderCancelled => {
+                InteractionCloseReason::ProviderCancelled
+            }
+        },
+    ))
 }
 
 fn encode_command(command: &AgentCommand) -> Result<AgentCommandDto, ProtocolError> {
@@ -969,18 +1123,60 @@ const fn decode_plan_item_status(value: PlanItemStatusDto) -> PlanItemStatus {
     }
 }
 
-fn encode_approval_scope(value: ApprovalScope) -> Result<ApprovalScopeDto, ProtocolError> {
+fn encode_approval_command_kind(
+    value: ApprovalCommandKind,
+) -> Result<ApprovalCommandKindDto, ProtocolError> {
     match value {
-        ApprovalScope::Once => Ok(ApprovalScopeDto::Once),
-        ApprovalScope::Session => Ok(ApprovalScopeDto::Session),
-        _ => Err(unsupported("ApprovalScope")),
+        ApprovalCommandKind::Command => Ok(ApprovalCommandKindDto::Command),
+        ApprovalCommandKind::WriteStdin => Ok(ApprovalCommandKindDto::WriteStdin),
+        _ => Err(unsupported("ApprovalCommandKind")),
     }
 }
 
-const fn decode_approval_scope(value: ApprovalScopeDto) -> ApprovalScope {
+const fn decode_approval_command_kind(value: ApprovalCommandKindDto) -> ApprovalCommandKind {
     match value {
-        ApprovalScopeDto::Once => ApprovalScope::Once,
-        ApprovalScopeDto::Session => ApprovalScope::Session,
+        ApprovalCommandKindDto::Command => ApprovalCommandKind::Command,
+        ApprovalCommandKindDto::WriteStdin => ApprovalCommandKind::WriteStdin,
+    }
+}
+
+fn encode_approval_file_change_kind(
+    value: ApprovalFileChangeKind,
+) -> Result<ApprovalFileChangeKindDto, ProtocolError> {
+    match value {
+        ApprovalFileChangeKind::Add => Ok(ApprovalFileChangeKindDto::Add),
+        ApprovalFileChangeKind::Delete => Ok(ApprovalFileChangeKindDto::Delete),
+        ApprovalFileChangeKind::Update => Ok(ApprovalFileChangeKindDto::Update),
+        _ => Err(unsupported("ApprovalFileChangeKind")),
+    }
+}
+
+const fn decode_approval_file_change_kind(
+    value: ApprovalFileChangeKindDto,
+) -> ApprovalFileChangeKind {
+    match value {
+        ApprovalFileChangeKindDto::Add => ApprovalFileChangeKind::Add,
+        ApprovalFileChangeKindDto::Delete => ApprovalFileChangeKind::Delete,
+        ApprovalFileChangeKindDto::Update => ApprovalFileChangeKind::Update,
+    }
+}
+
+fn encode_approval_disposition(
+    value: ApprovalDisposition,
+) -> Result<ApprovalDispositionDto, ProtocolError> {
+    match value {
+        ApprovalDisposition::Approve => Ok(ApprovalDispositionDto::Approve),
+        ApprovalDisposition::Reject => Ok(ApprovalDispositionDto::Reject),
+        ApprovalDisposition::Cancel => Ok(ApprovalDispositionDto::Cancel),
+        _ => Err(unsupported("ApprovalDisposition")),
+    }
+}
+
+const fn decode_approval_disposition(value: ApprovalDispositionDto) -> ApprovalDisposition {
+    match value {
+        ApprovalDispositionDto::Approve => ApprovalDisposition::Approve,
+        ApprovalDispositionDto::Reject => ApprovalDisposition::Reject,
+        ApprovalDispositionDto::Cancel => ApprovalDisposition::Cancel,
     }
 }
 

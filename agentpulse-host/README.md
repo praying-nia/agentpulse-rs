@@ -1,6 +1,6 @@
 # agentpulse-host
 
-User-facing Linux/macOS Host for the read-only AgentPulse product path.
+User-facing Linux/macOS Host for AgentPulse observation and approvals.
 
 ## Setup
 

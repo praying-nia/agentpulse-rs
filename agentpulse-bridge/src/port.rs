@@ -7,6 +7,8 @@ use agentpulse_core::{
     InteractionResponse, ProviderDescriptor, ProviderId,
 };
 
+use crate::ChannelSessionBaseline;
+
 /// Adapter boundary for sending validated user actions toward an AI agent.
 ///
 /// Implementations must treat successful calls as message acceptance rather
@@ -64,6 +66,15 @@ pub trait ChannelPort: Send {
 
     /// Accepts a complete current Session view.
     fn deliver_session(&mut self, session: AgentSession) -> Result<(), Self::Error>;
+
+    /// Accepts one atomic subscription baseline containing the Session and all
+    /// interactions pending at the baseline cursor.
+    fn deliver_session_baseline(
+        &mut self,
+        baseline: ChannelSessionBaseline,
+    ) -> Result<(), Self::Error> {
+        self.deliver_session(baseline.into_session())
+    }
 }
 
 /// Bridge-facing submission boundary used by a Channel adapter.

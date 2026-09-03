@@ -12,8 +12,8 @@ use std::{
 };
 
 use agentpulse_bridge::{
-    ChannelActionHandle, ChannelActionIngressError, ChannelActionSource, ChannelSubscriptionScope,
-    SubscribeOutcome, SubscriptionError, UnsubscribeOutcome,
+    ChannelActionError, ChannelActionHandle, ChannelActionIngressError, ChannelActionSource,
+    ChannelSubscriptionScope, SubscribeOutcome, SubscriptionError, UnsubscribeOutcome,
 };
 use agentpulse_core::{ChannelDescriptor, SessionId};
 use agentpulse_protocol::{ProtocolMessage, V1_PROTOCOL_VERSION};
@@ -591,6 +591,10 @@ fn process_ready_message(
             request_id,
             session_id,
         } => process_unsubscribe(request_id, session_id, actions, state),
+        NativeClientMessage::SubmitInteractionResponse {
+            request_id,
+            response,
+        } => process_interaction_response(request_id, response, actions, state),
     }
 }
 
@@ -609,11 +613,11 @@ fn process_discover(
                 "client state is unavailable",
             ));
         };
-        if !client.subscriptions.is_empty() || client.pending.is_some() {
+        if client.pending.is_some() {
             return Err(ConnectionFailure::Recoverable(Box::new(protocol_error(
                 Some(request_id),
                 NativeErrorCode::InvalidRequest,
-                "unsubscribe all Sessions before discovery",
+                "wait for the active subscription baseline before discovery",
                 true,
             ))));
         }
@@ -632,7 +636,7 @@ fn process_discover(
             context: NativeDeliveryContext::DiscoveryProvider {
                 request_id: request_id.clone(),
             },
-            message: ProtocolMessage::ProviderDescriptor(provider.clone()),
+            message: Box::new(ProtocolMessage::ProviderDescriptor(provider.clone())),
         })?);
     }
     let discovered = snapshot
@@ -646,7 +650,7 @@ fn process_discover(
                 request_id: request_id.clone(),
                 last_sequence: entry.last_sequence(),
             },
-            message: ProtocolMessage::AgentSession(entry.session().clone()),
+            message: Box::new(ProtocolMessage::AgentSession(entry.session().clone())),
         })?);
     }
     frames.push(server_text(&NativeServerMessage::SyncCompleted {
@@ -713,14 +717,20 @@ fn process_subscribe(
     if let Some(client) = lock_delivery(state).client.as_mut() {
         let _ = client.subscriptions.insert(session_id);
     }
-    let (subscription_status, baseline_sequence) = match outcome {
+    let (subscription_status, baseline_sequence, pending_interaction_count) = match outcome {
         SubscribeOutcome::Subscribed {
             session_view_delivered: true,
             baseline_sequence,
-        } => (NativeSubscriptionStatus::Subscribed, baseline_sequence),
+            pending_interaction_count,
+        } => (
+            NativeSubscriptionStatus::Subscribed,
+            baseline_sequence,
+            pending_interaction_count,
+        ),
         SubscribeOutcome::AlreadySubscribed { current_sequence } => (
             NativeSubscriptionStatus::AlreadySubscribed,
             current_sequence,
+            0,
         ),
         SubscribeOutcome::Subscribed {
             session_view_delivered: false,
@@ -753,6 +763,7 @@ fn process_subscribe(
         session_id,
         status: subscription_status,
         baseline_sequence,
+        pending_interaction_count,
     })?;
     let mut delivery = lock_delivery(state);
     let Some(client) = delivery.client.as_mut() else {
@@ -775,6 +786,41 @@ fn process_subscribe(
         lock_status(status).subscriptions += 1;
     }
     Ok(())
+}
+
+fn process_interaction_response(
+    request_id: String,
+    response: agentpulse_core::InteractionResponse,
+    actions: &ChannelActionHandle,
+    state: &SharedDeliveryState,
+) -> Result<(), ConnectionFailure> {
+    let session_id = response.session_id();
+    let interaction_id = response.request_id().to_string();
+    let subscribed = lock_delivery(state)
+        .client
+        .as_ref()
+        .is_some_and(|client| client.subscriptions.contains(&session_id));
+    if !subscribed {
+        return Err(ConnectionFailure::Recoverable(Box::new(protocol_error(
+            Some(request_id),
+            NativeErrorCode::SessionNotSubscribed,
+            "the current Native connection is not subscribed to the response Session",
+            true,
+        ))));
+    }
+
+    actions
+        .submit_interaction_response(response)
+        .map_err(|error| interaction_response_failure(request_id.clone(), error))?;
+    enqueue_control(
+        state,
+        NativeServerMessage::InteractionResponseResult {
+            request_id,
+            session_id,
+            interaction_id,
+        },
+    )
+    .map_err(ConnectionFailure::Fatal)
 }
 
 fn process_unsubscribe(
@@ -889,6 +935,33 @@ fn runtime_failure(
     };
     ConnectionFailure::Recoverable(Box::new(protocol_error(
         request_id,
+        code,
+        &error.to_string(),
+        true,
+    )))
+}
+
+fn interaction_response_failure(
+    request_id: String,
+    error: ChannelActionIngressError,
+) -> ConnectionFailure {
+    let code = match &error {
+        ChannelActionIngressError::Bridge(ChannelActionError::InteractionNotPending { .. }) => {
+            NativeErrorCode::InteractionNotPending
+        }
+        ChannelActionIngressError::Bridge(ChannelActionError::ChannelNotSubscribed { .. }) => {
+            NativeErrorCode::SessionNotSubscribed
+        }
+        ChannelActionIngressError::Bridge(ChannelActionError::CapabilityRoute(_)) => {
+            NativeErrorCode::CapabilityUnavailable
+        }
+        ChannelActionIngressError::Bridge(ChannelActionError::ProviderHandoff { .. }) => {
+            NativeErrorCode::ProviderRejected
+        }
+        _ => NativeErrorCode::Internal,
+    };
+    ConnectionFailure::Recoverable(Box::new(protocol_error(
+        Some(request_id),
         code,
         &error.to_string(),
         true,

@@ -1,10 +1,11 @@
-//! A complete read-only Codex Provider backed by a managed App Server.
+//! A Codex Provider with live observation and command/file approval write-back.
 //!
 //! The Provider owns a Unix-socket Codex App Server, either resumes an explicit
 //! set of threads or follows threads opened by another client of that same
 //! server, strictly validates the schema-pinned protocol, and publishes
 //! normalized live session events through `agentpulse-bridge`.
 
+mod approval;
 mod config;
 mod error;
 mod mapper;
@@ -23,6 +24,7 @@ pub use port::CodexProviderPort;
 pub use runtime::CodexProviderSource;
 pub use status::{CodexProviderHealth, CodexProviderSnapshot};
 
+use approval::ApprovalRuntimeState;
 use mapper::CodexEventMapper;
 use protocol::ProtocolSchema;
 use status::{SharedStatus, snapshot};
@@ -48,7 +50,7 @@ pub struct CodexProviderHandle {
 }
 
 impl CodexProviderHandle {
-    /// Returns the shared App Server endpoint for `codex --remote` clients.
+    /// Returns the private observing proxy endpoint for `codex --remote` clients.
     #[must_use]
     pub fn remote_uri(&self) -> &str {
         &self.remote_uri
@@ -96,19 +98,23 @@ impl CodexProvider {
             config.provider_id,
             ProviderKind::new("codex")?,
             NonEmptyText::new("Codex")?,
-            ProviderCapabilities::SESSION_STATE,
+            ProviderCapabilities::SESSION_STATE
+                | ProviderCapabilities::APPROVAL_REQUEST
+                | ProviderCapabilities::APPROVAL_RESPONSE,
         )
         .with_version(NonEmptyText::new(SUPPORTED_CODEX_CLI_VERSION)?);
         let status = Arc::new(Mutex::new(Default::default()));
+        let approvals = Arc::new(Mutex::new(ApprovalRuntimeState::new()));
         let mapper =
             CodexEventMapper::new(config.provider_id, &config.threads, config.discover_threads);
         let handle = CodexProviderHandle {
             remote_uri: config.remote_uri.clone(),
             status: Arc::clone(&status),
         };
-        let source = CodexProviderSource::new(config, schema, mapper, status);
+        let source =
+            CodexProviderSource::new(config, schema, mapper, status, Arc::clone(&approvals));
         Ok(CodexProviderParts {
-            port: CodexProviderPort::new(descriptor),
+            port: CodexProviderPort::with_approvals(descriptor, approvals),
             source,
             handle,
         })

@@ -1,6 +1,6 @@
 [package]
 name = "agentpulse-provider-codex"
-description = "Read-only Codex App Server provider for AgentPulse"
+description = "Codex App Server provider with approvals for AgentPulse"
 edition.workspace = true
 publish.workspace = true
 repository.workspace = true

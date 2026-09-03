@@ -1,18 +1,27 @@
-//! Read-only Codex Provider port.
+//! Codex Provider command and approval-response port.
+
+use std::sync::{Arc, Mutex};
 
 use agentpulse_bridge::ProviderPort;
 use agentpulse_core::{AgentCommand, InteractionResponse, ProviderDescriptor};
 
-use crate::CodexProviderPortError;
+use crate::{CodexProviderPortError, approval::ApprovalRuntimeState};
 
-/// Bridge-facing, read-only Codex Provider port.
+/// Bridge-facing Codex Provider port.
 pub struct CodexProviderPort {
     descriptor: ProviderDescriptor,
+    approvals: Arc<Mutex<ApprovalRuntimeState>>,
 }
 
 impl CodexProviderPort {
-    pub(crate) const fn new(descriptor: ProviderDescriptor) -> Self {
-        Self { descriptor }
+    pub(crate) fn with_approvals(
+        descriptor: ProviderDescriptor,
+        approvals: Arc<Mutex<ApprovalRuntimeState>>,
+    ) -> Self {
+        Self {
+            descriptor,
+            approvals,
+        }
     }
 }
 
@@ -25,12 +34,15 @@ impl ProviderPort for CodexProviderPort {
 
     fn accept_interaction_response(
         &mut self,
-        _response: InteractionResponse,
+        response: InteractionResponse,
     ) -> Result<(), Self::Error> {
-        Err(CodexProviderPortError::ReadOnlyInteractionResponse)
+        self.approvals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .claim(response)
     }
 
     fn accept_command(&mut self, _command: AgentCommand) -> Result<(), Self::Error> {
-        Err(CodexProviderPortError::ReadOnlyCommand)
+        Err(CodexProviderPortError::UnsupportedCommand)
     }
 }

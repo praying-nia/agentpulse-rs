@@ -4,13 +4,14 @@ use std::error::Error;
 
 use agentpulse_core::{
     AgentCommand, AgentCommandPayload, AgentEvent, AgentEventPayload, AgentMessage,
-    AgentMessageLevel, AgentSession, ApprovalDecision, ApprovalRequest, ApprovalScope,
-    CapabilityRouteError, CapabilityRouter, ChannelCapabilities, ChannelDescriptor,
-    ChannelEventRoute, ChannelId, ChannelKind, ChoiceOption, ChoiceOptionId, ChoiceRequest,
-    ChoiceSelection, CommandId, DomainError, EventId, EventSequence, InteractionId,
-    InteractionRequest, InteractionRequestPayload, InteractionResponse, InteractionResponsePayload,
-    InteractionRoute, NonEmptyText, ProviderCapabilities, ProviderDescriptor, ProviderId,
-    ProviderKind, SessionId, TextInputRequest, Timestamp, ToolActivity, ToolCallId,
+    AgentMessageLevel, AgentSession, ApprovalCommandKind, ApprovalDisposition, ApprovalOption,
+    ApprovalOptionId, ApprovalRequest, ApprovalSelection, ApprovalSubject, CapabilityRouteError,
+    CapabilityRouter, ChannelCapabilities, ChannelDescriptor, ChannelEventRoute, ChannelId,
+    ChannelKind, ChoiceOption, ChoiceOptionId, ChoiceRequest, ChoiceSelection, CommandId,
+    DomainError, EventId, EventSequence, InteractionId, InteractionRequest,
+    InteractionRequestPayload, InteractionResponse, InteractionResponsePayload, InteractionRoute,
+    NonEmptyText, ProviderCapabilities, ProviderDescriptor, ProviderId, ProviderKind, SessionId,
+    TextInputRequest, Timestamp, ToolActivity, ToolCallId,
 };
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -58,6 +59,23 @@ fn event(session_id: SessionId, payload: AgentEventPayload) -> Result<AgentEvent
         EventSequence::FIRST,
         timestamp(100)?,
         payload,
+    )
+}
+
+fn approval(option_id: ApprovalOptionId) -> Result<ApprovalRequest, DomainError> {
+    ApprovalRequest::actionable(
+        ApprovalSubject::Command {
+            kind: ApprovalCommandKind::Command,
+            command: Some(text("cargo test")?),
+            cwd: None,
+            reason: None,
+            network: None,
+        },
+        vec![ApprovalOption::new(
+            option_id,
+            ApprovalDisposition::Approve,
+            text("Approve once")?,
+        )],
     )
 }
 
@@ -136,12 +154,13 @@ fn interaction_routes_degrade_to_read_only_without_a_complete_response_path() ->
     let provider_id = ProviderId::new();
     let channel_id = ChannelId::new();
     let session = session(provider_id)?;
+    let approval_option_id = ApprovalOptionId::new();
     let request = InteractionRequest::new(
         InteractionId::new(),
         session.id(),
         timestamp(110)?,
         text("Approve?")?,
-        InteractionRequestPayload::Approval(ApprovalRequest::new(vec![ApprovalScope::Once])?),
+        InteractionRequestPayload::Approval(approval(approval_option_id)?),
     );
     let request_event = event(
         session.id(),
@@ -179,7 +198,7 @@ fn interaction_routes_degrade_to_read_only_without_a_complete_response_path() ->
         session.id(),
         channel_id,
         timestamp(120)?,
-        InteractionResponsePayload::Approval(ApprovalDecision::Approved(ApprovalScope::Once)),
+        InteractionResponsePayload::Approval(ApprovalSelection::new(approval_option_id)),
     );
     assert!(matches!(
         CapabilityRouter::validate_interaction_response(
@@ -255,6 +274,7 @@ fn every_interaction_kind_uses_its_end_to_end_capabilities() -> TestResult {
     )?;
 
     let option_id = ChoiceOptionId::new();
+    let approval_option_id = ApprovalOptionId::new();
     let requests_and_responses = vec![
         (
             InteractionRequest::new(
@@ -262,11 +282,9 @@ fn every_interaction_kind_uses_its_end_to_end_capabilities() -> TestResult {
                 session.id(),
                 timestamp(110)?,
                 text("Approve?")?,
-                InteractionRequestPayload::Approval(ApprovalRequest::new(vec![
-                    ApprovalScope::Once,
-                ])?),
+                InteractionRequestPayload::Approval(approval(approval_option_id)?),
             ),
-            InteractionResponsePayload::Approval(ApprovalDecision::Approved(ApprovalScope::Once)),
+            InteractionResponsePayload::Approval(ApprovalSelection::new(approval_option_id)),
         ),
         (
             InteractionRequest::new(
@@ -383,7 +401,7 @@ fn interaction_responses_are_revalidated_before_provider_handoff() -> TestResult
         session.id(),
         channel_id,
         timestamp(115)?,
-        InteractionResponsePayload::Approval(ApprovalDecision::Rejected { reason: None }),
+        InteractionResponsePayload::Approval(ApprovalSelection::new(ApprovalOptionId::new())),
     );
     assert!(matches!(
         CapabilityRouter::validate_interaction_response(

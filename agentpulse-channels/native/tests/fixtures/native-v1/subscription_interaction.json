@@ -1,0 +1,60 @@
+{
+  "native_transport_version": 1,
+  "message": {
+    "type": "domain_message",
+    "context": {
+      "type": "subscription_interaction",
+      "request_id": "01890f47-7c00-7000-8000-000000000005",
+      "route": "interaction_interactive"
+    },
+    "domain": {
+      "protocol_version": 1,
+      "message": {
+        "type": "interaction_request",
+        "payload": {
+          "id": "01890f47-7c00-7000-8000-000000000005",
+          "session_id": "01890f47-7c00-7000-8000-000000000003",
+          "requested_at": "2026-08-29T00:03:00Z",
+          "prompt": "Approve command execution",
+          "payload": {
+            "type": "approval",
+            "subject": {
+              "type": "command",
+              "kind": "command",
+              "command": "curl https://example.com/status",
+              "cwd": "/workspace/agentpulse",
+              "reason": "Check the deployment endpoint",
+              "network": {
+                "host": "example.com",
+                "protocol": "https"
+              }
+            },
+            "options": [
+              {
+                "id": "01890f47-7c00-7000-8000-000000000007",
+                "disposition": "approve",
+                "label": "Approve once"
+              },
+              {
+                "id": "01890f47-7c00-7000-8000-000000000008",
+                "disposition": "approve",
+                "label": "Approve for this session",
+                "description": "Allow matching requests until this Codex session ends"
+              },
+              {
+                "id": "01890f47-7c00-7000-8000-000000000009",
+                "disposition": "reject",
+                "label": "Decline"
+              },
+              {
+                "id": "01890f47-7c00-7000-8000-00000000000a",
+                "disposition": "cancel",
+                "label": "Cancel turn"
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

@@ -13,7 +13,8 @@ use agentpulse_core::{ExternalId, ProviderId, SessionId};
 use crate::{CodexProviderBuildError, SUPPORTED_CODEX_CLI_VERSION};
 
 const PORTABLE_UNIX_SOCKET_PATH_MAX: usize = 96;
-const SOCKET_FILE_NAME: &str = "app-server.sock";
+const APP_SERVER_SOCKET_FILE_NAME: &str = "app-server.sock";
+const CLIENT_PROXY_SOCKET_FILE_NAME: &str = "client.sock";
 
 #[derive(Clone, Debug)]
 pub(crate) struct ConfiguredThread {
@@ -21,13 +22,15 @@ pub(crate) struct ConfiguredThread {
     pub(crate) session_id: SessionId,
 }
 
-/// Configuration for one managed read-only Codex Provider instance.
+/// Configuration for one managed Codex Provider instance.
 #[derive(Clone, Debug)]
 pub struct CodexProviderConfig {
     pub(crate) provider_id: ProviderId,
     pub(crate) runtime_root: PathBuf,
     pub(crate) runtime_directory: PathBuf,
     pub(crate) socket_path: PathBuf,
+    pub(crate) app_server_uri: String,
+    pub(crate) proxy_socket_path: PathBuf,
     pub(crate) remote_uri: String,
     pub(crate) threads: Vec<ConfiguredThread>,
     pub(crate) discover_threads: bool,
@@ -92,27 +95,20 @@ impl CodexProviderConfig {
         let runtime_root = absolute_path(runtime_root)?;
 
         let runtime_directory = runtime_root.join(runtime_directory_key(provider_id));
-        let socket_path = runtime_directory.join(SOCKET_FILE_NAME);
-        let socket_text =
-            socket_path
-                .to_str()
-                .ok_or_else(|| CodexProviderBuildError::NonUtf8RuntimeRoot {
-                    path: runtime_root.clone(),
-                })?;
-        let length = socket_text.len();
-        if length > PORTABLE_UNIX_SOCKET_PATH_MAX {
-            return Err(CodexProviderBuildError::SocketPathTooLong {
-                length,
-                maximum: PORTABLE_UNIX_SOCKET_PATH_MAX,
-            });
-        }
-        let remote_uri = format!("unix://{socket_text}");
+        let socket_path = runtime_directory.join(APP_SERVER_SOCKET_FILE_NAME);
+        let proxy_socket_path = runtime_directory.join(CLIENT_PROXY_SOCKET_FILE_NAME);
+        let socket_text = checked_socket_text(&socket_path, &runtime_root)?;
+        let proxy_socket_text = checked_socket_text(&proxy_socket_path, &runtime_root)?;
+        let app_server_uri = format!("unix://{socket_text}");
+        let remote_uri = format!("unix://{proxy_socket_text}");
 
         Ok(Self {
             provider_id,
             runtime_root,
             runtime_directory,
             socket_path,
+            app_server_uri,
+            proxy_socket_path,
             remote_uri,
             threads,
             discover_threads,
@@ -155,7 +151,7 @@ impl CodexProviderConfig {
         SUPPORTED_CODEX_CLI_VERSION
     }
 
-    /// Returns the deterministic App Server endpoint shown to `codex --remote`.
+    /// Returns the deterministic observing proxy endpoint shown to `codex --remote`.
     #[must_use]
     pub fn remote_uri(&self) -> &str {
         &self.remote_uri
@@ -183,6 +179,25 @@ impl CodexProviderConfig {
         }
         Ok(())
     }
+}
+
+fn checked_socket_text<'a>(
+    path: &'a Path,
+    runtime_root: &Path,
+) -> Result<&'a str, CodexProviderBuildError> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| CodexProviderBuildError::NonUtf8RuntimeRoot {
+            path: runtime_root.to_path_buf(),
+        })?;
+    let length = text.len();
+    if length > PORTABLE_UNIX_SOCKET_PATH_MAX {
+        return Err(CodexProviderBuildError::SocketPathTooLong {
+            length,
+            maximum: PORTABLE_UNIX_SOCKET_PATH_MAX,
+        });
+    }
+    Ok(text)
 }
 
 fn runtime_directory_key(provider_id: ProviderId) -> String {
@@ -243,7 +258,12 @@ mod tests {
         );
         assert_eq!(first.runtime_directory, second.runtime_directory);
         assert_eq!(first.socket_path, second.socket_path);
+        assert_eq!(first.proxy_socket_path, second.proxy_socket_path);
+        assert_ne!(first.socket_path, first.proxy_socket_path);
         assert!(first.socket_path.as_os_str().len() <= PORTABLE_UNIX_SOCKET_PATH_MAX);
+        assert!(first.proxy_socket_path.as_os_str().len() <= PORTABLE_UNIX_SOCKET_PATH_MAX);
+        assert!(first.app_server_uri.ends_with("/app-server.sock"));
+        assert!(first.remote_uri.ends_with("/client.sock"));
         Ok(())
     }
 

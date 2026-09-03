@@ -3,13 +3,13 @@
 use std::error::Error;
 
 use agentpulse_core::{
-    AgentEvent, AgentEventPayload, AgentSession, AgentState, ApplyOutcome, ApprovalDecision,
-    ChannelId, ConnectionState, DeterminateProgress, DomainError, EventId, EventSequence,
-    InteractionId, InteractionRequest, InteractionRequestPayload, InteractionResponse,
-    InteractionResponsePayload, NonEmptyText, PlanItem, PlanItemId, PlanItemStatus, PlanSnapshot,
-    ProgressSnapshot, ProgressValue, ProviderId, ReduceError, Revision, SessionAggregate,
-    SessionAggregateConfig, SessionId, SessionOutcome, SnapshotKind, TextInputRequest, Timestamp,
-    ToolActivity, ToolCallId, ToolOutcome,
+    AgentEvent, AgentEventPayload, AgentSession, AgentState, ApplyOutcome, ApprovalOptionId,
+    ApprovalSelection, ChannelId, ConnectionState, DeterminateProgress, DomainError, EventId,
+    EventSequence, InteractionId, InteractionRequest, InteractionRequestPayload,
+    InteractionResponse, InteractionResponsePayload, NonEmptyText, PlanItem, PlanItemId,
+    PlanItemStatus, PlanSnapshot, ProgressSnapshot, ProgressValue, ProviderId, ReduceError,
+    Revision, SessionAggregate, SessionAggregateConfig, SessionId, SessionOutcome, SnapshotKind,
+    TextInputRequest, Timestamp, ToolActivity, ToolCallId, ToolOutcome,
 };
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -491,7 +491,7 @@ fn interactions_are_validated_paired_and_cleared_on_session_end() -> TestResult 
         session_id,
         ChannelId::new(),
         timestamp(120)?,
-        InteractionResponsePayload::Approval(ApprovalDecision::Rejected { reason: None }),
+        InteractionResponsePayload::Approval(ApprovalSelection::new(ApprovalOptionId::new())),
     );
     assert!(matches!(
         aggregate.apply(event(
