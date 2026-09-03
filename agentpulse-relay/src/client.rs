@@ -2,7 +2,10 @@
 
 use std::{
     net::{SocketAddr, TcpStream, ToSocketAddrs},
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -177,7 +180,14 @@ pub fn connect_host_once_with_route_check_and_waiting(
     let mut on_waiting = Some(on_waiting);
 
     loop {
-        match read_relay(&mut stream)? {
+        if stop.load(Ordering::Acquire) {
+            return Err(RelayError::Stopped);
+        }
+        let message = read_relay(&mut stream)?;
+        if stop.load(Ordering::Acquire) {
+            return Err(RelayError::Stopped);
+        }
+        match message {
             RelayMessage::HostWaiting {
                 connection_id: waiting_id,
             } if waiting_id == connection_id => {

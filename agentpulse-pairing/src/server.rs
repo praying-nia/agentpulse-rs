@@ -24,6 +24,7 @@ use crate::{
 };
 
 const SESSION_LIFETIME: Duration = Duration::from_secs(120);
+const CLOSE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_ATTEMPTS: usize = 5;
 const MAX_PAIRING_MESSAGE_BYTES: usize = 16 * 1024;
 
@@ -165,7 +166,7 @@ impl PairingSession {
                             recoverable: attempts < MAX_ATTEMPTS,
                         },
                     );
-                    let _ = socket.close(CloseCode::Protocol, "invalid pairing request");
+                    finish_connection(&mut socket, CloseCode::Protocol, "invalid pairing request");
                     if attempts >= MAX_ATTEMPTS {
                         return Err(PairingError::AttemptLimit);
                     }
@@ -184,7 +185,7 @@ impl PairingSession {
                         recoverable: attempts < MAX_ATTEMPTS,
                     },
                 );
-                let _ = socket.close(CloseCode::Policy, "invalid pairing credential");
+                finish_connection(&mut socket, CloseCode::Policy, "invalid pairing credential");
                 if attempts >= MAX_ATTEMPTS {
                     return Err(PairingError::AttemptLimit);
                 }
@@ -206,7 +207,7 @@ impl PairingSession {
                         recoverable: false,
                     },
                 )?;
-                let _ = socket.close(CloseCode::Policy, "pairing denied");
+                finish_connection(&mut socket, CloseCode::Policy, "pairing denied");
                 return Err(PairingError::Denied);
             }
             let token = match self.store.issue_device(
@@ -224,6 +225,7 @@ impl PairingSession {
                             recoverable: false,
                         },
                     )?;
+                    finish_connection(&mut socket, CloseCode::Policy, "device capacity reached");
                     return Err(PairingError::DeviceCapacity { capacity: 16 });
                 }
                 Err(error) => return Err(error),
@@ -244,7 +246,7 @@ impl PairingSession {
                     domain_protocol_versions: self.domain_protocol_versions,
                 },
             )?;
-            let _ = socket.close(CloseCode::Normal, "pairing completed");
+            finish_connection(&mut socket, CloseCode::Normal, "pairing completed");
             return Ok(PairingOutcome {
                 client_id: request.client_id,
                 display_name: request.display_name,
@@ -291,8 +293,163 @@ fn send(socket: &mut TlsWebSocket, message: &PairingServerMessage) -> Result<(),
     Ok(())
 }
 
+fn finish_connection(socket: &mut TlsWebSocket, code: CloseCode, reason: &str) {
+    if socket.close(code, reason).is_err() {
+        return;
+    }
+    let deadline = Instant::now() + CLOSE_HANDSHAKE_TIMEOUT;
+    while Instant::now() < deadline {
+        match socket.read() {
+            Ok(TransportRead::Closed) | Err(_) => return,
+            Ok(
+                TransportRead::Text(_)
+                | TransportRead::Pong
+                | TransportRead::Control
+                | TransportRead::Timeout,
+            ) => {}
+            Ok(_) => {}
+        }
+    }
+}
+
 fn credential_matches(supplied: &str, expected: &str) -> bool {
     let supplied = Sha256::digest(supplied.as_bytes());
     let expected = Sha256::digest(expected.as_bytes());
     bool::from(supplied.as_slice().ct_eq(expected.as_slice()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        error::Error,
+        fs,
+        net::{SocketAddr, TcpStream},
+        path::PathBuf,
+        sync::{Arc, mpsc},
+        thread,
+        time::Duration,
+    };
+
+    use rustls::{
+        ClientConfig, ClientConnection, RootCertStore, StreamOwned,
+        pki_types::{CertificateDer, ServerName},
+    };
+    use tungstenite::{ClientRequestBuilder, Message, WebSocket, client, http::Uri};
+
+    use super::*;
+    use crate::{decode_server_message, encode_pairing_request};
+
+    type TestResult = Result<(), Box<dyn Error>>;
+    type TlsClient = WebSocket<StreamOwned<ClientConnection, TcpStream>>;
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn create() -> Result<Self, std::io::Error> {
+            let path = std::env::temp_dir().join(format!("agentpulse-pairing-{}", Uuid::now_v7()));
+            fs::create_dir(&path)?;
+            Ok(Self(path))
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn connect(
+        address: SocketAddr,
+        server_name: &str,
+        ca_der: &[u8],
+    ) -> Result<TlsClient, Box<dyn Error>> {
+        let mut roots = RootCertStore::empty();
+        roots.add(CertificateDer::from(ca_der.to_vec()))?;
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connection = ClientConnection::new(
+            Arc::new(config),
+            ServerName::try_from(server_name.to_owned())?,
+        )?;
+        let tcp = TcpStream::connect(address)?;
+        tcp.set_read_timeout(Some(Duration::from_secs(2)))?;
+        tcp.set_write_timeout(Some(Duration::from_secs(2)))?;
+        let stream = StreamOwned::new(connection, tcp);
+        let uri: Uri = format!(
+            "wss://{server_name}:{}{PAIRING_WEBSOCKET_PATH}",
+            address.port()
+        )
+        .parse()?;
+        let request =
+            ClientRequestBuilder::new(uri).with_sub_protocol(PAIRING_WEBSOCKET_SUBPROTOCOL);
+        let (socket, _) = client(request, stream)?;
+        Ok(socket)
+    }
+
+    fn read_server(socket: &mut TlsClient) -> Result<PairingServerMessage, Box<dyn Error>> {
+        loop {
+            match socket.read()? {
+                Message::Text(text) => return Ok(decode_server_message(text.as_bytes())?),
+                Message::Ping(_) | Message::Pong(_) => socket.flush()?,
+                Message::Close(_) => return Err("server closed before an application frame".into()),
+                Message::Binary(_) | Message::Frame(_) => return Err("unexpected frame".into()),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires loopback socket access"]
+    fn successful_pairing_waits_for_client_close_acknowledgement() -> TestResult {
+        let directory = TestDirectory::create()?;
+        let store = HostCredentialStore::new(directory.0.join("credentials.json"));
+        let identity = store.initialize("Pairing Close Test")?;
+        let session = PairingSession::bind(
+            store,
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            SocketAddr::from(([127, 0, 0, 1], 2333)),
+            "relay.example.com:2333".to_owned(),
+            1,
+            vec![1],
+        )?;
+        let address = session.local_address();
+        let bundle = session.bundle().clone();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let result = session.serve(|_| true);
+            let _ = result_sender.send(result);
+        });
+
+        let mut socket = connect(address, &identity.server_name, &identity.ca_certificate_der)?;
+        let client_id = Uuid::now_v7().to_string();
+        let request = PairingRequest {
+            pairing_id: bundle.pairing_id,
+            bootstrap_token: bundle.bootstrap_token,
+            client_id: client_id.clone(),
+            display_name: "Close Test Client".to_owned(),
+            version: Some("0.1.0-test".to_owned()),
+        };
+        socket.send(Message::text(String::from_utf8(encode_pairing_request(
+            &request,
+        )?)?))?;
+        assert!(matches!(
+            read_server(&mut socket)?,
+            PairingServerMessage::Pending { .. }
+        ));
+        assert!(matches!(
+            read_server(&mut socket)?,
+            PairingServerMessage::Succeeded { .. }
+        ));
+        assert!(matches!(
+            result_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        assert!(matches!(socket.read()?, Message::Close(_)));
+        socket.flush()?;
+        let outcome = result_receiver.recv_timeout(Duration::from_secs(2))??;
+        assert_eq!(outcome.client_id, client_id);
+        server.join().map_err(|_| "pairing server panicked")?;
+        Ok(())
+    }
 }
