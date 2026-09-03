@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage:
+  ap [nona|rinia] [--] [CODEX_ARGUMENTS...]
+  ap host [nona|rinia]
+  ap qrcode
+  ap status
+  ap stop
+  ap logs [JOURNAL_ARGUMENTS...]
+
+Examples:
+  ap
+  ap nona
+  ap rinia -C /path/to/project
+
+The first command starts or reuses the matching AgentPulse Host, then opens
+the Codex terminal UI through its managed App Server. A newly started Host
+shows one pairing QR code first. The Host remains running after the terminal UI
+exits so paired phones can reconnect.
+EOF
+}
+
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/agentpulse"
+service_name=agentpulse-host.service
+
+agentpulse_bin="${AGENTPULSE_BIN:-$(command -v agentpulse || true)}"
+if [[ -z "$agentpulse_bin" || ! -x "$agentpulse_bin" ]]; then
+    echo "ap: agentpulse is not installed or executable" >&2
+    exit 1
+fi
+
+host_status() {
+    "$agentpulse_bin" status 2>/dev/null
+}
+
+host_is_running() {
+    [[ "$1" == Host:* ]]
+}
+
+unit_load_state() {
+    systemctl --user show "$service_name" --property LoadState --value 2>/dev/null || true
+}
+
+wait_until_stopped() {
+    local host_pid="$1"
+    local status
+    for _ in {1..300}; do
+        status="$(host_status)"
+        if ! host_is_running "$status" && {
+            [[ -z "$host_pid" ]] || ! kill -0 "$host_pid" 2>/dev/null
+        }; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "ap: AgentPulse Host did not stop within 30 seconds" >&2
+    return 1
+}
+
+wait_until_unit_collected() {
+    local load_state
+    for _ in {1..100}; do
+        load_state="$(unit_load_state)"
+        if [[ -z "$load_state" || "$load_state" == "not-found" ]]; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "ap: systemd did not release $service_name within 10 seconds" >&2
+    return 1
+}
+
+stop_host() {
+    local status="$1"
+    local host_pid
+    local load_state
+    host_pid="$(sed -n 's/^Host PID: //p' <<<"$status")"
+    load_state="$(unit_load_state)"
+    if [[ -n "$load_state" && "$load_state" != "not-found" ]]; then
+        systemctl --user stop "$service_name"
+    elif host_is_running "$status"; then
+        "$agentpulse_bin" stop >/dev/null
+    fi
+    wait_until_stopped "$host_pid"
+    wait_until_unit_collected
+}
+
+show_recent_logs() {
+    journalctl --user --unit "$service_name" -n 40 --no-pager >&2 || true
+}
+
+wait_until_ready() {
+    local status
+    local load_state
+    local active_state
+    for _ in {1..150}; do
+        status="$(host_status)"
+        if host_is_running "$status" && grep -qx 'Provider: running' <<<"$status"; then
+            return 0
+        fi
+        load_state="$(unit_load_state)"
+        active_state="$(systemctl --user show "$service_name" --property ActiveState --value 2>/dev/null || true)"
+        if [[ -z "$load_state" || "$load_state" == "not-found" || "$active_state" == "failed" ]]; then
+            echo "ap: AgentPulse Host exited during startup; recent log follows" >&2
+            show_recent_logs
+            return 1
+        fi
+        sleep 0.1
+    done
+    echo "ap: AgentPulse Host was not ready within 15 seconds" >&2
+    show_recent_logs
+    return 1
+}
+
+case "${1:-}" in
+    -h|--help|help)
+        usage
+        exit 0
+        ;;
+    status)
+        exec "$agentpulse_bin" status
+        ;;
+    qr|qrcode)
+        exec "$agentpulse_bin" pair
+        ;;
+    stop)
+        status="$(host_status)"
+        load_state="$(unit_load_state)"
+        if host_is_running "$status" || [[ -n "$load_state" && "$load_state" != "not-found" ]]; then
+            stop_host "$status"
+        fi
+        echo "AgentPulse Host is stopped."
+        exit 0
+        ;;
+    logs)
+        shift
+        if (( $# == 0 )); then
+            exec journalctl --user --unit "$service_name" -n 80
+        fi
+        exec journalctl --user --unit "$service_name" -n 80 "$@"
+        ;;
+esac
+
+host_only=false
+if [[ "${1:-}" == "host" ]]; then
+    host_only=true
+    shift
+fi
+
+profile=default
+case "${1:-}" in
+    default|nona|rinia)
+        profile="$1"
+        shift
+        ;;
+esac
+if [[ "${1:-}" == "--" ]]; then
+    shift
+fi
+
+if [[ "$profile" == "default" ]]; then
+    codex_command=codex
+else
+    codex_command="codex-$profile"
+fi
+codex_bin="$(command -v "$codex_command" || true)"
+if [[ -z "$codex_bin" || ! -x "$codex_bin" ]]; then
+    echo "ap: $codex_command is not installed or executable" >&2
+    exit 1
+fi
+
+mkdir -p "$state_dir"
+exec 9>"$state_dir/launcher.lock"
+flock 9
+
+status="$(host_status)"
+started_host=false
+if host_is_running "$status"; then
+    active_codex="$(sed -n 's/^Codex executable: //p' <<<"$status")"
+    if [[ "$active_codex" != "$codex_bin" ]]; then
+        echo "Switching AgentPulse Host from ${active_codex:-an unknown Codex executable} to $codex_bin..."
+        stop_host "$status"
+        status="AgentPulse Host is stopped."
+    fi
+fi
+
+if ! host_is_running "$status"; then
+    wait_until_unit_collected
+    echo "Starting AgentPulse Host with $codex_command..."
+    systemd-run --user \
+        --unit agentpulse-host \
+        --collect \
+        --quiet \
+        --property Type=exec \
+        --property KillMode=mixed \
+        --property TimeoutStopSec=30s \
+        "$agentpulse_bin" serve \
+        --bind 127.0.0.1 \
+        --codex "$codex_bin"
+    wait_until_ready
+    started_host=true
+fi
+
+flock -u 9
+exec 9>&-
+
+if $host_only; then
+    echo "AgentPulse Host is ready with $codex_command."
+    exit 0
+fi
+
+if $started_host; then
+    echo "AgentPulse Host is ready. Scan this one-time QR code, or press Ctrl+C and run ap again later."
+    "$agentpulse_bin" pair
+fi
+
+exec "$agentpulse_bin" codex --codex "$codex_bin" -- "$@"

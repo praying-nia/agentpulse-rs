@@ -19,6 +19,26 @@ agentpulse serve --bind 127.0.0.1
 agentpulse codex -- <additional-codex-arguments>
 ```
 
+For a one-command Linux workflow, install the workspace release binary and
+[`scripts/ap`](../scripts/ap) on `PATH`. The helper starts or reuses the Host,
+keeps the Host and terminal UI on the same Codex profile, and uses the systemd
+user manager to leave the Host running when the terminal UI exits:
+
+```bash
+ap             # codex
+ap nona        # codex-nona
+ap rinia       # codex-rinia
+ap qrcode      # show another one-time pairing QR
+ap status
+ap stop
+```
+
+Starting or switching the Host shows one pairing QR before opening Codex; press
+`Ctrl+C` to skip it and run `ap` again, leaving the Host in the background.
+`ap qrcode` opens another one-time pairing session whenever the Host is already
+running. Additional arguments are forwarded to Codex, for example
+`ap rinia -C /path/to/project`.
+
 ## Pair and operate
 
 With the Relay-configured Host running, publish a two-minute QR-only pairing route:

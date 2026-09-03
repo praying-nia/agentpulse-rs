@@ -31,7 +31,7 @@ x509-parser = "0.16"
 jsonschema = { version = "0.52", default-features = false }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
-ctrlc = "3"
+ctrlc = { version = "3", features = ["termination"] }
 directories = "6"
 fs2 = "0.4"
 hmac = "0.12"

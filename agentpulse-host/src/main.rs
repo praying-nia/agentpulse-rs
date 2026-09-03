@@ -236,6 +236,7 @@ struct RuntimeStatus {
     host_name: String,
     server_name: String,
     native_address: SocketAddr,
+    codex_executable: Option<PathBuf>,
     codex_remote_uri: String,
     provider_health: String,
     native_health: String,
@@ -468,6 +469,7 @@ fn serve(paths: &HostPaths, args: ServeArgs) -> AppResult<()> {
         host_name: identity.host_name.clone(),
         server_name: identity.server_name.clone(),
         native_address,
+        codex_executable: Some(args.codex.clone()),
         codex_remote_uri: provider_handle.remote_uri().to_owned(),
         provider_health: health_name(provider_handle.snapshot().health()).to_owned(),
         native_health: native_health_name(native_handle.snapshot().health).to_owned(),
@@ -958,6 +960,10 @@ fn print_status(paths: &HostPaths) -> AppResult<()> {
                     }
                 }
                 None => println!("Relay: disabled"),
+            }
+            println!("Host PID: {}", status.pid);
+            if let Some(executable) = status.codex_executable {
+                println!("Codex executable: {}", executable.display());
             }
             println!("Codex remote: {}", status.codex_remote_uri);
         }
