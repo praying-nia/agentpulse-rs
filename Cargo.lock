@@ -104,6 +104,7 @@ dependencies = [
  "agentpulse-core",
  "agentpulse-protocol",
  "jsonschema",
+ "nix",
  "semver",
  "serde_json",
  "thiserror 2.0.20",

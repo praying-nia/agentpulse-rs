@@ -37,6 +37,7 @@ fs2 = "0.4"
 hmac = "0.12"
 if-addrs = "0.14"
 mdns-sd = "0.17"
+nix = { version = "0.31", features = ["signal"] }
 qrcode = { version = "0.14", default-features = false }
 rand = "0.10"
 rcgen = { version = "0.13", features = ["x509-parser"] }

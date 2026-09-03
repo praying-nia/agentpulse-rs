@@ -2104,6 +2104,11 @@ impl AppServerRuntime for ManagedCodexRuntime {
     fn stop(&mut self, config: &CodexProviderConfig) -> Result<(), CodexProviderSourceError> {
         let mut failures = Vec::new();
         if let Some(mut process) = self.process.take() {
+            if let Err(error) = process.terminate()
+                && error.kind() != io::ErrorKind::InvalidInput
+            {
+                failures.push(format!("process termination request: {error}"));
+            }
             let deadline = Instant::now() + config.shutdown_timeout;
             let mut exited = false;
             while Instant::now() < deadline {
@@ -2257,6 +2262,27 @@ impl ManagedProcess {
 
     fn kill(&mut self) -> io::Result<()> {
         self.child.kill()
+    }
+
+    #[cfg(unix)]
+    fn terminate(&mut self) -> io::Result<()> {
+        use nix::{
+            errno::Errno,
+            sys::signal::{Signal, kill},
+            unistd::Pid,
+        };
+
+        let pid = i32::try_from(self.child.id())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "child PID exceeds i32"))?;
+        match kill(Pid::from_raw(pid), Signal::SIGTERM) {
+            Ok(()) | Err(Errno::ESRCH) => Ok(()),
+            Err(error) => Err(io::Error::from(error)),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn terminate(&mut self) -> io::Result<()> {
+        self.kill()
     }
 
     fn wait(&mut self) -> io::Result<ExitStatus> {
@@ -3614,6 +3640,27 @@ mod tests {
         fs::remove_dir(&config.runtime_directory)?;
         fs::remove_file(executable)?;
         fs::remove_dir(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_runtime_signals_process_before_waiting_for_shutdown_deadline() -> TestResult {
+        let config = CodexProviderConfig::new(ProviderId::new(), "/tmp", [THREAD_ID])?
+            .with_shutdown_timeout(Duration::from_secs(3));
+        let child = Command::new("sleep")
+            .arg("30")
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut runtime = ManagedCodexRuntime {
+            process: Some(ManagedProcess::new(child)?),
+            owns_runtime_directory: false,
+        };
+
+        let started = Instant::now();
+        runtime.stop(&config)?;
+
+        assert!(started.elapsed() < Duration::from_secs(2));
         Ok(())
     }
 
