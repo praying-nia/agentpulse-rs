@@ -482,6 +482,11 @@ enum PendingControl {
     Report {
         session_id: SessionId,
     },
+    SelectModel {
+        session_id: SessionId,
+        model: String,
+        effort: Option<String>,
+    },
     ResumeThread {
         source_session_id: SessionId,
     },
@@ -612,24 +617,17 @@ fn flush_control_commands(
             .map(|(thread, turn, state)| (thread.to_owned(), turn.map(str::to_owned), state));
         match command.payload() {
             AgentCommandPayload::SelectModel { model, effort } => {
-                let mut controls = lock_controls(controls);
-                let defaults = controls.defaults_mut(session_id);
-                defaults.model = Some(model.to_string());
-                defaults.effort = effort.as_ref().map(ToString::to_string);
-                drop(controls);
-                publish_system_for_session(
-                    context.as_ref(),
-                    format!(
-                        "Model set to {}{}",
-                        model,
-                        effort
-                            .as_ref()
-                            .map(|v| format!(" ({v})"))
-                            .unwrap_or_default()
-                    ),
-                    mapper,
-                    events,
-                    status,
+                send_control_request(
+                    io,
+                    protocol,
+                    ExpectedResponse::ModelList,
+                    json!({"limit": 50}),
+                    PendingControl::SelectModel {
+                        session_id,
+                        model: model.to_string(),
+                        effort: effort.as_ref().map(ToString::to_string),
+                    },
+                    pending,
                 )?;
             }
             AgentCommandPayload::SetPlanMode { enabled } => {
@@ -1052,6 +1050,45 @@ fn process_control_response(
                 .map(|(thread, turn, state)| (thread.to_owned(), turn.map(str::to_owned), state));
             publish_system_for_session(context.as_ref(), text, mapper, events, status)
         }
+        PendingControl::SelectModel {
+            session_id,
+            model,
+            effort,
+        } => {
+            let context = lock_mapper(mapper)
+                .command_context(session_id)
+                .map(|(thread, turn, state)| (thread.to_owned(), turn.map(str::to_owned), state));
+            match validate_model_selection(&result, &model, effort.as_deref()) {
+                Ok(()) => {
+                    let mut controls = lock_controls(controls);
+                    let defaults = controls.defaults_mut(session_id);
+                    defaults.model = Some(model.clone());
+                    defaults.effort = effort.clone();
+                    drop(controls);
+                    publish_system_for_session(
+                        context.as_ref(),
+                        format!(
+                            "Model set to {}{}",
+                            model,
+                            effort
+                                .as_ref()
+                                .map(|value| format!(" ({value})"))
+                                .unwrap_or_default()
+                        ),
+                        mapper,
+                        events,
+                        status,
+                    )
+                }
+                Err(message) => publish_system_for_session(
+                    context.as_ref(),
+                    format!("Model selection rejected: {message}"),
+                    mapper,
+                    events,
+                    status,
+                ),
+            }
+        }
         PendingControl::ResumeThread { .. } => {
             let thread_id = result
                 .get("thread")
@@ -1159,6 +1196,7 @@ fn process_control_error(
     })?;
     match kind {
         PendingControl::Report { session_id }
+        | PendingControl::SelectModel { session_id, .. }
         | PendingControl::Silent { session_id }
         | PendingControl::HistoryItems { session_id, .. }
         | PendingControl::ResumeThread {
@@ -1222,7 +1260,12 @@ fn format_catalog(
                     .get("displayName")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or(id);
-                lines.push(format!("{id} — {name}"));
+                let efforts = supported_reasoning_efforts(value);
+                lines.push(if efforts.is_empty() {
+                    format!("{id} — {name}")
+                } else {
+                    format!("{id} — {name} — efforts: {}", efforts.join(", "))
+                });
             }
         }
         ExpectedResponse::PermissionProfileList => {
@@ -1268,6 +1311,51 @@ fn format_catalog(
         }
     }
     Ok(lines.join("\n"))
+}
+
+fn supported_reasoning_efforts(model: &serde_json::Value) -> Vec<&str> {
+    model
+        .get("supportedReasoningEfforts")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|option| {
+            option
+                .get("reasoningEffort")
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect()
+}
+
+fn validate_model_selection(
+    result: &serde_json::Value,
+    requested_model: &str,
+    requested_effort: Option<&str>,
+) -> Result<(), String> {
+    let models = result
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "Codex model catalog omitted data".to_owned())?;
+    let model = models
+        .iter()
+        .find(|value| value.get("id").and_then(serde_json::Value::as_str) == Some(requested_model))
+        .ok_or_else(|| {
+            format!("unknown model `{requested_model}`; run /model to list valid IDs")
+        })?;
+    if let Some(effort) = requested_effort {
+        let supported = supported_reasoning_efforts(model);
+        if !supported.contains(&effort) {
+            return Err(format!(
+                "effort `{effort}` is not supported by `{requested_model}`; valid efforts: {}",
+                if supported.is_empty() {
+                    "none advertised".to_owned()
+                } else {
+                    supported.join(", ")
+                }
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2612,6 +2700,42 @@ mod tests {
     const THREAD_ID: &str = "019976a4-00f0-7312-b36c-d01f9c5c06f6";
     const SECOND_THREAD_ID: &str = "019976a4-00f4-7561-a2a4-156c98eb31bc";
     const LIVE_FIXTURE: &str = include_str!("../tests/fixtures/live_success.jsonl");
+
+    #[test]
+    fn model_selection_requires_an_advertised_model_and_effort() -> TestResult {
+        let catalog = json!({
+            "data": [{
+                "id": "gpt-test",
+                "displayName": "GPT Test",
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": "low", "description": "Fast"},
+                    {"reasoningEffort": "high", "description": "Thorough"}
+                ]
+            }]
+        });
+
+        assert_eq!(validate_model_selection(&catalog, "gpt-test", None), Ok(()));
+        assert_eq!(
+            validate_model_selection(&catalog, "gpt-test", Some("high")),
+            Ok(())
+        );
+        assert_eq!(
+            validate_model_selection(&catalog, "missing", None),
+            Err("unknown model `missing`; run /model to list valid IDs".to_owned())
+        );
+        assert_eq!(
+            validate_model_selection(&catalog, "gpt-test", Some("maximum")),
+            Err(
+                "effort `maximum` is not supported by `gpt-test`; valid efforts: low, high"
+                    .to_owned()
+            )
+        );
+        assert!(
+            format_catalog(ExpectedResponse::ModelList, &catalog, None)?
+                .contains("efforts: low, high")
+        );
+        Ok(())
+    }
     const SERVER_REQUEST: &str = include_str!("../tests/fixtures/server_request.json");
     const INVALID_NOTIFICATION: &str = include_str!("../tests/fixtures/invalid_notification.json");
 
