@@ -642,7 +642,7 @@ mod tests {
     impl TestDirectory {
         fn create() -> Result<Self, std::io::Error> {
             let path = std::env::temp_dir().join(format!("agentpulse-pairing-{}", Uuid::now_v7()));
-            fs::create_dir(&path)?;
+            agentpulse_platform::ensure_private_dir(&path)?;
             Ok(Self(path))
         }
 
