@@ -121,6 +121,18 @@ fn descriptor() -> io::Result<LocalMemory> {
 }
 
 pub(super) fn protect(path: &Path) -> io::Result<()> {
+    apply_acl(path, false)
+}
+
+/// Applies the private descriptor to an object created by this process. The
+/// owner is written explicitly because elevated/restricted CI tokens can cause
+/// Windows to choose the token's default owner instead of TokenUser.
+pub(super) fn protect_new(path: &Path, directory: bool) -> io::Result<()> {
+    let _ = directory;
+    apply_acl(path, true)
+}
+
+fn apply_acl(path: &Path, set_owner: bool) -> io::Result<()> {
     let file = OpenOptions::new()
         .access_mode(READ_CONTROL | WRITE_DAC)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
@@ -141,12 +153,25 @@ pub(super) fn protect(path: &Path) -> io::Result<()> {
         {
             return Err(io::Error::last_os_error());
         }
-        check_owner(file.as_raw_handle(), SE_FILE_OBJECT)?;
+        if !set_owner {
+            check_owner(file.as_raw_handle(), SE_FILE_OBJECT)?;
+        }
+        let security_flags = if set_owner {
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION
+        } else {
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
+        };
         let error = SetSecurityInfo(
             file.as_raw_handle(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            null_mut(),
+            security_flags,
+            if set_owner {
+                expected_owner_from_descriptor(&security)?
+            } else {
+                null_mut()
+            },
             null_mut(),
             dacl,
             null_mut(),
@@ -156,6 +181,16 @@ pub(super) fn protect(path: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn expected_owner_from_descriptor(security: &LocalMemory) -> io::Result<*mut c_void> {
+    let mut owner = null_mut();
+    let mut defaulted = 0;
+    // SAFETY: descriptor is live and the output pointer is writable.
+    if unsafe { GetSecurityDescriptorOwner(security.0, &mut owner, &mut defaulted) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(owner)
 }
 
 fn check_owner(handle: HANDLE, kind: SE_OBJECT_TYPE) -> io::Result<()> {

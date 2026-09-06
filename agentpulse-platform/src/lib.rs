@@ -32,11 +32,23 @@ fn invalid(message: &str) -> io::Error {
 /// Creates a private directory and removes inherited access by other users.
 /// The path must designate an application-owned directory, not a shared root.
 pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
+    let existed = fs::symlink_metadata(path).is_ok();
     fs::create_dir_all(path)?;
     if !fs::symlink_metadata(path)?.is_dir() {
         return Err(invalid("private directory is not a real directory"));
     }
-    protect(path, true)
+    #[cfg(unix)]
+    {
+        protect(path, true)
+    }
+    #[cfg(windows)]
+    {
+        if existed {
+            windows::protect(path)
+        } else {
+            windows::protect_new(path, true)
+        }
+    }
 }
 
 /// Protects an existing private file, rejecting links and special files.
@@ -65,6 +77,7 @@ fn protect(path: &Path, directory: bool) -> io::Result<()> {
 
 /// Opens a persistent lock file inside a private application directory.
 pub fn open_private_lock(path: &Path) -> io::Result<File> {
+    let existed = path.symlink_metadata().is_ok();
     let mut options = OpenOptions::new();
     options.create(true).truncate(false).read(true).write(true);
     #[cfg(unix)]
@@ -72,10 +85,17 @@ pub fn open_private_lock(path: &Path) -> io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    if path.symlink_metadata().is_ok() {
+    if existed {
         protect_file(path)?;
     }
     let file = options.open(path)?;
+    #[cfg(windows)]
+    if !existed {
+        windows::protect_new(path, false)?;
+    } else {
+        protect_file(path)?;
+    }
+    #[cfg(unix)]
     protect_file(path)?;
     Ok(file)
 }
@@ -101,7 +121,10 @@ pub fn atomic_write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
             options.mode(0o600);
         }
         let mut file = options.open(&temporary)?;
+        #[cfg(unix)]
         protect_file(&temporary)?;
+        #[cfg(windows)]
+        windows::protect_new(&temporary, false)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
