@@ -133,8 +133,9 @@ pub(super) fn protect_new(path: &Path, directory: bool) -> io::Result<()> {
 }
 
 fn apply_acl(path: &Path, set_owner: bool) -> io::Result<()> {
+    let access = READ_CONTROL | WRITE_DAC | if set_owner { WRITE_OWNER } else { 0 };
     let file = OpenOptions::new()
-        .access_mode(READ_CONTROL | WRITE_DAC)
+        .access_mode(access)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;

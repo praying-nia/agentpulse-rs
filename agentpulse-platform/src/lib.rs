@@ -32,6 +32,7 @@ fn invalid(message: &str) -> io::Error {
 /// Creates a private directory and removes inherited access by other users.
 /// The path must designate an application-owned directory, not a shared root.
 pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
     let existed = fs::symlink_metadata(path).is_ok();
     fs::create_dir_all(path)?;
     if !fs::symlink_metadata(path)?.is_dir() {
