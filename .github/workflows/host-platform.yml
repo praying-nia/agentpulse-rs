@@ -1,0 +1,43 @@
+name: Host platform contracts
+
+on:
+  push:
+    paths:
+      - 'Cargo.*'
+      - 'agentpulse-platform/**'
+      - 'agentpulse-providers/codex/**'
+      - 'agentpulse-host/**'
+      - 'agentpulse-pairing/**'
+      - '.github/workflows/host-platform.yml'
+  pull_request:
+    paths:
+      - 'Cargo.*'
+      - 'agentpulse-platform/**'
+      - 'agentpulse-providers/codex/**'
+      - 'agentpulse-host/**'
+      - 'agentpulse-pairing/**'
+      - '.github/workflows/host-platform.yml'
+  workflow_dispatch:
+
+jobs:
+  contracts:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+      - name: Format
+        run: cargo +stable fmt --all --check
+      - name: Lint changed platform packages
+        run: cargo +stable clippy -p agentpulse-platform -p agentpulse-provider-codex -p agentpulse-pairing -p agentpulse-host --all-targets --no-deps --locked -- -D warnings
+      - name: Native storage, IPC and CLI contracts
+        run: cargo +stable test -p agentpulse-platform -p agentpulse-provider-codex -p agentpulse-pairing -p agentpulse-host --locked -- --test-threads=1
+      - name: Documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo +stable doc -p agentpulse-platform -p agentpulse-provider-codex -p agentpulse-pairing -p agentpulse-host --no-deps --locked

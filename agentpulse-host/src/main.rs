@@ -3,10 +3,9 @@
 use std::{
     collections::{BTreeSet, HashMap},
     error::Error,
-    fs::{self, File, OpenOptions},
-    io::{BufReader, Read, Write},
+    fs::{self, File},
+    io::{Read, Write},
     net::{IpAddr, SocketAddr},
-    os::unix::{fs::OpenOptionsExt, fs::PermissionsExt, net::UnixListener, net::UnixStream},
     path::{Path, PathBuf},
     process::Command,
     str::FromStr,
@@ -26,6 +25,10 @@ use agentpulse_channel_native::{
 use agentpulse_core::{ChannelId, ProviderId, SessionAggregateConfig};
 use agentpulse_pairing::{
     FileCredentialAuthorizer, HostCredentialStore, PairingSession, terminal_qr,
+};
+use agentpulse_platform::{
+    AdminListener, AdminStream, atomic_write_private, ensure_private_dir, open_private_lock,
+    protect_file,
 };
 use agentpulse_protocol::V2_PROTOCOL_VERSION;
 use agentpulse_provider_codex::{
@@ -221,10 +224,8 @@ impl HostPaths {
     }
 
     fn ensure(&self) -> AppResult<()> {
-        fs::create_dir_all(&self.data_dir)?;
-        fs::create_dir_all(&self.runtime_dir)?;
-        fs::set_permissions(&self.data_dir, fs::Permissions::from_mode(0o700))?;
-        fs::set_permissions(&self.runtime_dir, fs::Permissions::from_mode(0o700))?;
+        ensure_private_dir(&self.data_dir)?;
+        ensure_private_dir(&self.runtime_dir)?;
         Ok(())
     }
 
@@ -415,7 +416,7 @@ fn threads(paths: &HostPaths, command: ThreadsCommand) -> AppResult<()> {
 
 fn serve(paths: &HostPaths, args: ServeArgs) -> AppResult<()> {
     let _lock = acquire_serve_lock(paths)?;
-    prepare_admin_socket(paths)?;
+    let _status_cleanup = StatusFileCleanup(paths);
     let store = paths.store();
     let identity = store.load_identity()?;
     let relay_settings = load_relay_settings(&paths.relay_config, &identity.host_id)?;
@@ -437,13 +438,14 @@ fn serve(paths: &HostPaths, args: ServeArgs) -> AppResult<()> {
     };
     let provider_id = ProviderId::from_str(&identity.provider_id)?;
     let channel_id = ChannelId::from_str(&identity.channel_id)?;
+    let codex_executable = agentpulse_provider_codex::resolve_codex_executable(&args.codex)?;
     let runtime_root = paths.runtime_dir.join("codex");
     let provider_config = if args.discover_threads {
         CodexProviderConfig::discovering(provider_id, runtime_root)?
     } else {
         CodexProviderConfig::new(provider_id, runtime_root, identity.thread_ids.clone())?
     }
-    .with_codex_executable(args.codex.clone());
+    .with_codex_executable(codex_executable.clone());
     let provider_parts = CodexProvider::build(provider_config)?;
     let provider_handle = provider_parts.handle().clone();
     let (provider_port, provider_source, _) = provider_parts.into_parts();
@@ -465,9 +467,7 @@ fn serve(paths: &HostPaths, args: ServeArgs) -> AppResult<()> {
         .snapshot()
         .local_address
         .ok_or("Native endpoint did not publish its listening address")?;
-    let admin = UnixListener::bind(&paths.admin_socket)?;
-    fs::set_permissions(&paths.admin_socket, fs::Permissions::from_mode(0o600))?;
-    admin.set_nonblocking(true)?;
+    let mut admin = AdminListener::bind(&paths.admin_socket)?;
     let stop_requested = Arc::new(AtomicBool::new(false));
     let signal_stop = Arc::clone(&stop_requested);
     ctrlc::set_handler(move || signal_stop.store(true, Ordering::Release))?;
@@ -495,7 +495,7 @@ fn serve(paths: &HostPaths, args: ServeArgs) -> AppResult<()> {
         host_name: identity.host_name.clone(),
         server_name: identity.server_name.clone(),
         native_address,
-        codex_executable: Some(args.codex.clone()),
+        codex_executable: Some(codex_executable.clone()),
         codex_remote_uri: provider_handle.remote_uri().to_owned(),
         provider_health: health_name(provider_handle.snapshot().health()).to_owned(),
         native_health: native_health_name(native_handle.snapshot().health).to_owned(),
@@ -525,13 +525,13 @@ fn serve(paths: &HostPaths, args: ServeArgs) -> AppResult<()> {
     );
     println!(
         "Codex: {} --remote {}",
-        args.codex.display(),
+        codex_executable.display(),
         provider_handle.remote_uri()
     );
     println!("Pair a phone in another terminal: agentpulse pair");
 
     let loop_result = run_admin_loop(
-        &admin,
+        &mut admin,
         &stop_requested,
         &mut status,
         &provider_handle,
@@ -549,14 +549,13 @@ fn serve(paths: &HostPaths, args: ServeArgs) -> AppResult<()> {
     if let Some(mdns) = mdns {
         let _ = mdns.shutdown();
     }
-    cleanup_runtime_files(paths);
     loop_result?;
     let _ = stop_result?;
     Ok(())
 }
 
 fn run_admin_loop(
-    listener: &UnixListener,
+    listener: &mut AdminListener,
     stop_requested: &AtomicBool,
     status: &mut RuntimeStatus,
     provider: &agentpulse_provider_codex::CodexProviderHandle,
@@ -589,7 +588,11 @@ fn run_admin_loop(
                 .into());
         }
         match listener.accept() {
-            Ok((mut stream, _)) => handle_admin(&mut stream, stop_requested, status)?,
+            Ok(mut stream) => {
+                if let Err(error) = handle_admin(&mut stream, stop_requested, status) {
+                    eprintln!("warning: admin client failed: {error}");
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(error.into()),
         }
@@ -599,14 +602,11 @@ fn run_admin_loop(
 }
 
 fn handle_admin(
-    stream: &mut UnixStream,
+    stream: &mut AdminStream,
     stop_requested: &AtomicBool,
     status: &RuntimeStatus,
 ) -> AppResult<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    let mut payload = Vec::new();
-    stream.take(64 * 1024).read_to_end(&mut payload)?;
+    let payload = stream.receive(Duration::from_secs(2))?;
     let request = serde_json::from_slice::<AdminRequest>(&payload);
     let response = match request {
         Ok(AdminRequest::Status) => AdminResponse {
@@ -628,8 +628,7 @@ fn handle_admin(
             error: Some(error.to_string()),
         },
     };
-    stream.write_all(&serde_json::to_vec(&response)?)?;
-    stream.shutdown(std::net::Shutdown::Write)?;
+    stream.send(&serde_json::to_vec(&response)?, Duration::from_secs(2))?;
     Ok(())
 }
 
@@ -637,11 +636,18 @@ fn codex(paths: &HostPaths, args: CodexArgs) -> AppResult<()> {
     let status = request_admin(paths, AdminRequest::Status)?
         .status
         .ok_or("running Host did not return status")?;
-    let exit = Command::new(args.codex)
-        .arg("--remote")
-        .arg(status.codex_remote_uri)
-        .args(args.arguments)
-        .status()?;
+    let executable = if args.codex == Path::new("codex") {
+        status.codex_executable.unwrap_or(args.codex)
+    } else {
+        args.codex
+    };
+    let exit = Command::new(agentpulse_provider_codex::resolve_codex_executable(
+        &executable,
+    )?)
+    .arg("--remote")
+    .arg(status.codex_remote_uri)
+    .args(args.arguments)
+    .status()?;
     if !exit.success() {
         return Err(format!("Codex exited with {exit}").into());
     }
@@ -837,6 +843,11 @@ fn relay(paths: &HostPaths, command: RelayCommand) -> AppResult<()> {
 }
 
 fn load_relay_settings(path: &Path, host_id: &str) -> AppResult<Option<RelayHostSettings>> {
+    match protect_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -868,17 +879,7 @@ fn save_relay_settings(path: &Path, endpoint: &RelayEndpoint, token: &str) -> Ap
         endpoint: endpoint.clone(),
         enrollment_token: token.to_owned(),
     };
-    let temporary = path.with_extension("tmp");
-    let mut options = OpenOptions::new();
-    options.create(true).truncate(true).write(true).mode(0o600);
-    let mut file = options.open(&temporary)?;
-    file.write_all(&serde_json::to_vec_pretty(&record)?)?;
-    file.sync_all()?;
-    fs::rename(&temporary, path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    if let Some(parent) = path.parent() {
-        File::open(parent)?.sync_all()?;
-    }
+    atomic_write_private(path, &serde_json::to_vec_pretty(&record)?)?;
     Ok(())
 }
 
@@ -1014,14 +1015,10 @@ fn stop(paths: &HostPaths) -> AppResult<()> {
 }
 
 fn request_admin(paths: &HostPaths, request: AdminRequest) -> AppResult<AdminResponse> {
-    let mut stream =
-        UnixStream::connect(&paths.admin_socket).map_err(|_| "AgentPulse Host is not running")?;
-    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(3)))?;
-    stream.write_all(&serde_json::to_vec(&request)?)?;
-    stream.shutdown(std::net::Shutdown::Write)?;
-    let mut bytes = Vec::new();
-    BufReader::new(stream).read_to_end(&mut bytes)?;
+    let mut stream = AdminStream::connect(&paths.admin_socket, Duration::from_secs(3))
+        .map_err(|error| format!("cannot connect to AgentPulse Host: {error}"))?;
+    stream.send(&serde_json::to_vec(&request)?, Duration::from_secs(3))?;
+    let bytes = stream.receive(Duration::from_secs(3))?;
     let response: AdminResponse = serde_json::from_slice(&bytes)?;
     if response.ok {
         Ok(response)
@@ -1033,24 +1030,8 @@ fn request_admin(paths: &HostPaths, request: AdminRequest) -> AppResult<AdminRes
     }
 }
 
-fn prepare_admin_socket(paths: &HostPaths) -> AppResult<()> {
-    if !paths.admin_socket.exists() {
-        return Ok(());
-    }
-    if UnixStream::connect(&paths.admin_socket).is_ok() {
-        return Err("AgentPulse Host is already running".into());
-    }
-    fs::remove_file(&paths.admin_socket)?;
-    Ok(())
-}
-
 fn acquire_serve_lock(paths: &HostPaths) -> AppResult<File> {
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&paths.lock_file)?;
+    let lock = open_private_lock(&paths.lock_file)?;
     lock.try_lock_exclusive()
         .map_err(|_| "AgentPulse Host is already running")?;
     Ok(lock)
@@ -1062,24 +1043,24 @@ fn acquire_stopped_lock(paths: &HostPaths) -> AppResult<File> {
 }
 
 fn write_status(path: &Path, status: &RuntimeStatus) -> AppResult<()> {
-    let temporary = path.with_extension("tmp");
-    let bytes = serde_json::to_vec_pretty(status)?;
-    let mut options = OpenOptions::new();
-    options.create(true).truncate(true).write(true).mode(0o600);
-    let mut file = options.open(&temporary)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    fs::rename(temporary, path)?;
+    atomic_write_private(path, &serde_json::to_vec_pretty(status)?)?;
     Ok(())
 }
 
 fn cleanup_runtime_files(paths: &HostPaths) {
-    for path in [&paths.admin_socket, &paths.status_file] {
+    for path in [&paths.status_file] {
         if let Err(error) = fs::remove_file(path)
             && error.kind() != std::io::ErrorKind::NotFound
         {
             eprintln!("warning: failed to remove {}: {error}", path.display());
         }
+    }
+}
+
+struct StatusFileCleanup<'a>(&'a HostPaths);
+impl Drop for StatusFileCleanup<'_> {
+    fn drop(&mut self) {
+        cleanup_runtime_files(self.0);
     }
 }
 
@@ -1172,6 +1153,86 @@ fn _supported_codex_version() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestDirectory(PathBuf);
+    impl TestDirectory {
+        fn paths() -> AppResult<(Self, HostPaths)> {
+            let root = std::env::temp_dir().join(format!("ap-host-{}", uuid::Uuid::now_v7()));
+            let paths = HostPaths::resolve(Some(root.clone()))?;
+            paths.ensure()?;
+            Ok((Self(root), paths))
+        }
+    }
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn instance_lock_excludes_another_host_and_releases_on_drop() -> AppResult<()> {
+        let (_directory, paths) = TestDirectory::paths()?;
+        let lock = acquire_serve_lock(&paths)?;
+        assert!(acquire_serve_lock(&paths).is_err());
+        assert!(acquire_stopped_lock(&paths).is_err());
+        drop(lock);
+        let _next = acquire_serve_lock(&paths)?;
+        Ok(())
+    }
+
+    #[test]
+    fn admin_rejects_bad_json_then_serves_status_and_stop() -> AppResult<()> {
+        let (_directory, paths) = TestDirectory::paths()?;
+        let mut listener = AdminListener::bind(&paths.admin_socket)?;
+        let status: RuntimeStatus = serde_json::from_value(serde_json::json!({
+            "host_id": "test", "host_name": "Windows Host", "server_name": "test.local",
+            "native_address": "127.0.0.1:49320", "codex_executable": null,
+            "codex_remote_uri": "test://placeholder", "provider_health": "starting",
+            "native_health": "starting", "relay_endpoint": null, "relay_health": "disabled",
+            "relay_last_error": null, "pid": std::process::id()
+        }))?;
+        write_status(&paths.status_file, &status)?;
+        write_status(&paths.status_file, &status)?;
+        let stopped = Arc::new(AtomicBool::new(false));
+        let server_stopped = Arc::clone(&stopped);
+        let worker = thread::spawn(move || -> Result<(), String> {
+            for _ in 0..3 {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok(stream) => break stream,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            thread::sleep(Duration::from_millis(5))
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    }
+                };
+                handle_admin(&mut stream, &server_stopped, &status).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        });
+        let mut bad = AdminStream::connect(&paths.admin_socket, Duration::from_secs(2))?;
+        bad.send(b"not json", Duration::from_secs(2))?;
+        let response: AdminResponse =
+            serde_json::from_slice(&bad.receive(Duration::from_secs(2))?)?;
+        assert!(!response.ok);
+        drop(bad);
+        let response = request_admin(&paths, AdminRequest::Status)?;
+        assert_eq!(
+            response.status.map(|s| s.host_name),
+            Some("Windows Host".to_owned())
+        );
+        assert!(!stopped.load(Ordering::Acquire));
+        assert!(request_admin(&paths, AdminRequest::Stop)?.ok);
+        worker.join().map_err(|_| "admin worker panicked")??;
+        assert!(stopped.load(Ordering::Acquire));
+        cleanup_runtime_files(&paths);
+        assert!(!paths.status_file.exists());
+        Ok(())
+    }
 
     #[test]
     fn serve_uses_stable_native_port_by_default() -> AppResult<()> {

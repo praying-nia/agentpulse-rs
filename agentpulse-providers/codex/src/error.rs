@@ -9,6 +9,12 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum CodexProviderBuildError {
+    /// A local endpoint could not be reserved.
+    #[error("failed to reserve Codex loopback endpoint: {message}")]
+    Endpoint {
+        /// The operating-system error.
+        message: String,
+    },
     /// No Codex thread was configured.
     #[error("at least one Codex thread ID is required")]
     EmptyThreadList,
@@ -140,8 +146,8 @@ pub enum CodexProviderSourceError {
     /// The same Source instance was started twice without a completed stop.
     #[error("Codex Provider Source is already started")]
     AlreadyStarted,
-    /// Managed Unix App Server operation is unavailable on this platform.
-    #[error("managed Codex App Server Unix sockets are unsupported on this platform")]
+    /// Managed App Server operation is unavailable on this platform.
+    #[error("managed Codex App Server is unsupported on this platform")]
     UnsupportedPlatform,
     /// The Codex version probe failed.
     #[error("failed to query Codex version: {message}")]

@@ -12,9 +12,18 @@ use agentpulse_core::{ExternalId, ProviderId, SessionId};
 
 use crate::{CodexProviderBuildError, SUPPORTED_CODEX_CLI_VERSION};
 
+#[cfg(unix)]
 const PORTABLE_UNIX_SOCKET_PATH_MAX: usize = 96;
+#[cfg(unix)]
 const APP_SERVER_SOCKET_FILE_NAME: &str = "app-server.sock";
+#[cfg(unix)]
 const CLIENT_PROXY_SOCKET_FILE_NAME: &str = "client.sock";
+
+#[cfg(windows)]
+use std::{
+    net::{SocketAddr, TcpListener},
+    sync::{Arc, Mutex},
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct ConfiguredThread {
@@ -28,9 +37,17 @@ pub struct CodexProviderConfig {
     pub(crate) provider_id: ProviderId,
     pub(crate) runtime_root: PathBuf,
     pub(crate) runtime_directory: PathBuf,
+    #[cfg(unix)]
     pub(crate) socket_path: PathBuf,
     pub(crate) app_server_uri: String,
+    #[cfg(unix)]
     pub(crate) proxy_socket_path: PathBuf,
+    #[cfg(windows)]
+    pub(crate) app_server_address: Arc<Mutex<Option<SocketAddr>>>,
+    #[cfg(windows)]
+    pub(crate) proxy_listener: Arc<Mutex<Option<TcpListener>>>,
+    #[cfg(windows)]
+    pub(crate) proxy_address: SocketAddr,
     pub(crate) remote_uri: String,
     pub(crate) threads: Vec<ConfiguredThread>,
     pub(crate) discover_threads: bool,
@@ -95,20 +112,58 @@ impl CodexProviderConfig {
         let runtime_root = absolute_path(runtime_root)?;
 
         let runtime_directory = runtime_root.join(runtime_directory_key(provider_id));
+        #[cfg(unix)]
         let socket_path = runtime_directory.join(APP_SERVER_SOCKET_FILE_NAME);
+        #[cfg(unix)]
         let proxy_socket_path = runtime_directory.join(CLIENT_PROXY_SOCKET_FILE_NAME);
+        #[cfg(unix)]
         let socket_text = checked_socket_text(&socket_path, &runtime_root)?;
+        #[cfg(unix)]
         let proxy_socket_text = checked_socket_text(&proxy_socket_path, &runtime_root)?;
+        #[cfg(unix)]
         let app_server_uri = format!("unix://{socket_text}");
+        #[cfg(unix)]
         let remote_uri = format!("unix://{proxy_socket_text}");
+
+        #[cfg(windows)]
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).map_err(|error| {
+            CodexProviderBuildError::Endpoint {
+                message: error.to_string(),
+            }
+        })?;
+        #[cfg(windows)]
+        let proxy_address =
+            listener
+                .local_addr()
+                .map_err(|error| CodexProviderBuildError::Endpoint {
+                    message: error.to_string(),
+                })?;
+        #[cfg(windows)]
+        let remote_uri = {
+            let token = rand::random::<[u8; 32]>()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!("ws://{proxy_address}/agentpulse/{token}")
+        };
+        #[cfg(windows)]
+        let app_server_uri = "ws://127.0.0.1:0".to_owned();
 
         Ok(Self {
             provider_id,
             runtime_root,
             runtime_directory,
+            #[cfg(unix)]
             socket_path,
             app_server_uri,
+            #[cfg(unix)]
             proxy_socket_path,
+            #[cfg(windows)]
+            app_server_address: Arc::new(Mutex::new(None)),
+            #[cfg(windows)]
+            proxy_listener: Arc::new(Mutex::new(Some(listener))),
+            #[cfg(windows)]
+            proxy_address,
             remote_uri,
             threads,
             discover_threads,
@@ -151,7 +206,8 @@ impl CodexProviderConfig {
         SUPPORTED_CODEX_CLI_VERSION
     }
 
-    /// Returns the deterministic observing proxy endpoint shown to `codex --remote`.
+    /// Returns the observing proxy endpoint shown to `codex --remote`.
+    /// Windows reserves a random loopback port and a secret connection path.
     #[must_use]
     pub fn remote_uri(&self) -> &str {
         &self.remote_uri
@@ -181,6 +237,7 @@ impl CodexProviderConfig {
     }
 }
 
+#[cfg(unix)]
 fn checked_socket_text<'a>(
     path: &'a Path,
     runtime_root: &Path,
@@ -239,9 +296,11 @@ mod tests {
     use super::*;
 
     const PROVIDER_ID: &str = "0198f1b7-7212-7a34-9678-90abcdef1234";
+    #[cfg(unix)]
     const THREAD_ID: &str = "01a04932-b445-77f1-85aa-9e8304f16c71";
 
     #[test]
+    #[cfg(unix)]
     fn normal_desktop_host_path_uses_stable_short_random_key() -> Result<(), Box<dyn Error>> {
         let provider_id = ProviderId::from_str(PROVIDER_ID)?;
         let runtime_root = "/home/desktop-user/.config/agentpulse/runtime/codex";
@@ -268,6 +327,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn genuinely_long_runtime_root_still_rejects_socket_path() -> Result<(), Box<dyn Error>> {
         let provider_id = ProviderId::from_str(PROVIDER_ID)?;
         let runtime_root = PathBuf::from(format!("/{}", "x".repeat(80)));

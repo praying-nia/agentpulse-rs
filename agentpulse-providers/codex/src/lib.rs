@@ -1,6 +1,7 @@
 //! A Codex Provider with live observation and command/file approval write-back.
 //!
-//! The Provider owns a Unix-socket Codex App Server, either resumes an explicit
+//! The Provider owns a local Codex App Server (Unix socket or Windows loopback),
+//! either resumes an explicit
 //! set of threads or follows threads opened by another client of that same
 //! server, strictly validates the schema-pinned protocol, and publishes
 //! normalized live session events through `agentpulse-bridge`.
@@ -9,6 +10,7 @@ mod approval;
 mod config;
 mod control;
 mod error;
+mod executable;
 mod mapper;
 mod port;
 mod protocol;
@@ -21,6 +23,7 @@ use agentpulse_core::{NonEmptyText, ProviderCapabilities, ProviderDescriptor, Pr
 
 pub use config::CodexProviderConfig;
 pub use error::{CodexProviderBuildError, CodexProviderPortError, CodexProviderSourceError};
+pub use executable::resolve_codex_executable;
 pub use port::CodexProviderPort;
 pub use runtime::CodexProviderSource;
 pub use status::{CodexProviderHealth, CodexProviderSnapshot};

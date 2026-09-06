@@ -1,8 +1,7 @@
 //! Strict atomic Host identity and device-credential storage.
 
 use std::{
-    fs::{self, File, OpenOptions},
-    io::Write,
+    fs::{self, File},
     path::{Path, PathBuf},
 };
 
@@ -355,6 +354,8 @@ impl HostCredentialStore {
                 path: self.path.clone(),
             });
         }
+        agentpulse_platform::protect_file(&self.path)
+            .map_err(|source| PairingError::io("protect file", &self.path, source))?;
         let bytes =
             fs::read(&self.path).map_err(|source| PairingError::io("read", &self.path, source))?;
         let record: StoreRecord = serde_json::from_slice(&bytes)?;
@@ -364,35 +365,8 @@ impl HostCredentialStore {
 
     fn save_unlocked(&self, record: &StoreRecord) -> Result<(), PairingError> {
         let bytes = serde_json::to_vec_pretty(record)?;
-        let temporary = self.path.with_extension("tmp");
-        let mut options = OpenOptions::new();
-        options.create(true).truncate(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&temporary)
-            .map_err(|source| PairingError::io("create temporary", &temporary, source))?;
-        file.write_all(&bytes)
-            .map_err(|source| PairingError::io("write temporary", &temporary, source))?;
-        file.sync_all()
-            .map_err(|source| PairingError::io("sync temporary", &temporary, source))?;
-        fs::rename(&temporary, &self.path)
-            .map_err(|source| PairingError::io("replace", &self.path, source))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))
-                .map_err(|source| PairingError::io("set permissions on", &self.path, source))?;
-        }
-        if let Some(parent) = self.path.parent() {
-            File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|source| PairingError::io("sync directory", parent, source))?;
-        }
-        Ok(())
+        agentpulse_platform::atomic_write_private(&self.path, &bytes)
+            .map_err(|source| PairingError::io("replace private file", &self.path, source))
     }
 
     fn ensure_parent(&self) -> Result<(), PairingError> {
@@ -403,24 +377,13 @@ impl HostCredentialStore {
                 field: "credential_path",
                 reason: "path has no parent".to_owned(),
             })?;
-        fs::create_dir_all(parent)
-            .map_err(|source| PairingError::io("create directory", parent, source))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-                .map_err(|source| PairingError::io("set permissions on", parent, source))?;
-        }
+        agentpulse_platform::ensure_private_dir(parent)
+            .map_err(|source| PairingError::io("protect directory", parent, source))?;
         Ok(())
     }
 
     fn open_lock(&self) -> Result<File, PairingError> {
-        OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&self.lock_path)
+        agentpulse_platform::open_private_lock(&self.lock_path)
             .map_err(|source| PairingError::io("open lock", &self.lock_path, source))
     }
 }
