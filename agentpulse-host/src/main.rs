@@ -1217,10 +1217,20 @@ fn _supported_codex_version() -> &'static str {
 mod tests {
     use super::*;
 
+    fn short_test_root() -> PathBuf {
+        let uuid = uuid::Uuid::now_v7().simple().to_string();
+        let suffix = &uuid[uuid.len() - 16..];
+        #[cfg(unix)]
+        let temporary = Path::new("/tmp");
+        #[cfg(windows)]
+        let temporary = std::env::temp_dir();
+        temporary.join(format!("aph{suffix}"))
+    }
+
     struct TestDirectory(PathBuf);
     impl TestDirectory {
         fn paths() -> AppResult<(Self, HostPaths)> {
-            let root = std::env::temp_dir().join(format!("ap-host-{}", uuid::Uuid::now_v7()));
+            let root = short_test_root();
             let paths = HostPaths::resolve(Some(root.clone()))?;
             paths.ensure()?;
             Ok((Self(root), paths))
