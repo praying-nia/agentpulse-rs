@@ -9,7 +9,9 @@ fn loopback_config_reserves_port_and_accepts_long_unicode_paths() -> TestResult 
     let id = ProviderId::new();
     let root = std::env::temp_dir().join("\u{6d4b}\u{8bd5}".repeat(64));
     let config = CodexProviderConfig::discovering(id, root)?;
-    assert!(config.remote_uri().starts_with("ws://127.0.0.1:"));
+    assert_eq!(config.remote_uri(), format!("ws://{}", config.proxy_address));
+    assert_eq!(config.proxy_token.expose().len(), 64);
+    assert!(!format!("{config:?}").contains(config.proxy_token.expose()));
     assert_eq!(config.app_server_uri, "ws://127.0.0.1:0");
     assert!(std::net::TcpListener::bind(config.proxy_address).is_err());
     let address = config.proxy_address;
@@ -28,14 +30,16 @@ fn reported_address_requires_nonzero_ipv4_loopback_listener() {
 }
 
 #[test]
-fn proxy_rejects_wrong_path_and_browser_origin_then_accepts_native_client() -> TestResult {
+fn proxy_requires_bearer_and_rejects_non_root_targets_and_browser_origin() -> TestResult {
     use tungstenite::client::IntoClientRequest;
+    use tungstenite::http::header::{AUTHORIZATION, ORIGIN};
     let config = windows_config()?;
     let listener = transport::bind_proxy(&config)?;
     let address = config.proxy_address;
     let uri = config.remote_uri().to_owned();
+    let token = config.proxy_token.expose().to_owned();
     let worker = thread::spawn(move || -> Result<(), String> {
-        for should_accept in [false, false, true] {
+        for should_accept in [false, false, false, false, false, true] {
             let (stream, _) = listener.accept().map_err(|e| e.to_string())?;
             stream.set_read_timeout(Some(Duration::from_secs(2))).map_err(|e| e.to_string())?;
             stream.set_write_timeout(Some(Duration::from_secs(2))).map_err(|e| e.to_string())?;
@@ -44,15 +48,48 @@ fn proxy_rejects_wrong_path_and_browser_origin_then_accepts_native_client() -> T
         }
         Ok(())
     });
-    for (target, origin) in [(format!("ws://{address}/invalid"), None), (uri.clone(), Some("https://example.invalid")), (uri, None)] {
+    let cases = [
+        (uri.clone(), None, None, false),
+        (uri.clone(), Some("wrong-token"), None, false),
+        (
+            format!("{uri}/invalid"),
+            Some(token.as_str()),
+            None,
+            false,
+        ),
+        (
+            format!("{uri}/?unexpected=true"),
+            Some(token.as_str()),
+            None,
+            false,
+        ),
+        (
+            uri.clone(),
+            Some(token.as_str()),
+            Some("https://example.invalid"),
+            false,
+        ),
+        (uri, Some(token.as_str()), None, true),
+    ];
+    for (case_index, (target, supplied_token, origin, should_accept)) in
+        cases.into_iter().enumerate()
+    {
         let stream = TcpStream::connect(address)?;
         stream.set_read_timeout(Some(Duration::from_secs(2)))?;
         let mut request = target.as_str().into_client_request()?;
-        if let Some(origin) = origin { request.headers_mut().insert("Origin", origin.parse()?); }
+        if let Some(supplied_token) = supplied_token {
+            request.headers_mut().insert(AUTHORIZATION, format!("Bearer {supplied_token}").parse()?);
+        }
+        if let Some(origin) = origin { request.headers_mut().insert(ORIGIN, origin.parse()?); }
         let result = tungstenite::client(request, stream);
-        if target.ends_with("/invalid") || origin.is_some() {
-            assert!(matches!(result, Err(tungstenite::HandshakeError::Failure(tungstenite::Error::Http(response))) if response.status() == 403));
-        } else { assert!(result.is_ok()); }
+        if should_accept {
+            assert!(result.is_ok());
+        } else {
+            assert!(
+                matches!(&result, Err(tungstenite::HandshakeError::Failure(tungstenite::Error::Http(response))) if response.status() == 403),
+                "rejection case {case_index} returned {result:?}"
+            );
+        }
     }
     worker.join().map_err(|_| "handshake server panicked")??;
     Ok(())

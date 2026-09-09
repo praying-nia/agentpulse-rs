@@ -4,6 +4,8 @@ use super::*;
 pub(super) use std::net::{TcpListener as LocalListener, TcpStream as LocalStream};
 #[cfg(unix)]
 pub(super) use std::os::unix::net::{UnixListener as LocalListener, UnixStream as LocalStream};
+#[cfg(windows)]
+use subtle::ConstantTimeEq;
 
 pub(super) fn bind_proxy(
     config: &CodexProviderConfig,
@@ -128,19 +130,28 @@ pub(super) fn accept_proxy(
     };
     #[cfg(windows)]
     let result = {
-        use tungstenite::handshake::server::{Request, Response};
-        let expected_path = config
-            .remote_uri
-            .strip_prefix(&format!("ws://{}", config.proxy_address))
-            .ok_or("invalid proxy URI")?
-            .to_owned();
+        use tungstenite::{
+            handshake::server::{Request, Response},
+            http::header::{AUTHORIZATION, ORIGIN},
+        };
+        let expected_token = config.proxy_token.clone();
         drive_handshake(
             tungstenite::accept_hdr_with_config(
                 stream,
                 move |request: &Request, response: Response| {
-                    if request.uri().path() != expected_path
+                    let mut authorization_values = request.headers().get_all(AUTHORIZATION).iter();
+                    let authorized = authorization_values
+                        .next()
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.strip_prefix("Bearer "))
+                        .is_some_and(|value| {
+                            bool::from(value.as_bytes().ct_eq(expected_token.expose().as_bytes()))
+                        })
+                        && authorization_values.next().is_none();
+                    if request.uri().path() != "/"
                         || request.uri().query().is_some()
-                        || request.headers().contains_key("origin")
+                        || request.headers().contains_key(ORIGIN)
+                        || !authorized
                     {
                         let mut rejection =
                             tungstenite::http::Response::new(Some("Forbidden".to_owned()));

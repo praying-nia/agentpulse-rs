@@ -644,6 +644,16 @@ fn process_discover(
     let snapshot = actions
         .discovery_snapshot()
         .map_err(|error| runtime_failure(Some(request_id.clone()), error))?;
+    let session_ids = snapshot
+        .sessions()
+        .iter()
+        .map(|entry| entry.session().id().to_string())
+        .collect::<Vec<_>>();
+    eprintln!(
+        "agentpulse native: discovery snapshot sessions={} ids={:?}",
+        session_ids.len(),
+        session_ids
+    );
     let mut frames = Vec::with_capacity(snapshot.providers().len() + snapshot.sessions().len() + 2);
     frames.push(server_text(&NativeServerMessage::SyncStarted {
         request_id: request_id.clone(),
@@ -679,6 +689,11 @@ fn process_discover(
     delivery
         .enqueue_batch(frames)
         .map_err(|capacity| ConnectionFailure::Fatal(queue_error(capacity)))?;
+    eprintln!(
+        "agentpulse native: discovery frames enqueued sessions={} ids={:?}",
+        session_ids.len(),
+        session_ids
+    );
     if let Some(client) = delivery.client.as_mut() {
         client.discovered = discovered;
     }

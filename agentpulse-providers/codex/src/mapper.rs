@@ -91,6 +91,17 @@ impl CodexEventMapper {
                 "thread/resume returned unconfigured thread {thread_id}"
             ))
         })?;
+        let title = thread_title(thread)?.map(|value| value.as_str().to_owned());
+        let cwd = optional_string(thread, "cwd")?.unwrap_or_default();
+        let status_type = thread
+            .get("status")
+            .and_then(|value| value.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        eprintln!(
+            "agentpulse codex: discovered thread id={} title={:?} cwd={:?} status={}",
+            thread_id, title, cwd, status_type
+        );
 
         if self.threads.contains_key(thread_id) {
             let observed_at = timestamp_seconds(optional_i64_field(thread, "updatedAt")?)?;
@@ -233,6 +244,10 @@ impl CodexEventMapper {
         &mut self,
         thread_id: &str,
     ) -> Result<(), CodexProviderSourceError> {
+        eprintln!(
+            "agentpulse codex: tracking discovered thread id={}",
+            thread_id
+        );
         self.configured
             .entry(thread_id.to_owned())
             .or_insert(SessionId::from_str(thread_id)?);

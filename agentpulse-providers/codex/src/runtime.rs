@@ -161,6 +161,11 @@ impl CodexProviderSource {
             Err(error) => return Err(self.record_start_failure(error, &events)),
         };
         let mut protocol = ProtocolEngine::new(self.schema.clone());
+        eprintln!(
+            "agentpulse codex: startup configured_threads={} discover_threads={}",
+            self.config.threads.len(),
+            self.config.discover_threads
+        );
 
         if let Err(error) = initialize_connection(
             &mut *io,
@@ -177,6 +182,10 @@ impl CodexProviderSource {
         let mut resume_failures = Vec::new();
         for thread in &self.config.threads {
             let thread_id = thread.external_id.as_str();
+            eprintln!(
+                "agentpulse codex: thread/resume request thread_id={}",
+                thread_id
+            );
             let (request_id, request) = match protocol.thread_resume_request(thread_id) {
                 Ok(request) => request,
                 Err(error) => {
@@ -213,6 +222,11 @@ impl CodexProviderSource {
                     resume_failures.push(format!("{thread_id}: {error}"));
                 }
             }
+        }
+        if self.config.discover_threads {
+            eprintln!(
+                "agentpulse codex: discover mode issued no startup thread/list request; waiting for thread/started"
+            );
         }
 
         if !resume_failures.is_empty() {
@@ -2896,6 +2910,8 @@ mod tests {
     };
     use agentpulse_protocol::{ProtocolMessage, V2_PROTOCOL_VERSION};
     use tungstenite::{ClientRequestBuilder, Message, WebSocket, client, http::Uri};
+    #[cfg(windows)]
+    use tungstenite::{client::IntoClientRequest, http::header::AUTHORIZATION};
 
     use super::*;
     use crate::{CodexProviderPort, status::snapshot};
@@ -4056,10 +4072,16 @@ mod tests {
         stream.set_read_timeout(Some(Duration::from_secs(2)))?;
         stream.set_write_timeout(Some(Duration::from_secs(2)))?;
         #[cfg(unix)]
-        let uri = "ws://localhost/";
+        let (socket, _) = tungstenite::client("ws://localhost/", stream)?;
         #[cfg(windows)]
-        let uri = config.remote_uri();
-        let (socket, _) = tungstenite::client(uri, stream)?;
+        let (socket, _) = {
+            let mut request = config.remote_uri().into_client_request()?;
+            request.headers_mut().insert(
+                AUTHORIZATION,
+                format!("Bearer {}", config.proxy_token.expose()).parse()?,
+            );
+            tungstenite::client(request, stream)?
+        };
         Ok(socket)
     }
 

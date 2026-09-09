@@ -121,8 +121,10 @@ dependencies = [
  "rand",
  "semver",
  "serde_json",
+ "subtle",
  "thiserror 2.0.20",
  "tungstenite",
+ "zeroize",
 ]
 
 [[package]]

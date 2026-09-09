@@ -44,11 +44,12 @@ use directories::ProjectDirs;
 use fs2::FileExt;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 type AppResult<T> = Result<T, Box<dyn Error>>;
 const DEFAULT_NATIVE_PORT: u16 = 49_320;
 const RELAY_CONNECTOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const CODEX_PROXY_TOKEN_ENV: &str = "AGENTPULSE_CODEX_PROXY_TOKEN";
 
 #[derive(Parser)]
 #[command(name = "agentpulse", version, about = "Secure local AgentPulse Host")]
@@ -251,6 +252,14 @@ struct RuntimeStatus {
     pid: u32,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodexLaunchCredentials {
+    remote_uri: String,
+    auth_token: Option<String>,
+    executable: Option<PathBuf>,
+}
+
 const RELAY_HOST_CONFIG_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Serialize, Deserialize)]
@@ -326,6 +335,7 @@ impl RelayRuntimeState {
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum AdminRequest {
     Status,
+    CodexLaunch,
     Stop,
 }
 
@@ -334,6 +344,8 @@ enum AdminRequest {
 struct AdminResponse {
     ok: bool,
     status: Option<RuntimeStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex_launch: Option<CodexLaunchCredentials>,
     error: Option<String>,
 }
 
@@ -419,6 +431,10 @@ fn serve(paths: &HostPaths, args: ServeArgs) -> AppResult<()> {
     let _status_cleanup = StatusFileCleanup(paths);
     let store = paths.store();
     let identity = store.load_identity()?;
+    eprintln!(
+        "agentpulse host: configured_thread_ids={:?} discover_threads={}",
+        identity.thread_ids, args.discover_threads
+    );
     let relay_settings = load_relay_settings(&paths.relay_config, &identity.host_id)?;
     if identity.thread_ids.is_empty() && !args.discover_threads {
         return Err("no Codex threads configured; run `agentpulse threads add` first".into());
@@ -589,7 +605,7 @@ fn run_admin_loop(
         }
         match listener.accept() {
             Ok(mut stream) => {
-                if let Err(error) = handle_admin(&mut stream, stop_requested, status) {
+                if let Err(error) = handle_admin(&mut stream, stop_requested, status, provider) {
                     eprintln!("warning: admin client failed: {error}");
                 }
             }
@@ -605,13 +621,25 @@ fn handle_admin(
     stream: &mut AdminStream,
     stop_requested: &AtomicBool,
     status: &RuntimeStatus,
+    provider: &agentpulse_provider_codex::CodexProviderHandle,
 ) -> AppResult<()> {
     let payload = stream.receive(Duration::from_secs(2))?;
     let request = serde_json::from_slice::<AdminRequest>(&payload);
-    let response = match request {
+    let mut response = match request {
         Ok(AdminRequest::Status) => AdminResponse {
             ok: true,
             status: Some(status.clone()),
+            codex_launch: None,
+            error: None,
+        },
+        Ok(AdminRequest::CodexLaunch) => AdminResponse {
+            ok: true,
+            status: None,
+            codex_launch: Some(CodexLaunchCredentials {
+                remote_uri: provider.remote_uri().to_owned(),
+                auth_token: provider.remote_auth_token().map(str::to_owned),
+                executable: status.codex_executable.clone(),
+            }),
             error: None,
         },
         Ok(AdminRequest::Stop) => {
@@ -619,39 +647,69 @@ fn handle_admin(
             AdminResponse {
                 ok: true,
                 status: Some(status.clone()),
+                codex_launch: None,
                 error: None,
             }
         }
         Err(error) => AdminResponse {
             ok: false,
             status: None,
+            codex_launch: None,
             error: Some(error.to_string()),
         },
     };
-    stream.send(&serde_json::to_vec(&response)?, Duration::from_secs(2))?;
+    let payload = Zeroizing::new(serde_json::to_vec(&response)?);
+    if let Some(credentials) = response.codex_launch.as_mut()
+        && let Some(token) = credentials.auth_token.as_mut()
+    {
+        token.zeroize();
+    }
+    stream.send(payload.as_slice(), Duration::from_secs(2))?;
     Ok(())
 }
 
 fn codex(paths: &HostPaths, args: CodexArgs) -> AppResult<()> {
-    let status = request_admin(paths, AdminRequest::Status)?
-        .status
-        .ok_or("running Host did not return status")?;
+    let credentials = request_admin(paths, AdminRequest::CodexLaunch)?
+        .codex_launch
+        .ok_or("running Host did not return Codex launch credentials")?;
     let executable = if args.codex == Path::new("codex") {
-        status.codex_executable.unwrap_or(args.codex)
+        credentials.executable.clone().unwrap_or(args.codex)
     } else {
         args.codex
     };
-    let exit = Command::new(agentpulse_provider_codex::resolve_codex_executable(
+    let auth_token = credentials.auth_token.map(Zeroizing::new);
+    let mut command = Command::new(agentpulse_provider_codex::resolve_codex_executable(
         &executable,
-    )?)
-    .arg("--remote")
-    .arg(status.codex_remote_uri)
-    .args(args.arguments)
-    .status()?;
+    )?);
+    configure_codex_command(
+        &mut command,
+        &credentials.remote_uri,
+        auth_token.as_ref().map(|token| token.as_str()),
+        &args.arguments,
+    );
+    let mut child = command.spawn()?;
+    drop(command);
+    let exit = child.wait()?;
     if !exit.success() {
         return Err(format!("Codex exited with {exit}").into());
     }
     Ok(())
+}
+
+fn configure_codex_command(
+    command: &mut Command,
+    remote_uri: &str,
+    auth_token: Option<&str>,
+    arguments: &[String],
+) {
+    command.arg("--remote").arg(remote_uri);
+    if let Some(token) = auth_token {
+        command
+            .arg("--remote-auth-token-env")
+            .arg(CODEX_PROXY_TOKEN_ENV)
+            .env(CODEX_PROXY_TOKEN_ENV, token);
+    }
+    command.args(arguments);
 }
 
 fn pair(paths: &HostPaths) -> AppResult<()> {
@@ -668,6 +726,11 @@ fn pair(paths: &HostPaths) -> AppResult<()> {
         NATIVE_TRANSPORT_VERSION,
         vec![V2_PROTOCOL_VERSION],
     )?;
+    eprintln!(
+        "agentpulse pairing: session listener_port={} bundle_port={}",
+        session.local_address().port(),
+        session.bundle().port
+    );
     let pairing_root = device_root_from_token(&session.bundle().bootstrap_token);
     let route = derive_route(&pairing_root, &settings.endpoint)?.registration();
     let relay_config = RelayHostConnectionConfig::new(
@@ -1018,8 +1081,8 @@ fn request_admin(paths: &HostPaths, request: AdminRequest) -> AppResult<AdminRes
     let mut stream = AdminStream::connect(&paths.admin_socket, Duration::from_secs(3))
         .map_err(|error| format!("cannot connect to AgentPulse Host: {error}"))?;
     stream.send(&serde_json::to_vec(&request)?, Duration::from_secs(3))?;
-    let bytes = stream.receive(Duration::from_secs(3))?;
-    let response: AdminResponse = serde_json::from_slice(&bytes)?;
+    let bytes = Zeroizing::new(stream.receive(Duration::from_secs(3))?);
+    let response: AdminResponse = serde_json::from_slice(bytes.as_slice())?;
     if response.ok {
         Ok(response)
     } else {
@@ -1193,10 +1256,16 @@ mod tests {
         }))?;
         write_status(&paths.status_file, &status)?;
         write_status(&paths.status_file, &status)?;
+        let provider = CodexProvider::build(CodexProviderConfig::discovering(
+            ProviderId::new(),
+            paths.runtime_dir.join("admin-test-codex"),
+        )?)?
+        .handle()
+        .clone();
         let stopped = Arc::new(AtomicBool::new(false));
         let server_stopped = Arc::clone(&stopped);
         let worker = thread::spawn(move || -> Result<(), String> {
-            for _ in 0..3 {
+            for _ in 0..4 {
                 let deadline = Instant::now() + Duration::from_secs(5);
                 let mut stream = loop {
                     match listener.accept() {
@@ -1210,7 +1279,8 @@ mod tests {
                         Err(error) => return Err(error.to_string()),
                     }
                 };
-                handle_admin(&mut stream, &server_stopped, &status).map_err(|e| e.to_string())?;
+                handle_admin(&mut stream, &server_stopped, &status, &provider)
+                    .map_err(|e| e.to_string())?;
             }
             Ok(())
         });
@@ -1225,6 +1295,14 @@ mod tests {
             response.status.map(|s| s.host_name),
             Some("Windows Host".to_owned())
         );
+        let launch = request_admin(&paths, AdminRequest::CodexLaunch)?
+            .codex_launch
+            .ok_or("admin omitted Codex launch credentials")?;
+        #[cfg(windows)]
+        assert!(launch.auth_token.is_some());
+        #[cfg(not(windows))]
+        assert!(launch.auth_token.is_none());
+        assert!(!launch.remote_uri.is_empty());
         assert!(!stopped.load(Ordering::Acquire));
         assert!(request_admin(&paths, AdminRequest::Stop)?.ok);
         worker.join().map_err(|_| "admin worker panicked")??;
@@ -1232,6 +1310,41 @@ mod tests {
         cleanup_runtime_files(&paths);
         assert!(!paths.status_file.exists());
         Ok(())
+    }
+
+    #[test]
+    fn codex_launch_keeps_proxy_token_out_of_arguments() {
+        let token = "proxy-token-must-not-appear-in-arguments";
+        let forwarded = vec!["--no-alt-screen".to_owned()];
+        let mut command = Command::new("codex.exe");
+        configure_codex_command(
+            &mut command,
+            "ws://127.0.0.1:49152",
+            Some(token),
+            &forwarded,
+        );
+
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arguments,
+            [
+                "--remote",
+                "ws://127.0.0.1:49152",
+                "--remote-auth-token-env",
+                CODEX_PROXY_TOKEN_ENV,
+                "--no-alt-screen",
+            ]
+        );
+        assert!(arguments.iter().all(|argument| argument != token));
+        let injected = command
+            .get_envs()
+            .find(|(name, _)| *name == CODEX_PROXY_TOKEN_ENV)
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned());
+        assert_eq!(injected.as_deref(), Some(token));
     }
 
     #[test]

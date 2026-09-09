@@ -51,6 +51,8 @@ pub const BUNDLED_CODEX_SCHEMA_SHA256: &str =
 #[derive(Clone)]
 pub struct CodexProviderHandle {
     remote_uri: String,
+    #[cfg(windows)]
+    remote_auth_token: config::ProxyToken,
     status: SharedStatus,
 }
 
@@ -59,6 +61,21 @@ impl CodexProviderHandle {
     #[must_use]
     pub fn remote_uri(&self) -> &str {
         &self.remote_uri
+    }
+
+    /// Returns the bearer token required by a Windows loopback Proxy.
+    ///
+    /// Callers must pass this only through the launched Codex process environment.
+    #[must_use]
+    pub fn remote_auth_token(&self) -> Option<&str> {
+        #[cfg(windows)]
+        {
+            Some(self.remote_auth_token.expose())
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
     }
 
     /// Returns an atomic point-in-time status copy.
@@ -120,6 +137,8 @@ impl CodexProvider {
             CodexEventMapper::new(config.provider_id, &config.threads, config.discover_threads);
         let handle = CodexProviderHandle {
             remote_uri: config.remote_uri.clone(),
+            #[cfg(windows)]
+            remote_auth_token: config.proxy_token.clone(),
             status: Arc::clone(&status),
         };
         let source = CodexProviderSource::new(

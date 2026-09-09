@@ -21,9 +21,38 @@ const CLIENT_PROXY_SOCKET_FILE_NAME: &str = "client.sock";
 
 #[cfg(windows)]
 use std::{
+    fmt,
     net::{SocketAddr, TcpListener},
     sync::{Arc, Mutex},
 };
+#[cfg(windows)]
+use zeroize::Zeroizing;
+
+#[cfg(windows)]
+#[derive(Clone)]
+pub(crate) struct ProxyToken(Arc<Zeroizing<String>>);
+
+#[cfg(windows)]
+impl ProxyToken {
+    fn random() -> Self {
+        let value = rand::random::<[u8; 32]>()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Self(Arc::new(Zeroizing::new(value)))
+    }
+
+    pub(crate) fn expose(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+#[cfg(windows)]
+impl fmt::Debug for ProxyToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ProxyToken([REDACTED])")
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ConfiguredThread {
@@ -48,6 +77,8 @@ pub struct CodexProviderConfig {
     pub(crate) proxy_listener: Arc<Mutex<Option<TcpListener>>>,
     #[cfg(windows)]
     pub(crate) proxy_address: SocketAddr,
+    #[cfg(windows)]
+    pub(crate) proxy_token: ProxyToken,
     pub(crate) remote_uri: String,
     pub(crate) threads: Vec<ConfiguredThread>,
     pub(crate) discover_threads: bool,
@@ -139,13 +170,9 @@ impl CodexProviderConfig {
                     message: error.to_string(),
                 })?;
         #[cfg(windows)]
-        let remote_uri = {
-            let token = rand::random::<[u8; 32]>()
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
-            format!("ws://{proxy_address}/agentpulse/{token}")
-        };
+        let proxy_token = ProxyToken::random();
+        #[cfg(windows)]
+        let remote_uri = format!("ws://{proxy_address}");
         #[cfg(windows)]
         let app_server_uri = "ws://127.0.0.1:0".to_owned();
 
@@ -164,6 +191,8 @@ impl CodexProviderConfig {
             proxy_listener: Arc::new(Mutex::new(Some(listener))),
             #[cfg(windows)]
             proxy_address,
+            #[cfg(windows)]
+            proxy_token,
             remote_uri,
             threads,
             discover_threads,
@@ -207,7 +236,7 @@ impl CodexProviderConfig {
     }
 
     /// Returns the observing proxy endpoint shown to `codex --remote`.
-    /// Windows reserves a random loopback port and a secret connection path.
+    /// Windows reserves a random loopback port and authenticates separately.
     #[must_use]
     pub fn remote_uri(&self) -> &str {
         &self.remote_uri

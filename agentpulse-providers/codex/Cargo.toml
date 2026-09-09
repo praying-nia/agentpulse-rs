@@ -15,8 +15,10 @@ jsonschema.workspace = true
 nix.workspace = true
 semver.workspace = true
 serde_json.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
 tungstenite.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 agentpulse-channel-native = { path = "../../agentpulse-channels/native" }

@@ -22,9 +22,12 @@ The Host resolves the native `codex.exe` from PATH or the official npm package;
 PowerShell execution policy does not need to change. For a custom installation,
 pass `serve --codex 'C:\path with spaces\codex.exe'`. `agentpulse codex` defaults
 to that same executable and connects to the observing proxy reported by Host.
-The remote URI contains a secret random path; treat the complete URI as local
-connection access. A new Host configuration allocates a new proxy URI; query
-Host instead of saving an old URI. The Native phone port remains stable.
+On Windows, it obtains the root-only loopback URI and a separate 256-bit proxy
+token through the current-user protected admin channel, then passes the token
+only in the Codex child environment with `--remote-auth-token-env`. The token is
+not printed in status, logs, command arguments, or errors. A new Host
+configuration allocates new proxy credentials; launch through `agentpulse codex`
+instead of saving them. The Native phone port remains stable.
 
 Windows local Runtime, Proxy and Host CLI acceptance use Codex 0.153.4. This
 version still follows the best-effort compatibility policy against the bundled

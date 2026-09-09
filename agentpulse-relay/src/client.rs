@@ -7,7 +7,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -332,8 +332,35 @@ pub fn connect_host_once_with_route_check_and_waiting(
         }
     }
 
-    let mut local = TcpStream::connect_timeout(&config.local_tunnel_address, CONNECT_TIMEOUT)
-        .map_err(|source| RelayError::io("connect local tunnel target", source))?;
+    let tunnel_started = Instant::now();
+    eprintln!(
+        "agentpulse relay: TunnelReady received loopback_port={}",
+        config.local_tunnel_address.port()
+    );
+    let mut local = match TcpStream::connect_timeout(&config.local_tunnel_address, CONNECT_TIMEOUT)
+    {
+        Ok(local) => {
+            let local_address = local.local_addr().ok();
+            let peer_address = local.peer_addr().ok();
+            eprintln!(
+                "agentpulse relay: loopback connect succeeded port={} local_port={} peer_port={} elapsed_ms={}",
+                config.local_tunnel_address.port(),
+                local_address.map_or(0, |address| address.port()),
+                peer_address.map_or(0, |address| address.port()),
+                tunnel_started.elapsed().as_millis()
+            );
+            local
+        }
+        Err(source) => {
+            eprintln!(
+                "agentpulse relay: loopback connect failed port={} elapsed_ms={} error={}",
+                config.local_tunnel_address.port(),
+                tunnel_started.elapsed().as_millis(),
+                source
+            );
+            return Err(RelayError::io("connect local tunnel target", source));
+        }
+    };
     local
         .set_nonblocking(true)
         .map_err(|source| RelayError::io("configure local tunnel target", source))?;
@@ -341,13 +368,27 @@ pub fn connect_host_once_with_route_check_and_waiting(
         .sock
         .set_nonblocking(true)
         .map_err(|source| RelayError::io("configure public Relay tunnel", source))?;
-    pump(
+    let result = pump(
         &mut local,
         &mut stream,
         stop,
         TUNNEL_IDLE_TIMEOUT,
         TUNNEL_STALLED_TIMEOUT,
-    )
+    );
+    match &result {
+        Ok(stats) => eprintln!(
+            "agentpulse relay: tunnel pump completed elapsed_ms={} to_host_bytes={} to_client_bytes={}",
+            stats.elapsed.as_millis(),
+            stats.to_host_bytes,
+            stats.to_client_bytes
+        ),
+        Err(error) => eprintln!(
+            "agentpulse relay: tunnel pump failed elapsed_ms={} error={}",
+            tunnel_started.elapsed().as_millis(),
+            error
+        ),
+    }
+    result
 }
 
 /// Opens public TLS and validates that a Relay v1 challenge is served.

@@ -140,13 +140,23 @@ impl PairingSession {
         let mut attempts = 0_usize;
         while Instant::now() < self.expires_at {
             let mut socket = match self.listener.try_accept() {
-                Ok(Some(socket)) => socket,
+                Ok(Some(socket)) => {
+                    eprintln!(
+                        "agentpulse pairing: listener accepted peer_port={}",
+                        socket.peer_address().port()
+                    );
+                    socket
+                }
                 Ok(None) => {
                     thread::sleep(Duration::from_millis(50));
                     continue;
                 }
-                Err(agentpulse_transport::LoopbackWebSocketError::Handshake { .. }) => {
+                Err(agentpulse_transport::LoopbackWebSocketError::Handshake { ref message }) => {
                     attempts += 1;
+                    eprintln!(
+                        "agentpulse pairing: handshake rejected attempt={} error_chain={}",
+                        attempts, message
+                    );
                     if attempts >= MAX_ATTEMPTS {
                         return Err(PairingError::AttemptLimit);
                     }
