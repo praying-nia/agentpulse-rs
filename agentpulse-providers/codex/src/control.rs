@@ -1,6 +1,6 @@
 //! Bounded in-memory state for the public AgentPulse command surface.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use agentpulse_core::{
@@ -41,6 +41,8 @@ impl PromptQueue {
 }
 
 pub(crate) struct ControlRuntimeState {
+    pub(crate) local: crate::local_interaction::LocalInteractions,
+    pub(crate) revise_requested: BTreeSet<SessionId>,
     commands: VecDeque<AgentCommand>,
     prompts: BTreeMap<SessionId, PromptQueue>,
     defaults: BTreeMap<SessionId, TurnDefaults>,
@@ -50,6 +52,8 @@ pub(crate) struct ControlRuntimeState {
 impl ControlRuntimeState {
     pub(crate) fn new() -> Self {
         Self {
+            local: crate::local_interaction::LocalInteractions::default(),
+            revise_requested: BTreeSet::new(),
             commands: VecDeque::new(),
             prompts: BTreeMap::new(),
             defaults: BTreeMap::new(),
@@ -88,6 +92,11 @@ impl ControlRuntimeState {
                 }
                 queue.bytes += bytes;
                 queue.prompts.push_back(text.clone());
+                if self.local.pending.values().any(|choice| {
+                    choice.plan && choice.request.session_id() == command.session_id()
+                }) {
+                    self.revise_requested.insert(command.session_id());
+                }
                 Ok(())
             }
             AgentCommandPayload::Queue { action } => {

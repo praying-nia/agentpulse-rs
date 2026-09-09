@@ -43,6 +43,15 @@ impl ProviderPort for CodexProviderPort {
         &mut self,
         response: InteractionResponse,
     ) -> Result<(), Self::Error> {
+        {
+            let mut controls = self
+                .controls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if controls.local.pending.contains_key(&response.request_id()) {
+                return controls.local.claim(response);
+            }
+        }
         self.approvals
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

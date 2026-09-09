@@ -11,6 +11,7 @@ mod config;
 mod control;
 mod error;
 mod executable;
+mod local_interaction;
 mod mapper;
 mod port;
 mod protocol;

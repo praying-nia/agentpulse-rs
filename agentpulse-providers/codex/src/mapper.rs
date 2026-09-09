@@ -8,8 +8,9 @@ use std::{
 use agentpulse_bridge::{ProviderEventHandle, ProviderEventIngressError};
 use agentpulse_core::{
     AgentEvent, AgentEventPayload, AgentMessage, AgentMessageLevel, AgentMessageRole, AgentSession,
-    AgentState, ConnectionState, EventId, EventSequence, NonEmptyText, ProviderId, Revision,
-    SessionId, SessionOutcome, Timestamp, WorkspaceRef,
+    AgentState, ConnectionState, EventId, EventSequence, InteractionCloseReason, InteractionClosed,
+    InteractionId, InteractionRequest, NonEmptyText, ProviderId, Revision, SessionId,
+    SessionOutcome, Timestamp, WorkspaceRef,
 };
 use serde_json::{Value, json};
 
@@ -39,6 +40,8 @@ struct ThreadMapping {
     active_turn_id: Option<String>,
     last_message: Option<NonEmptyText>,
     last_final_message: Option<NonEmptyText>,
+    proposed_plan: Option<String>,
+    plan_ready: bool,
 }
 
 pub(crate) struct CodexEventMapper {
@@ -49,9 +52,99 @@ pub(crate) struct CodexEventMapper {
     items: BTreeMap<(String, String, String), Value>,
     recent_keys: BTreeSet<String>,
     recent_order: VecDeque<String>,
+    pub(crate) local_choices: BTreeMap<InteractionId, (String, bool)>,
 }
 
 impl CodexEventMapper {
+    pub(crate) fn ready_plans(&self) -> Vec<(SessionId, String)> {
+        self.threads
+            .iter()
+            .filter(|(_, t)| t.plan_ready && t.connection == ConnectionState::Connected)
+            .map(|(id, t)| (t.session_id, id.clone()))
+            .collect()
+    }
+
+    pub(crate) fn dismiss_plan(&mut self, thread_id: &str) {
+        if let Some(thread) = self.threads.get_mut(thread_id) {
+            thread.plan_ready = false;
+        }
+    }
+
+    pub(crate) fn has_plan(&self, thread_id: &str) -> bool {
+        self.threads.get(thread_id).is_some_and(|t| t.plan_ready)
+    }
+
+    pub(crate) fn publish_local_choice(
+        &mut self,
+        thread_id: &str,
+        request: InteractionRequest,
+        plan: bool,
+        events: &ProviderEventHandle,
+        status: &SharedStatus,
+    ) -> Result<(), CodexProviderSourceError> {
+        // The desktop may have started the next turn since the worker snapshot.
+        if plan && !self.has_plan(thread_id) {
+            return Ok(());
+        }
+        let id = request.id();
+        self.publish_payload(
+            thread_id,
+            Timestamp::now_utc(),
+            AgentEventPayload::InteractionRequested(request),
+            events,
+            status,
+        )?;
+        self.local_choices.insert(id, (thread_id.to_owned(), plan));
+        Ok(())
+    }
+
+    pub(crate) fn close_local_choice(
+        &mut self,
+        id: InteractionId,
+        events: &ProviderEventHandle,
+        status: &SharedStatus,
+    ) -> Result<(), CodexProviderSourceError> {
+        if let Some((thread_id, _)) = self.local_choices.remove(&id) {
+            let session_id = self
+                .threads
+                .get(&thread_id)
+                .ok_or_else(|| {
+                    CodexProviderSourceError::protocol("local choice thread disappeared")
+                })?
+                .session_id;
+            self.publish_payload(
+                &thread_id,
+                Timestamp::now_utc(),
+                AgentEventPayload::InteractionClosed(InteractionClosed::new(
+                    id,
+                    session_id,
+                    InteractionCloseReason::ProviderCancelled,
+                )),
+                events,
+                status,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn close_local_choices(
+        &mut self,
+        thread_id: &str,
+        events: &ProviderEventHandle,
+        status: &SharedStatus,
+    ) -> Result<(), CodexProviderSourceError> {
+        let ids = self
+            .local_choices
+            .iter()
+            .filter(|(_, (thread, _))| thread == thread_id)
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.close_local_choice(id, events, status)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn is_thread_tracked(&self, thread_id: &str) -> bool {
         self.threads.contains_key(thread_id)
     }
@@ -72,6 +165,7 @@ impl CodexEventMapper {
             items: BTreeMap::new(),
             recent_keys: BTreeSet::new(),
             recent_order: VecDeque::new(),
+            local_choices: BTreeMap::new(),
         }
     }
 
@@ -183,6 +277,8 @@ impl CodexEventMapper {
                 active_turn_id: latest_in_progress_turn(thread)?,
                 last_message: None,
                 last_final_message: None,
+                proposed_plan: None,
+                plan_ready: false,
             },
         );
         Ok(())
@@ -198,7 +294,7 @@ impl CodexEventMapper {
         for entry in entries {
             let item = object_field(entry, "item")?;
             let (role, text) = match string_field(item, "type")? {
-                "agentMessage" => (
+                "agentMessage" | "plan" => (
                     AgentMessageRole::Assistant,
                     string_field(item, "text")?.to_owned(),
                 ),
@@ -501,7 +597,10 @@ impl CodexEventMapper {
             return Ok(MappingDisposition::Mapped);
         }
 
-        let state = map_loaded_state(status_value)?;
+        let mut state = map_loaded_state(status_value)?;
+        if state == AgentState::Idle && self.threads.get(thread_id).is_some_and(|t| t.plan_ready) {
+            state = AgentState::WaitingForInteraction;
+        }
         let (connection, current_state) = self
             .threads
             .get(thread_id)
@@ -544,6 +643,13 @@ impl CodexEventMapper {
     ) -> Result<MappingDisposition, CodexProviderSourceError> {
         let turn = object_field(params, "turn")?;
         let turn_id = string_field(turn, "id")?.to_owned();
+        if !self
+            .threads
+            .get(thread_id)
+            .is_some_and(|t| t.active_turn_id.as_deref() == Some(&turn_id))
+        {
+            self.close_local_choices(thread_id, events, status)?;
+        }
         let timestamp = timestamp_seconds(optional_i64_field(turn, "startedAt")?)?;
         let mapping = self
             .threads
@@ -560,6 +666,8 @@ impl CodexEventMapper {
         mapping.active_turn_id = Some(turn_id);
         mapping.last_message = None;
         mapping.last_final_message = None;
+        mapping.proposed_plan = None;
+        mapping.plan_ready = false;
         let needs_state = mapping.state != AgentState::Running;
         if needs_state {
             self.publish_payload(
@@ -590,7 +698,8 @@ impl CodexEventMapper {
         let item_id = string_field(item, "id")?;
         self.items
             .remove(&(thread_id.to_owned(), turn_id.to_owned(), item_id.to_owned()));
-        if string_field(item, "type")? != "agentMessage" {
+        let item_type = string_field(item, "type")?;
+        if item_type != "agentMessage" && item_type != "plan" {
             return Ok(MappingDisposition::ValidatedUnmapped);
         }
         let text = string_field(item, "text")?;
@@ -604,6 +713,9 @@ impl CodexEventMapper {
             .get_mut(thread_id)
             .ok_or_else(|| CodexProviderSourceError::protocol("tracked thread disappeared"))?;
         mapping.last_message = Some(content.clone());
+        if item_type == "plan" {
+            mapping.proposed_plan = Some(text.to_owned());
+        }
         if phase == Some("final_answer") {
             mapping.last_final_message = Some(content.clone());
         }
@@ -663,10 +775,18 @@ impl CodexEventMapper {
                 )));
             }
         };
+        let proposed = turn_status == "completed" && mapping.proposed_plan.is_some();
+        if let Some(mapping) = self.threads.get_mut(thread_id) {
+            mapping.plan_ready = proposed;
+        }
         self.publish_payload(
             thread_id,
             timestamp,
-            AgentEventPayload::SessionEnded(outcome),
+            if proposed {
+                AgentEventPayload::StateChanged(AgentState::WaitingForInteraction)
+            } else {
+                AgentEventPayload::SessionEnded(outcome)
+            },
             events,
             status,
         )?;
@@ -726,10 +846,22 @@ impl CodexEventMapper {
         &mut self,
         thread_id: &str,
         occurred_at: Timestamp,
-        payload: AgentEventPayload,
+        mut payload: AgentEventPayload,
         events: &ProviderEventHandle,
         status: &SharedStatus,
     ) -> Result<(), CodexProviderSourceError> {
+        if matches!(payload, AgentEventPayload::StateChanged(AgentState::Idle))
+            && self.has_plan(thread_id)
+        {
+            payload = AgentEventPayload::StateChanged(AgentState::WaitingForInteraction);
+        }
+        if matches!(
+            payload,
+            AgentEventPayload::SessionEnded(_)
+                | AgentEventPayload::ConnectionChanged(ConnectionState::Disconnected)
+        ) {
+            self.close_local_choices(thread_id, events, status)?;
+        }
         let mapping = self
             .threads
             .get(thread_id)

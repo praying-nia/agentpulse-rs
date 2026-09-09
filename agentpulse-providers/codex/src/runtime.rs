@@ -22,6 +22,7 @@ use agentpulse_core::{
 use serde_json::json;
 use tungstenite::{Message, WebSocket};
 
+mod local;
 mod transport;
 use transport::{LocalListener, LocalStream};
 
@@ -516,6 +517,15 @@ enum ProxyExit {
 }
 
 enum PendingControl {
+    Models {
+        session_id: SessionId,
+        models: Vec<serde_json::Value>,
+        cursors: Vec<String>,
+    },
+    ImplementPlan {
+        session_id: SessionId,
+        thread_id: String,
+    },
     Report {
         session_id: SessionId,
     },
@@ -523,6 +533,8 @@ enum PendingControl {
         session_id: SessionId,
         model: String,
         effort: Option<String>,
+        models: Vec<serde_json::Value>,
+        cursors: Vec<String>,
     },
     ResumeThread {
         source_session_id: SessionId,
@@ -640,6 +652,7 @@ fn flush_control_commands(
             .is_some_and(|(_, turn, _)| turn.is_some());
         lock_controls(controls).observe_turn(session_id, active);
     }
+    local::flush_local_choices(io, protocol, mapper, status, controls, events, pending)?;
     loop {
         // Keep the controls mutex out of the command body. Some commands publish
         // events through the Bridge, while another Bridge caller may concurrently
@@ -663,12 +676,17 @@ fn flush_control_commands(
                         session_id,
                         model: model.to_string(),
                         effort: effort.as_ref().map(ToString::to_string),
+                        models: Vec::new(),
+                        cursors: Vec::new(),
                     },
                     pending,
                 )?;
             }
             AgentCommandPayload::SetPlanMode { enabled } => {
                 lock_controls(controls).defaults_mut(session_id).plan_mode = *enabled;
+                if let Some((thread, _, _)) = context.as_ref() {
+                    local::dismiss_plan(thread, mapper, events, status)?;
+                }
                 publish_system_for_session(
                     context.as_ref(),
                     if *enabled {
@@ -736,7 +754,11 @@ fn flush_control_commands(
                     protocol,
                     ExpectedResponse::ModelList,
                     json!({"limit": 50}),
-                    PendingControl::Report { session_id },
+                    PendingControl::Models {
+                        session_id,
+                        models: Vec::new(),
+                        cursors: Vec::new(),
+                    },
                     pending,
                 )?;
             }
@@ -839,6 +861,9 @@ fn flush_control_commands(
                 }
             }
             AgentCommandPayload::CancelSession { .. } => {
+                if let Some((thread, _, _)) = context.as_ref() {
+                    local::dismiss_plan(thread, mapper, events, status)?;
+                }
                 if let Some((thread_id, Some(turn_id), _)) = context.as_ref() {
                     send_control_request(
                         io,
@@ -890,6 +915,9 @@ fn flush_control_commands(
         let Some((thread_id, None, _)) = context else {
             continue;
         };
+        if lock_mapper(mapper).has_plan(&thread_id) {
+            continue;
+        }
         let Some(prompt) = lock_controls(controls).front_prompt(session_id) else {
             continue;
         };
@@ -1070,13 +1098,76 @@ fn process_control_response(
     events: &ProviderEventHandle,
     status: &SharedStatus,
 ) -> Result<(), CodexProviderSourceError> {
-    let kind = pending.remove(&id).ok_or_else(|| {
+    let mut kind = pending.remove(&id).ok_or_else(|| {
         CodexProviderSourceError::protocol(format!(
             "unexpected live {} response",
             expected.method()
         ))
     })?;
+    let result = if let PendingControl::Models {
+        session_id,
+        models,
+        cursors,
+    }
+    | PendingControl::SelectModel {
+        session_id,
+        models,
+        cursors,
+        ..
+    } = &mut kind
+    {
+        models.extend(
+            result
+                .get("data")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        if models.len() > 1000 {
+            return local::report(
+                *session_id,
+                "模型目录超过上限，请重试 /model",
+                mapper,
+                events,
+                status,
+            );
+        }
+        if let Some(cursor) = result.get("nextCursor").and_then(serde_json::Value::as_str) {
+            if cursors.len() >= 20 || cursors.iter().any(|seen| seen == cursor) {
+                return local::report(
+                    *session_id,
+                    "模型目录分页异常，请重试 /model",
+                    mapper,
+                    events,
+                    status,
+                );
+            }
+            cursors.push(cursor.to_owned());
+            return send_control_request(
+                io,
+                protocol,
+                ExpectedResponse::ModelList,
+                json!({"limit": 50, "cursor": cursor}),
+                kind,
+                pending,
+            );
+        }
+        json!({"data": std::mem::take(models)})
+    } else {
+        result
+    };
     match kind {
+        PendingControl::Models { session_id, .. } => {
+            local::show_models(session_id, &result, controls, mapper, events, status)
+        }
+        PendingControl::ImplementPlan {
+            session_id,
+            thread_id,
+        } => {
+            lock_controls(controls).defaults_mut(session_id).plan_mode = false;
+            lock_mapper(mapper).dismiss_plan(&thread_id);
+            publish_user_message(&thread_id, "Implement the plan.", mapper, events, status)
+        }
         PendingControl::Report { session_id } => {
             let current_cwd = lock_mapper(mapper)
                 .cwd_for_session(session_id)
@@ -1091,6 +1182,7 @@ fn process_control_response(
             session_id,
             model,
             effort,
+            ..
         } => {
             let context = lock_mapper(mapper)
                 .command_context(session_id)
@@ -1099,8 +1191,22 @@ fn process_control_response(
                 Ok(()) => {
                     let mut controls = lock_controls(controls);
                     let defaults = controls.defaults_mut(session_id);
-                    defaults.model = Some(model.clone());
-                    defaults.effort = effort.clone();
+                    let entry = result["data"].as_array().and_then(|models| {
+                        models
+                            .iter()
+                            .find(|entry| entry["id"].as_str() == Some(&model))
+                    });
+                    defaults.model = Some(
+                        entry
+                            .and_then(|entry| entry["model"].as_str())
+                            .unwrap_or(&model)
+                            .to_owned(),
+                    );
+                    defaults.effort = effort.clone().or_else(|| {
+                        entry
+                            .and_then(|entry| entry["defaultReasoningEffort"].as_str())
+                            .map(str::to_owned)
+                    });
                     drop(controls);
                     publish_system_for_session(
                         context.as_ref(),
@@ -1232,7 +1338,18 @@ fn process_control_error(
         ))
     })?;
     match kind {
+        PendingControl::ImplementPlan { session_id, .. } => {
+            lock_controls(controls).clear_turn_inflight(session_id);
+            local::report(
+                session_id,
+                format!("实施计划启动失败 ({code}): {message}；请重试或继续修改。"),
+                mapper,
+                events,
+                status,
+            )?;
+        }
         PendingControl::Report { session_id }
+        | PendingControl::Models { session_id, .. }
         | PendingControl::SelectModel { session_id, .. }
         | PendingControl::Silent { session_id }
         | PendingControl::HistoryItems { session_id, .. }
@@ -2874,6 +2991,7 @@ impl AppServerIo for LocalWebSocketIo {
 
 #[cfg(test)]
 mod tests {
+    mod local_tests;
     use std::{
         collections::VecDeque,
         error::Error,
@@ -3214,6 +3332,8 @@ mod tests {
             ProviderKind::new("codex")?,
             NonEmptyText::new("Codex Test")?,
             ProviderCapabilities::SESSION_STATE
+                | ProviderCapabilities::USER_INPUT_REQUEST
+                | ProviderCapabilities::USER_INPUT_RESPONSE
                 | ProviderCapabilities::APPROVAL_REQUEST
                 | ProviderCapabilities::APPROVAL_RESPONSE
                 | ProviderCapabilities::PROMPT_SUBMIT
