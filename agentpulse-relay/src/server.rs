@@ -22,7 +22,7 @@ use crate::{
     crypto::{client_proof, decode_32, host_proof, verify_proof},
     framing::{read_frame, write_frame},
     protocol::{
-        EndpointMessage, RelayErrorCode, RelayMessage, RouteRegistration, challenge,
+        EndpointMessage, MAX_ROUTES, RelayErrorCode, RelayMessage, RouteRegistration, challenge,
         decode_endpoint, encode_relay,
     },
     tunnel::pump,
@@ -34,8 +34,10 @@ const HOST_PING_INTERVAL: Duration = Duration::from_secs(15);
 const HOST_PONG_TIMEOUT: Duration = Duration::from_secs(5);
 const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const TUNNEL_STALLED_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_OUTER_CONNECTIONS: usize = 32;
-const MAX_WAITING_HOSTS: usize = 4;
+// One waiting registration per paired device, plus the QR bootstrap route.
+// Allow both ends of tunnels and bounded handshake/reconnect overlap.
+const MAX_WAITING_HOSTS: usize = MAX_ROUTES + 1;
+const MAX_OUTER_CONNECTIONS: usize = 4 * MAX_WAITING_HOSTS;
 
 type OuterStream = StreamOwned<ServerConnection, TcpStream>;
 
