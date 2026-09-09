@@ -36,8 +36,8 @@ use agentpulse_provider_codex::{
 };
 use agentpulse_relay::{
     RelayConnectionCanceller, RelayEndpoint, RelayError, RelayHostConnectionConfig,
-    RouteRegistration, connect_host_once_with_route_check,
-    connect_host_once_with_route_check_and_waiting, derive_route, device_root_from_token,
+    RouteRegistration, connect_host_once_with_route_check_and_waiting, derive_route,
+    device_root_from_token,
 };
 use clap::{Args, Parser, Subcommand};
 use directories::ProjectDirs;
@@ -249,6 +249,8 @@ struct RuntimeStatus {
     relay_endpoint: Option<String>,
     relay_health: String,
     relay_last_error: Option<String>,
+    #[serde(default)]
+    relay_ready_routes: Vec<String>,
     pid: u32,
 }
 
@@ -280,6 +282,7 @@ struct RelayRuntimeState(Arc<Mutex<RelayRuntimeSnapshot>>);
 
 #[derive(Clone, Debug)]
 struct RelayRuntimeSnapshot {
+    ready_routes: Vec<String>,
     health: String,
     last_error: Option<String>,
 }
@@ -308,6 +311,7 @@ impl RelayConnector {
 impl RelayRuntimeState {
     fn new(initial_health: &str) -> Self {
         Self(Arc::new(Mutex::new(RelayRuntimeSnapshot {
+            ready_routes: Vec::new(),
             health: initial_health.to_owned(),
             last_error: None,
         })))
@@ -315,14 +319,38 @@ impl RelayRuntimeState {
 
     fn update(&self, health: &str, last_error: Option<String>) {
         if let Ok(mut state) = self.0.lock() {
+            state.ready_routes.clear();
             state.health = health.to_owned();
             state.last_error = last_error;
+        }
+    }
+
+    fn ready(&self, routes: &[RouteRegistration]) {
+        if let Ok(mut state) = self.0.lock() {
+            for route in routes {
+                if !state.ready_routes.contains(&route.route_id) {
+                    state.ready_routes.push(route.route_id.clone());
+                }
+            }
+            state.health = "waiting_or_tunneling".to_owned();
+            state.last_error = None;
+        }
+    }
+
+    fn unready(&self, route_id: &str, error: Option<String>) {
+        if let Ok(mut state) = self.0.lock() {
+            state.ready_routes.retain(|id| id != route_id);
+            if state.ready_routes.is_empty() {
+                state.health = "refreshing".to_owned();
+            }
+            state.last_error = error;
         }
     }
 
     fn snapshot(&self) -> RelayRuntimeSnapshot {
         self.0.lock().map_or_else(
             |_| RelayRuntimeSnapshot {
+                ready_routes: Vec::new(),
                 health: "unavailable".to_owned(),
                 last_error: Some("Relay status lock is unavailable".to_owned()),
             },
@@ -520,6 +548,7 @@ fn serve(paths: &HostPaths, args: ServeArgs) -> AppResult<()> {
             .as_ref()
             .map_or_else(|| "disabled".to_owned(), |state| state.snapshot().health),
         relay_last_error: None,
+        relay_ready_routes: Vec::new(),
         pid: std::process::id(),
     };
     write_status(&paths.status_file, &status)?;
@@ -586,6 +615,7 @@ fn run_admin_loop(
             let relay = relay.snapshot();
             status.relay_health = relay.health;
             status.relay_last_error = relay.last_error;
+            status.relay_ready_routes = relay.ready_routes;
         }
         write_status(status_file, status)?;
         if provider.snapshot().health() == CodexProviderHealth::Failed {
@@ -734,7 +764,7 @@ fn pair(paths: &HostPaths) -> AppResult<()> {
     let pairing_root = device_root_from_token(&session.bundle().bootstrap_token);
     let route = derive_route(&pairing_root, &settings.endpoint)?.registration();
     let relay_config = RelayHostConnectionConfig::new(
-        settings.endpoint,
+        settings.endpoint.clone(),
         status.host_id,
         settings.enrollment_token.as_str(),
         session.local_address(),
@@ -786,7 +816,32 @@ fn pair(paths: &HostPaths) -> AppResult<()> {
     }
     println!("Pairing expires in two minutes. Scan this QR code:");
     println!("{}", terminal_qr(session.pairing_uri())?);
-    let result = session.serve(|request| approve_device(&request.display_name, &request.client_id));
+    let result = session.serve_with_ready(
+        |request| approve_device(&request.display_name, &request.client_id),
+        |token| {
+            let route = derive_route(&device_root_from_token(token), &settings.endpoint)
+                .map_err(|error| agentpulse_pairing::PairingError::InvalidField {
+                    field: "relay_route",
+                    reason: error.to_string(),
+                })?
+                .registration();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
+                if request_admin(paths, AdminRequest::Status)
+                    .ok()
+                    .and_then(|response| response.status)
+                    .is_some_and(|status| status.relay_ready_routes.contains(&route.route_id))
+                {
+                    return Ok(());
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(agentpulse_pairing::PairingError::InvalidField {
+                field: "relay_route",
+                reason: "timed out waiting for device route registration".to_owned(),
+            })
+        },
+    );
     relay_stop.store(true, Ordering::Release);
     let outcome = result?;
     println!(
@@ -969,6 +1024,41 @@ fn spawn_relay_connector(
     stop: Arc<AtomicBool>,
     runtime: RelayRuntimeState,
 ) -> RelayConnector {
+    spawn_relay_connector_with(
+        store,
+        host_id,
+        native_address,
+        settings,
+        stop,
+        runtime,
+        |config, routes, stop, current, ready| {
+            connect_host_once_with_route_check_and_waiting(config, routes, stop, current, ready)
+        },
+    )
+}
+
+fn spawn_relay_connector_with<F>(
+    store: HostCredentialStore,
+    host_id: String,
+    native_address: SocketAddr,
+    settings: RelayHostSettings,
+    stop: Arc<AtomicBool>,
+    runtime: RelayRuntimeState,
+    connect: F,
+) -> RelayConnector
+where
+    F: Fn(
+            &RelayHostConnectionConfig,
+            &[RouteRegistration],
+            &AtomicBool,
+            &dyn Fn() -> bool,
+            &dyn Fn(),
+        ) -> Result<agentpulse_relay::RelayTunnelStats, RelayError>
+        + Send
+        + Sync
+        + 'static,
+{
+    let connect = Arc::new(connect);
     let canceller = RelayConnectionCanceller::new();
     let worker_canceller = canceller.clone();
     let worker = thread::spawn(move || {
@@ -984,41 +1074,97 @@ fn spawn_relay_connector(
                 return;
             }
         };
-        let backoff_seconds = [1_u64, 2, 5, 10, 30];
-        let mut backoff_index = 0_usize;
+        // Keep a separate registration per device. A newly paired device must
+        // not wait for another route's 15-second heartbeat or active tunnel.
+        let mut workers: HashMap<String, (Arc<AtomicBool>, thread::JoinHandle<()>)> =
+            HashMap::new();
         while !stop.load(Ordering::Acquire) {
-            let routes = match relay_routes(&store, &settings.endpoint) {
-                Ok(routes) if routes.is_empty() => {
-                    runtime.update("waiting_for_device", None);
-                    sleep_until_stopped(&stop, Duration::from_secs(1));
-                    continue;
+            match relay_routes(&store, &settings.endpoint) {
+                Ok(routes) => {
+                    for (id, (device_stop, _)) in &workers {
+                        if !routes.iter().any(|route| &route.route_id == id) {
+                            device_stop.store(true, Ordering::Release);
+                            runtime.unready(id, None);
+                        }
+                    }
+                    let finished = workers
+                        .iter()
+                        .filter(|(_, (_, worker))| worker.is_finished())
+                        .map(|(id, _)| id.clone())
+                        .collect::<Vec<_>>();
+                    for id in finished {
+                        if let Some((_, worker)) = workers.remove(&id) {
+                            let _ = worker.join();
+                        }
+                    }
+                    if routes.is_empty() {
+                        runtime.update("waiting_for_device", None);
+                    }
+                    for route in routes {
+                        // The store permits 16 devices; allow bounded retiring
+                        // workers during revocation/re-pairing as well.
+                        if workers.contains_key(&route.route_id) || workers.len() >= 32 {
+                            continue;
+                        }
+                        let device_stop = Arc::new(AtomicBool::new(false));
+                        let worker_stop = Arc::clone(&device_stop);
+                        let device_config = config.clone();
+                        let device_runtime = runtime.clone();
+                        let device_store = store.clone();
+                        let endpoint = settings.endpoint.clone();
+                        let id = route.route_id.clone();
+                        let connect = Arc::clone(&connect);
+                        let worker = thread::spawn(move || {
+                            let routes = [route];
+                            let backoff_seconds = [1_u64, 2, 5, 10, 30];
+                            let mut backoff_index = 0_usize;
+                            while !worker_stop.load(Ordering::Acquire) {
+                                let result = connect(
+                                    &device_config,
+                                    &routes,
+                                    &worker_stop,
+                                    &|| {
+                                        relay_routes(&device_store, &endpoint)
+                                            .is_ok_and(|current| current.contains(&routes[0]))
+                                    },
+                                    &|| {
+                                        if !worker_stop.load(Ordering::Acquire) {
+                                            device_runtime.ready(&routes);
+                                        }
+                                    },
+                                );
+                                device_runtime.unready(
+                                    &routes[0].route_id,
+                                    result.as_ref().err().map(ToString::to_string),
+                                );
+                                match result {
+                                    Ok(_) | Err(RelayError::RoutesChanged) => backoff_index = 0,
+                                    Err(RelayError::Stopped) => break,
+                                    Err(_) => {
+                                        let delay = backoff_seconds[backoff_index];
+                                        backoff_index =
+                                            (backoff_index + 1).min(backoff_seconds.len() - 1);
+                                        sleep_until_stopped(
+                                            &worker_stop,
+                                            Duration::from_secs(delay),
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                        workers.insert(id, (device_stop, worker));
+                    }
                 }
-                Ok(routes) => routes,
-                Err(error) => {
-                    runtime.update("retrying", Some(error.to_string()));
-                    sleep_until_stopped(&stop, Duration::from_secs(1));
-                    continue;
-                }
-            };
-            runtime.update("waiting_or_tunneling", None);
-            let expected_routes = routes.clone();
-            let result = connect_host_once_with_route_check(&config, &routes, &stop, || {
-                relay_routes(&store, &settings.endpoint)
-                    .is_ok_and(|current| current == expected_routes)
-            });
-            match result {
-                Ok(_) | Err(RelayError::RoutesChanged) => {
-                    backoff_index = 0;
-                    runtime.update("refreshing", None);
-                }
-                Err(RelayError::Stopped) => break,
-                Err(error) => {
-                    runtime.update("retrying", Some(error.to_string()));
-                    let delay = backoff_seconds[backoff_index];
-                    backoff_index = (backoff_index + 1).min(backoff_seconds.len() - 1);
-                    sleep_until_stopped(&stop, Duration::from_secs(delay));
-                }
+                Err(error) => runtime.update("retrying", Some(error.to_string())),
             }
+            sleep_until_stopped(&stop, Duration::from_millis(100));
+        }
+        for (device_stop, _) in workers.values() {
+            device_stop.store(true, Ordering::Release);
+        }
+        // The owner cancels all sockets before joining this supervisor.
+        for (_, (_, worker)) in workers {
+            let _ = worker.join();
         }
         runtime.update("stopped", None);
     });
@@ -1384,6 +1530,64 @@ mod tests {
         };
         assert_eq!(args.port, 49_321);
         Ok(())
+    }
+
+    #[test]
+    fn newly_paired_device_registers_while_existing_device_is_connected() -> AppResult<()> {
+        let (_directory, paths) = TestDirectory::paths()?;
+        let store = paths.store();
+        let identity = store.initialize("Pairing readiness")?;
+        let first = uuid::Uuid::now_v7().to_string();
+        let second = uuid::Uuid::now_v7().to_string();
+        store.issue_device(&first, "First", None)?;
+        let endpoint: RelayEndpoint = "relay.example.com:2333".parse()?;
+        let initial_routes = relay_routes(&store, &endpoint)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let runtime = RelayRuntimeState::new("starting");
+        let (sender, receiver) = mpsc::channel();
+        let connector = spawn_relay_connector_with(
+            store.clone(),
+            identity.host_id,
+            SocketAddr::from(([127, 0, 0, 1], 49320)),
+            RelayHostSettings {
+                endpoint: endpoint.clone(),
+                enrollment_token: Zeroizing::new("test-enrollment".to_owned()),
+            },
+            Arc::clone(&stop),
+            runtime.clone(),
+            move |_, routes, device_stop, _, ready| {
+                ready();
+                let _ = sender.send(routes[0].route_id.clone());
+                // Represents an existing waiting registration or active tunnel.
+                while !device_stop.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(RelayError::Stopped)
+            },
+        );
+        let result = (|| -> AppResult<()> {
+            assert_eq!(
+                receiver.recv_timeout(Duration::from_secs(2))?,
+                initial_routes[0].route_id
+            );
+            store.issue_device(&second, "Second", None)?;
+            let new_id = receiver.recv_timeout(Duration::from_secs(2))?;
+            assert_ne!(new_id, initial_routes[0].route_id);
+            assert_eq!(runtime.snapshot().ready_routes.len(), 2);
+            store.revoke_device(&second)?;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while runtime.snapshot().ready_routes.contains(&new_id) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                runtime.snapshot().ready_routes,
+                vec![initial_routes[0].route_id.clone()]
+            );
+            Ok(())
+        })();
+        stop.store(true, Ordering::Release);
+        connector.cancel_and_join(Duration::from_secs(2))?;
+        result
     }
 
     #[test]

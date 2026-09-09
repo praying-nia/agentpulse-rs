@@ -3583,8 +3583,15 @@ mod tests {
         let _ = host.start()?;
 
         assert_eq!(locked(&control.outgoing).len(), 2);
+        // Title generation is an ephemeral thread announced on the same connection.
+        let mut background: serde_json::Value = serde_json::from_str(thread_started)?;
+        let background_id = SessionId::new();
+        background["params"]["thread"]["id"] = json!(background_id.to_string());
+        background["params"]["thread"]["ephemeral"] = json!(true);
+        control.push_text(background.to_string());
         control.push_text(thread_started);
         wait_until(|| snapshot(&status).mapped_events() == 1)?;
+        assert!(host.inspect_bridge(|bridge| bridge.session_aggregate(background_id).is_none())?);
         assert!(host.inspect_bridge(|bridge| bridge.session_aggregate(session_id).is_some())?);
         assert_eq!(snapshot(&status).health(), CodexProviderHealth::Running);
         let _ = host.stop()?;

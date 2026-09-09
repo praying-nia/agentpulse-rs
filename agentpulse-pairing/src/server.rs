@@ -137,6 +137,16 @@ impl PairingSession {
         self,
         approve: impl Fn(&PairingRequest) -> bool,
     ) -> Result<PairingOutcome, PairingError> {
+        self.serve_with_ready(approve, |_| Ok(()))
+    }
+
+    /// Issues credentials, then waits for the caller's transport readiness barrier
+    /// before exposing them to the device. The callback must have a bounded wait.
+    pub fn serve_with_ready(
+        self,
+        approve: impl Fn(&PairingRequest) -> bool,
+        ready: impl Fn(&str) -> Result<(), PairingError>,
+    ) -> Result<PairingOutcome, PairingError> {
         let mut attempts = 0_usize;
         while Instant::now() < self.expires_at {
             let mut socket = match self.listener.try_accept() {
@@ -240,6 +250,20 @@ impl PairingSession {
                 }
                 Err(error) => return Err(error),
             };
+            if let Err(error) = ready(&token) {
+                let _ = self.store.revoke_device(&request.client_id);
+                send(
+                    &mut socket,
+                    &PairingServerMessage::Error {
+                        code: PairingErrorCode::Internal,
+                        message: "Host connection could not become ready; please pair again"
+                            .to_owned(),
+                        recoverable: false,
+                    },
+                )?;
+                finish_connection(&mut socket, CloseCode::Error, "Host connection unavailable");
+                return Err(error);
+            }
             let identity = self.store.load_identity()?;
             let ca_certificate_der = identity.ca_certificate_base64();
             send(
@@ -411,11 +435,21 @@ mod tests {
     #[test]
     #[ignore = "requires loopback socket access"]
     fn successful_pairing_waits_for_client_close_acknowledgement() -> TestResult {
+        pairing_readiness_case(true)
+    }
+
+    #[test]
+    #[ignore = "requires loopback socket access"]
+    fn readiness_failure_returns_error_and_revokes_unissued_token() -> TestResult {
+        pairing_readiness_case(false)
+    }
+
+    fn pairing_readiness_case(succeeds: bool) -> TestResult {
         let directory = TestDirectory::create()?;
         let store = HostCredentialStore::new(directory.0.join("credentials.json"));
         let identity = store.initialize("Pairing Close Test")?;
         let session = PairingSession::bind(
-            store,
+            store.clone(),
             SocketAddr::from(([127, 0, 0, 1], 0)),
             SocketAddr::from(([127, 0, 0, 1], 2333)),
             "relay.example.com:2333".to_owned(),
@@ -425,8 +459,25 @@ mod tests {
         let address = session.local_address();
         let bundle = session.bundle().clone();
         let (result_sender, result_receiver) = mpsc::channel();
+        let (issued_sender, issued_receiver) = mpsc::channel();
+        let (ready_sender, ready_receiver) = mpsc::channel();
         let server = thread::spawn(move || {
-            let result = session.serve(|_| true);
+            let result = session.serve_with_ready(
+                |_| true,
+                |token| {
+                    issued_sender
+                        .send(!token.is_empty())
+                        .map_err(|_| PairingError::Expired)?;
+                    ready_receiver
+                        .recv_timeout(Duration::from_secs(2))
+                        .map_err(|_| PairingError::Expired)?;
+                    if succeeds {
+                        Ok(())
+                    } else {
+                        Err(PairingError::Expired)
+                    }
+                },
+            );
             let _ = result_sender.send(result);
         });
 
@@ -446,19 +497,49 @@ mod tests {
             read_server(&mut socket)?,
             PairingServerMessage::Pending { .. }
         ));
-        assert!(matches!(
-            read_server(&mut socket)?,
-            PairingServerMessage::Succeeded { .. }
-        ));
+        assert!(issued_receiver.recv_timeout(Duration::from_secs(2))?);
+        // The client has only received Pending while its route is unavailable.
         assert!(matches!(
             result_receiver.try_recv(),
             Err(mpsc::TryRecvError::Empty)
         ));
-
+        socket
+            .get_mut()
+            .sock
+            .set_read_timeout(Some(Duration::from_millis(100)))?;
+        assert!(matches!(socket.read(), Err(tungstenite::Error::Io(error))
+            if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)));
+        socket
+            .get_mut()
+            .sock
+            .set_read_timeout(Some(Duration::from_secs(2)))?;
+        ready_sender.send(())?;
+        let message = read_server(&mut socket)?;
+        if succeeds {
+            assert!(matches!(message, PairingServerMessage::Succeeded { .. }));
+        } else {
+            assert!(matches!(
+                message,
+                PairingServerMessage::Error {
+                    code: PairingErrorCode::Internal,
+                    recoverable: false,
+                    ..
+                }
+            ));
+            assert!(store.devices()?.is_empty());
+        }
+        assert!(matches!(
+            result_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
         assert!(matches!(socket.read()?, Message::Close(_)));
         socket.flush()?;
-        let outcome = result_receiver.recv_timeout(Duration::from_secs(2))??;
-        assert_eq!(outcome.client_id, client_id);
+        let outcome = result_receiver.recv_timeout(Duration::from_secs(2))?;
+        if succeeds {
+            assert_eq!(outcome?.client_id, client_id);
+        } else {
+            assert!(matches!(outcome, Err(PairingError::Expired)));
+        }
         server.join().map_err(|_| "pairing server panicked")?;
         Ok(())
     }

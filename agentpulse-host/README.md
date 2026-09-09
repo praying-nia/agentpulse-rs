@@ -103,3 +103,18 @@ agentpulse credentials rotate --confirm-revoke-all
 ```
 
 Rotation is allowed only while stopped and revokes every device. Host identity and credentials are private local configuration; Session and Event state is in memory and is not persisted.
+
+After terminal approval, `pair` waits for the new device's Native Relay route to
+be acknowledged before returning success. The Host registers each device on its
+own connector and checks for newly issued credentials every 100 ms, so an old
+waiting registration or active tunnel cannot delay a new pairing. If readiness
+cannot be confirmed within 30 seconds, pairing returns an error and revokes the
+unissued credential. Rebuild and restart the Host to load this behavior.
+
+## Known issue: desktop plan confirmation
+
+On Codex CLI 0.153.0, choosing “实施计划” on Android starts implementation, but
+its desktop TUI can leave the local “Implement this plan?” popup open. This is a
+Codex TUI lifecycle issue: a remote turn start does not dismiss that local popup.
+Dismiss the stale popup with Escape; do not confirm it again. AgentPulse does not
+patch Codex for this issue. The phone's action has already started the turn.

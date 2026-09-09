@@ -107,3 +107,8 @@ mapping exists only for the lifetime of the Provider.
 RuntimeHost 停止会关闭 WebSocket、等待读取 Worker、终止受管 App Server，并仅清理 Provider 自己创建的私有目录。实时协议或进程故障会将已跟踪 Session 标记为 `Disconnected`，并通过 `CodexProviderHandle` 暴露终态错误；恢复方式是显式停止并重新启动 RuntimeHost。
 
 The canonical mapping and lifecycle contract is defined in the AgentPulse protocol repository's `codex-provider.md`.
+
+Automatic discovery excludes previously unconfigured `ephemeral` threads,
+including the TUI's hidden title-generation thread created after the first
+message. Explicitly selected threads and normal persistent conversations remain
+available. See the [desktop plan confirmation known issue](../../agentpulse-host/README.md#known-issue-desktop-plan-confirmation).

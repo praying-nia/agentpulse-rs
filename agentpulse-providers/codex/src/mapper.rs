@@ -445,6 +445,14 @@ impl CodexEventMapper {
         if method == "thread/started" && self.discover_threads {
             let thread = object_field(params, "thread")?;
             let thread_id = string_field(thread, "id")?;
+            // The TUI creates ephemeral threads for background work such as
+            // generating a title after the first message. Do not expose these
+            // as conversations. Explicitly selected threads remain supported.
+            if thread.get("ephemeral").and_then(Value::as_bool) == Some(true)
+                && !self.configured.contains_key(thread_id)
+            {
+                return Ok(MappingDisposition::ValidatedUnmapped);
+            }
             if !self.configured.contains_key(thread_id) {
                 self.configured
                     .insert(thread_id.to_owned(), SessionId::from_str(thread_id)?);
