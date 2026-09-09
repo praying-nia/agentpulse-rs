@@ -7,6 +7,7 @@ repository.workspace = true
 version.workspace = true
 
 [dependencies]
+agentpulse-platform = { path = "../agentpulse-platform" }
 agentpulse-transport = { path = "../agentpulse-transport" }
 base64.workspace = true
 fs2.workspace = true

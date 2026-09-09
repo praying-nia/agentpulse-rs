@@ -22,18 +22,13 @@ use agentpulse_core::{
 use serde_json::json;
 use tungstenite::{Message, WebSocket};
 
-#[cfg(unix)]
+mod transport;
+use transport::{LocalListener, LocalStream};
+
 use semver::Version;
 #[cfg(unix)]
-use std::{
-    fs,
-    net::Shutdown,
-    os::unix::{
-        fs::PermissionsExt,
-        net::{UnixListener, UnixStream},
-        process::CommandExt,
-    },
-};
+use std::os::unix::{fs::PermissionsExt, net::UnixStream, process::CommandExt};
+use std::{fs, net::Shutdown};
 
 use crate::{
     CodexProviderConfig, CodexProviderHealth, CodexProviderSourceError,
@@ -52,12 +47,9 @@ use crate::{
 const IO_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const STDERR_LIMIT: usize = 64 * 1024;
-#[cfg(unix)]
 const MAX_PROXY_CONNECTIONS: usize = 16;
-#[cfg(unix)]
 const LATEST_VERIFIED_CODEX_CLI_CORE: (u64, u64, u64) = (0, 153, 0);
 
-#[cfg(unix)]
 #[derive(Debug, Eq, PartialEq)]
 enum CodexCliCompatibility {
     Verified,
@@ -169,6 +161,11 @@ impl CodexProviderSource {
             Err(error) => return Err(self.record_start_failure(error, &events)),
         };
         let mut protocol = ProtocolEngine::new(self.schema.clone());
+        eprintln!(
+            "agentpulse codex: startup configured_threads={} discover_threads={}",
+            self.config.threads.len(),
+            self.config.discover_threads
+        );
 
         if let Err(error) = initialize_connection(
             &mut *io,
@@ -185,6 +182,10 @@ impl CodexProviderSource {
         let mut resume_failures = Vec::new();
         for thread in &self.config.threads {
             let thread_id = thread.external_id.as_str();
+            eprintln!(
+                "agentpulse codex: thread/resume request thread_id={}",
+                thread_id
+            );
             let (request_id, request) = match protocol.thread_resume_request(thread_id) {
                 Ok(request) => request,
                 Err(error) => {
@@ -221,6 +222,11 @@ impl CodexProviderSource {
                     resume_failures.push(format!("{thread_id}: {error}"));
                 }
             }
+        }
+        if self.config.discover_threads {
+            eprintln!(
+                "agentpulse codex: discover mode issued no startup thread/list request; waiting for thread/started"
+            );
         }
 
         if !resume_failures.is_empty() {
@@ -280,7 +286,16 @@ impl CodexProviderSource {
                 }
             }
         }
-        lock_status(&self.status).health = CodexProviderHealth::Running;
+        let mut status = lock_status(&self.status);
+        if status.health == CodexProviderHealth::Failed {
+            return Err(CodexProviderSourceError::transport(
+                status
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "worker failed during startup".to_owned()),
+            ));
+        }
+        status.health = CodexProviderHealth::Running;
         Ok(())
     }
 
@@ -345,11 +360,33 @@ impl ProviderEventSource for CodexProviderSource {
     type Error = CodexProviderSourceError;
 
     fn start(&mut self, events: ProviderEventHandle) -> Result<(), Self::Error> {
-        self.start_inner(events)
+        if self.resources_acquired || self.worker.is_some() {
+            return Err(CodexProviderSourceError::AlreadyStarted);
+        }
+        match self.start_inner(events.clone()) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let cleanup = self.stop_inner();
+                let error = match cleanup {
+                    Ok(()) => error,
+                    Err(cleanup) => CodexProviderSourceError::runtime(
+                        "startup cleanup",
+                        format!("{error}; {cleanup}"),
+                    ),
+                };
+                Err(self.record_start_failure(error, &events))
+            }
+        }
     }
 
     fn stop(&mut self) -> Result<(), Self::Error> {
         self.stop_inner()
+    }
+}
+
+impl Drop for CodexProviderSource {
+    fn drop(&mut self) {
+        let _ = self.stop_inner();
     }
 }
 
@@ -1691,8 +1728,8 @@ fn protocol_string<'a>(
 #[derive(Default)]
 struct ProxyControl {
     stopped: AtomicBool,
-    #[cfg(unix)]
-    connections: Mutex<BTreeMap<u64, Vec<UnixStream>>>,
+    #[cfg(any(unix, windows))]
+    connections: Mutex<BTreeMap<u64, Vec<LocalStream>>>,
 }
 
 impl ProxyControl {
@@ -1702,7 +1739,7 @@ impl ProxyControl {
 
     fn request_stop(&self) {
         self.stopped.store(true, Ordering::Release);
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let connections = {
                 let mut connections = self
@@ -1717,11 +1754,11 @@ impl ProxyControl {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn register(
         &self,
         route: ApprovalRoute,
-        stream: &UnixStream,
+        stream: &LocalStream,
     ) -> Result<bool, CodexProviderSourceError> {
         let interrupt = stream.try_clone().map_err(|error| {
             CodexProviderSourceError::runtime("client proxy cancellation socket clone", error)
@@ -1742,7 +1779,7 @@ impl ProxyControl {
         Ok(true)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn unregister(&self, route: ApprovalRoute) {
         self.connections
             .lock()
@@ -1751,7 +1788,6 @@ impl ProxyControl {
     }
 }
 
-#[cfg(unix)]
 fn start_client_proxy(
     config: &CodexProviderConfig,
     schema: ProtocolSchema,
@@ -1760,36 +1796,23 @@ fn start_client_proxy(
     approvals: SharedApprovalState,
     events: ProviderEventHandle,
 ) -> Result<(Arc<ProxyControl>, JoinHandle<ProxyExit>), CodexProviderSourceError> {
-    let listener = UnixListener::bind(&config.proxy_socket_path)
-        .map_err(|error| CodexProviderSourceError::runtime("client proxy bind", error))?;
-    if let Err(error) =
-        fs::set_permissions(&config.proxy_socket_path, fs::Permissions::from_mode(0o600))
-    {
-        let _ = fs::remove_file(&config.proxy_socket_path);
-        return Err(CodexProviderSourceError::runtime(
-            "client proxy permissions",
-            error,
-        ));
-    }
+    let listener = transport::bind_proxy(config)?;
     if let Err(error) = listener.set_nonblocking(true) {
-        let _ = fs::remove_file(&config.proxy_socket_path);
+        let _ = transport::cleanup_proxy(config);
         return Err(CodexProviderSourceError::runtime(
             "client proxy nonblocking mode",
             error,
         ));
     }
-
     let control = Arc::new(ProxyControl::default());
     let worker_control = Arc::clone(&control);
-    let app_server_socket_path = config.socket_path.clone();
-    let proxy_socket_path = config.proxy_socket_path.clone();
+    let worker_config = config.clone();
     let worker = thread::Builder::new()
         .name("agentpulse-codex-proxy".to_owned())
         .spawn(move || {
             run_client_proxy(
                 listener,
-                app_server_socket_path,
-                proxy_socket_path,
+                worker_config,
                 schema,
                 mapper,
                 status,
@@ -1799,30 +1822,17 @@ fn start_client_proxy(
             )
         })
         .map_err(|error| {
-            let _ = fs::remove_file(&config.proxy_socket_path);
+            let _ = transport::cleanup_proxy(config);
             CodexProviderSourceError::runtime("client proxy thread spawn", error)
         })?;
     Ok((control, worker))
 }
 
-#[cfg(not(unix))]
-fn start_client_proxy(
-    _config: &CodexProviderConfig,
-    _schema: ProtocolSchema,
-    _mapper: Arc<Mutex<CodexEventMapper>>,
-    _status: SharedStatus,
-    _approvals: SharedApprovalState,
-    _events: ProviderEventHandle,
-) -> Result<(Arc<ProxyControl>, JoinHandle<ProxyExit>), CodexProviderSourceError> {
-    Err(CodexProviderSourceError::UnsupportedPlatform)
-}
-
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[allow(clippy::too_many_arguments)]
 fn run_client_proxy(
-    listener: UnixListener,
-    app_server_socket_path: std::path::PathBuf,
-    proxy_socket_path: std::path::PathBuf,
+    listener: LocalListener,
+    config: CodexProviderConfig,
     schema: ProtocolSchema,
     mapper: Arc<Mutex<CodexEventMapper>>,
     status: SharedStatus,
@@ -1851,7 +1861,7 @@ fn run_client_proxy(
                 }
                 let route = ApprovalRoute::Proxy(next_route);
                 next_route = next_route.saturating_add(1);
-                let worker_path = app_server_socket_path.clone();
+                let worker_config = config.clone();
                 let worker_schema = schema.clone();
                 let worker_mapper = Arc::clone(&mapper);
                 let worker_status = Arc::clone(&status);
@@ -1863,7 +1873,7 @@ fn run_client_proxy(
                     .spawn(move || {
                         run_proxy_connection(
                             stream,
-                            &worker_path,
+                            &worker_config,
                             worker_schema,
                             worker_mapper,
                             worker_status,
@@ -1892,7 +1902,7 @@ fn run_client_proxy(
                 for worker in clients {
                     let _ = worker.join();
                 }
-                let _ = fs::remove_file(proxy_socket_path);
+                let _ = transport::cleanup_proxy(&config);
                 return ProxyExit::Failed;
             }
         }
@@ -1901,15 +1911,11 @@ fn run_client_proxy(
     for worker in clients {
         let _ = worker.join();
     }
-    let cleanup = match fs::remove_file(proxy_socket_path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("client proxy socket removal: {error}")),
-    };
+    let cleanup = transport::cleanup_proxy(&config).map_err(|error| error.to_string());
     ProxyExit::Stopped(cleanup)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const fn route_number(route: ApprovalRoute) -> u64 {
     match route {
         ApprovalRoute::Proxy(number) => number,
@@ -1917,11 +1923,11 @@ const fn route_number(route: ApprovalRoute) -> u64 {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[allow(clippy::too_many_arguments)]
 fn run_proxy_connection(
-    downstream_stream: UnixStream,
-    app_server_socket_path: &std::path::Path,
+    downstream_stream: LocalStream,
+    config: &CodexProviderConfig,
     schema: ProtocolSchema,
     mapper: Arc<Mutex<CodexEventMapper>>,
     status: SharedStatus,
@@ -1932,7 +1938,7 @@ fn run_proxy_connection(
 ) {
     let result = proxy_connection_loop(
         downstream_stream,
-        app_server_socket_path,
+        config,
         &schema,
         &mapper,
         &status,
@@ -1959,11 +1965,11 @@ fn run_proxy_connection(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[allow(clippy::too_many_arguments)]
 fn proxy_connection_loop(
-    downstream_stream: UnixStream,
-    app_server_socket_path: &std::path::Path,
+    downstream_stream: LocalStream,
+    config: &CodexProviderConfig,
     schema: &ProtocolSchema,
     mapper: &Arc<Mutex<CodexEventMapper>>,
     status: &SharedStatus,
@@ -1976,33 +1982,29 @@ fn proxy_connection_loop(
         return Ok(());
     }
     downstream_stream
+        .set_nonblocking(false)
+        .map_err(|error| CodexProviderSourceError::runtime("client blocking mode", error))?;
+    downstream_stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .map_err(|error| CodexProviderSourceError::runtime("client handshake timeout", error))?;
     downstream_stream
         .set_write_timeout(Some(Duration::from_secs(2)))
         .map_err(|error| CodexProviderSourceError::runtime("client write timeout", error))?;
-    let mut downstream = tungstenite::accept(downstream_stream).map_err(|error| {
+    let mut downstream = transport::accept_proxy(downstream_stream, config).map_err(|error| {
         CodexProviderSourceError::transport(format!("client WebSocket handshake failed: {error}"))
     })?;
     configure_proxy_stream(downstream.get_mut())?;
 
-    let upstream_stream = UnixStream::connect(app_server_socket_path)
-        .map_err(|error| CodexProviderSourceError::runtime("proxy upstream connection", error))?;
-    if !control.register(route, &upstream_stream)? {
+    let mut upstream = transport::connect(config, Duration::from_secs(2))?;
+    configure_proxy_stream(upstream.get_ref())?;
+    if !control.register(route, upstream.get_ref())? {
         return Ok(());
     }
-    configure_proxy_stream(&upstream_stream)?;
-    let (mut upstream, _) =
-        tungstenite::client("ws://localhost/", upstream_stream).map_err(|error| {
-            CodexProviderSourceError::transport(format!(
-                "proxy upstream WebSocket handshake failed: {error}"
-            ))
-        })?;
     let protocol = ProtocolEngine::new(schema.clone());
 
     while !control.is_stopped() {
         flush_approval_responses(
-            &mut UnixWebSocketRef(&mut upstream),
+            &mut LocalWebSocketRef(&mut upstream),
             &protocol,
             approvals,
             route,
@@ -2067,8 +2069,8 @@ fn proxy_connection_loop(
     Ok(())
 }
 
-#[cfg(unix)]
-fn configure_proxy_stream(stream: &UnixStream) -> Result<(), CodexProviderSourceError> {
+#[cfg(any(unix, windows))]
+fn configure_proxy_stream(stream: &LocalStream) -> Result<(), CodexProviderSourceError> {
     stream
         .set_read_timeout(Some(IO_POLL_INTERVAL))
         .map_err(|error| CodexProviderSourceError::runtime("proxy socket read timeout", error))?;
@@ -2077,12 +2079,12 @@ fn configure_proxy_stream(stream: &UnixStream) -> Result<(), CodexProviderSource
         .map_err(|error| CodexProviderSourceError::runtime("proxy socket write timeout", error))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn proxy_transport_error(error: tungstenite::Error) -> CodexProviderSourceError {
     CodexProviderSourceError::transport(format!("client proxy: {error}"))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn is_timeout(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -2090,7 +2092,7 @@ fn is_timeout(error: &io::Error) -> bool {
     )
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[allow(clippy::too_many_arguments)]
 fn observe_proxy_server_text(
     protocol: &ProtocolEngine,
@@ -2131,11 +2133,11 @@ fn observe_proxy_server_text(
     }
 }
 
-#[cfg(unix)]
-struct UnixWebSocketRef<'a>(&'a mut WebSocket<UnixStream>);
+#[cfg(any(unix, windows))]
+struct LocalWebSocketRef<'a>(&'a mut WebSocket<LocalStream>);
 
-#[cfg(unix)]
-impl AppServerIo for UnixWebSocketRef<'_> {
+#[cfg(any(unix, windows))]
+impl AppServerIo for LocalWebSocketRef<'_> {
     fn write_text(&mut self, text: String) -> Result<(), CodexProviderSourceError> {
         self.0
             .send(Message::Text(text.into()))
@@ -2171,15 +2173,99 @@ struct ManagedCodexRuntime {
     owns_runtime_directory: bool,
 }
 
+#[cfg(windows)]
+impl ManagedCodexRuntime {
+    fn start_windows(
+        &mut self,
+        config: &CodexProviderConfig,
+    ) -> Result<Box<dyn AppServerIo>, CodexProviderSourceError> {
+        if let CodexCliCompatibility::UnverifiedNewer(version) = verify_codex_version(config)? {
+            eprintln!(
+                "warning: Codex CLI {version} is newer than verified schema {}; starting best-effort",
+                crate::SUPPORTED_CODEX_CLI_VERSION
+            );
+        }
+        agentpulse_platform::ensure_private_dir(&config.runtime_root)
+            .map_err(|error| CodexProviderSourceError::runtime("private root creation", error))?;
+        match fs::create_dir(&config.runtime_directory) {
+            Ok(()) => self.owns_runtime_directory = true,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(CodexProviderSourceError::RuntimePathOccupied {
+                    path: config.runtime_directory.clone(),
+                });
+            }
+            Err(error) => {
+                return Err(CodexProviderSourceError::runtime(
+                    "private directory creation",
+                    error,
+                ));
+            }
+        }
+        agentpulse_platform::ensure_private_dir(&config.runtime_directory).map_err(|error| {
+            CodexProviderSourceError::runtime("private directory permissions", error)
+        })?;
+        let executable = crate::resolve_codex_executable(&config.codex_executable)
+            .map_err(|error| CodexProviderSourceError::runtime("executable resolution", error))?;
+        let mut command = Command::new(executable);
+        command
+            .args(["app-server", "--listen", &config.app_server_uri])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        self.launch_windows(config, &mut command)
+    }
+
+    fn launch_windows(
+        &mut self,
+        config: &CodexProviderConfig,
+        command: &mut Command,
+    ) -> Result<Box<dyn AppServerIo>, CodexProviderSourceError> {
+        self.process = Some(ManagedProcess::spawn_windows(command)?);
+        let deadline = Instant::now() + config.startup_timeout;
+        loop {
+            let process = self.process.as_mut().ok_or_else(|| {
+                CodexProviderSourceError::runtime("process state", "missing child")
+            })?;
+            if let Some(status) = process
+                .try_wait()
+                .map_err(|error| CodexProviderSourceError::runtime("process status", error))?
+            {
+                process.join_stderr(IO_POLL_INTERVAL);
+                return Err(CodexProviderSourceError::ProcessExited {
+                    status: display_exit_status(status),
+                    stderr: process.stderr_snapshot(),
+                });
+            }
+            if let Some(address) = transport::reported_address(&process.stderr_snapshot()) {
+                *config
+                    .app_server_address
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(address);
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if !remaining.is_zero() {
+                    let socket = transport::connect(config, remaining.min(Duration::from_secs(2)))?;
+                    configure_proxy_stream(socket.get_ref())?;
+                    return Ok(Box::new(LocalWebSocketIo { socket }));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(CodexProviderSourceError::StartupTimeout {
+                    timeout: config.startup_timeout,
+                });
+            }
+            thread::sleep(PROCESS_POLL_INTERVAL);
+        }
+    }
+}
+
 impl AppServerRuntime for ManagedCodexRuntime {
     fn start(
         &mut self,
         config: &CodexProviderConfig,
     ) -> Result<Box<dyn AppServerIo>, CodexProviderSourceError> {
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            let _ = config;
-            Err(CodexProviderSourceError::UnsupportedPlatform)
+            self.start_windows(config)
         }
 
         #[cfg(unix)]
@@ -2214,7 +2300,11 @@ impl AppServerRuntime for ManagedCodexRuntime {
                     CodexProviderSourceError::runtime("private directory permissions", error)
                 })?;
 
-            let mut command = Command::new(&config.codex_executable);
+            let mut command = Command::new(
+                crate::resolve_codex_executable(&config.codex_executable).map_err(|error| {
+                    CodexProviderSourceError::runtime("executable resolution", error)
+                })?,
+            );
             command
                 .arg("app-server")
                 .arg("--listen")
@@ -2264,7 +2354,7 @@ impl AppServerRuntime for ManagedCodexRuntime {
                                         "Unix WebSocket handshake failed: {error}"
                                     ))
                                 })?;
-                            return Ok(Box::new(UnixWebSocketIo { socket }));
+                            return Ok(Box::new(LocalWebSocketIo { socket }));
                         }
                         Err(error)
                             if matches!(
@@ -2329,8 +2419,20 @@ impl AppServerRuntime for ManagedCodexRuntime {
             process.join_stderr(IO_POLL_INTERVAL);
         }
 
-        #[cfg(unix)]
+        #[cfg(windows)]
+        {
+            *config
+                .app_server_address
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            config
+                .proxy_listener
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+        }
         if self.owns_runtime_directory {
+            #[cfg(unix)]
             if config.socket_path.exists()
                 && let Err(error) = fs::remove_file(&config.socket_path)
             {
@@ -2355,31 +2457,121 @@ impl AppServerRuntime for ManagedCodexRuntime {
     }
 }
 
-#[cfg(unix)]
 fn verify_codex_version(
     config: &CodexProviderConfig,
 ) -> Result<CodexCliCompatibility, CodexProviderSourceError> {
-    let output = Command::new(&config.codex_executable)
+    #[cfg(windows)]
+    let actual = probe_windows_version(config)?;
+    #[cfg(unix)]
+    let actual = {
+        let output = Command::new(
+            crate::resolve_codex_executable(&config.codex_executable).map_err(|error| {
+                CodexProviderSourceError::runtime("executable resolution", error)
+            })?,
+        )
         .arg("--version")
         .output()
         .map_err(|error| CodexProviderSourceError::VersionProbe {
             message: error.to_string(),
         })?;
-    if !output.status.success() {
-        return Err(CodexProviderSourceError::VersionProbe {
-            message: format!("process exited with {}", output.status),
-        });
-    }
-    let actual = String::from_utf8(output.stdout)
-        .map_err(|error| CodexProviderSourceError::VersionProbe {
-            message: format!("stdout was not UTF-8: {error}"),
-        })?
-        .trim()
-        .to_owned();
+        if !output.status.success() {
+            return Err(CodexProviderSourceError::VersionProbe {
+                message: format!("process exited with {}", output.status),
+            });
+        }
+        String::from_utf8(output.stdout)
+            .map_err(|error| CodexProviderSourceError::VersionProbe {
+                message: format!("stdout was not UTF-8: {error}"),
+            })?
+            .trim()
+            .to_owned()
+    };
     classify_codex_version(&actual)
 }
 
-#[cfg(unix)]
+#[cfg(windows)]
+fn probe_windows_version(config: &CodexProviderConfig) -> Result<String, CodexProviderSourceError> {
+    let executable = crate::resolve_codex_executable(&config.codex_executable)
+        .map_err(|error| CodexProviderSourceError::runtime("executable resolution", error))?;
+    let mut command = Command::new(executable);
+    command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    probe_windows_command(config, &mut command)
+}
+
+#[cfg(windows)]
+fn probe_windows_command(
+    config: &CodexProviderConfig,
+    command: &mut Command,
+) -> Result<String, CodexProviderSourceError> {
+    let mut process = ManagedProcess::spawn_windows(command)?;
+    let stdout = process
+        .child
+        .stdout
+        .take()
+        .ok_or_else(|| CodexProviderSourceError::runtime("version stdout", "missing pipe"))?;
+    let output = Arc::new(Mutex::new(VecDeque::new()));
+    let worker_output = Arc::clone(&output);
+    let (done_sender, done) = mpsc::channel();
+    let worker = thread::Builder::new()
+        .name("agentpulse-codex-version".to_owned())
+        .spawn(move || {
+            capture_stderr(stdout, &worker_output);
+            let _ = done_sender.send(());
+        })
+        .map_err(|error| CodexProviderSourceError::runtime("version reader", error))?;
+    let deadline = Instant::now() + config.startup_timeout;
+    let result = loop {
+        match process.try_wait() {
+            Ok(Some(status)) => {
+                break if status.success() {
+                    Ok(())
+                } else {
+                    Err(CodexProviderSourceError::VersionProbe {
+                        message: format!("process exited with {status}"),
+                    })
+                };
+            }
+            Err(error) => {
+                break Err(CodexProviderSourceError::VersionProbe {
+                    message: error.to_string(),
+                });
+            }
+            Ok(None) => {}
+        }
+        if Instant::now() >= deadline {
+            break Err(CodexProviderSourceError::VersionProbe {
+                message: format!("version probe timed out after {:?}", config.startup_timeout),
+            });
+        }
+        thread::sleep(PROCESS_POLL_INTERVAL);
+    };
+    let _ = process.kill();
+    let _ = process.wait();
+    if done.recv_timeout(IO_POLL_INTERVAL).is_ok() {
+        let _ = worker.join();
+    } else {
+        return Err(CodexProviderSourceError::VersionProbe {
+            message: "version output reader did not finish".to_owned(),
+        });
+    }
+    result?;
+    let bytes = output
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .copied()
+        .collect();
+    String::from_utf8(bytes)
+        .map(|text| text.trim().to_owned())
+        .map_err(|error| CodexProviderSourceError::VersionProbe {
+            message: error.to_string(),
+        })
+}
+
 fn classify_codex_version(actual: &str) -> Result<CodexCliCompatibility, CodexProviderSourceError> {
     let Some(version_text) = actual.strip_prefix("codex-cli ") else {
         return Err(version_mismatch(actual));
@@ -2396,7 +2588,6 @@ fn classify_codex_version(actual: &str) -> Result<CodexCliCompatibility, CodexPr
     }
 }
 
-#[cfg(unix)]
 fn version_mismatch(actual: &str) -> CodexProviderSourceError {
     CodexProviderSourceError::VersionMismatch {
         expected: crate::SUPPORTED_CODEX_CLI_VERSION_REQUIREMENT,
@@ -2406,6 +2597,8 @@ fn version_mismatch(actual: &str) -> CodexProviderSourceError {
 
 struct ManagedProcess {
     child: Child,
+    #[cfg(windows)]
+    job: Option<agentpulse_platform::ProcessJob>,
     #[cfg(unix)]
     process_group: Option<i32>,
     stderr: Arc<Mutex<VecDeque<u8>>>,
@@ -2414,7 +2607,19 @@ struct ManagedProcess {
 }
 
 impl ManagedProcess {
-    #[cfg(test)]
+    #[cfg(windows)]
+    fn spawn_windows(command: &mut Command) -> Result<Self, CodexProviderSourceError> {
+        let (child, job) = agentpulse_platform::ProcessJob::spawn(command)
+            .map_err(|error| CodexProviderSourceError::runtime("process job launch", error))?;
+        let mut process = Self::new_with_process_group(child, None)?;
+        let _watcher = job
+            .terminate_on_root_exit(&process.child)
+            .map_err(|error| CodexProviderSourceError::runtime("process watcher", error))?;
+        process.job = Some(job);
+        Ok(process)
+    }
+
+    #[cfg(all(test, unix))]
     fn new(child: Child) -> Result<Self, CodexProviderSourceError> {
         Self::new_with_process_group(child, None)
     }
@@ -2464,6 +2669,8 @@ impl ManagedProcess {
         };
         Ok(Self {
             child,
+            #[cfg(windows)]
+            job: None,
             #[cfg(unix)]
             process_group,
             stderr,
@@ -2515,9 +2722,12 @@ impl ManagedProcess {
         self.child.kill()
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     fn kill(&mut self) -> io::Result<()> {
-        self.child.kill()
+        match &self.job {
+            Some(job) => job.terminate(),
+            None => self.child.kill(),
+        }
     }
 
     #[cfg(unix)]
@@ -2537,9 +2747,11 @@ impl ManagedProcess {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     fn kill_remaining_process_group(&mut self) -> io::Result<()> {
-        Ok(())
+        self.job
+            .as_ref()
+            .map_or(Ok(()), agentpulse_platform::ProcessJob::terminate)
     }
 
     fn wait(&mut self) -> io::Result<ExitStatus> {
@@ -2564,6 +2776,15 @@ impl ManagedProcess {
             let _ = worker.join();
         }
         let _ = self.stderr_thread.take();
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ManagedProcess {
+    fn drop(&mut self) {
+        let _ = self.kill();
+        let _ = self.child.wait();
+        self.join_stderr(IO_POLL_INTERVAL);
     }
 }
 
@@ -2594,13 +2815,11 @@ fn display_exit_status(status: ExitStatus) -> String {
     )
 }
 
-#[cfg(unix)]
-struct UnixWebSocketIo {
-    socket: WebSocket<UnixStream>,
+struct LocalWebSocketIo {
+    socket: WebSocket<LocalStream>,
 }
 
-#[cfg(unix)]
-impl AppServerIo for UnixWebSocketIo {
+impl AppServerIo for LocalWebSocketIo {
     fn write_text(&mut self, text: String) -> Result<(), CodexProviderSourceError> {
         self.socket
             .send(Message::Text(text.into()))
@@ -2691,6 +2910,8 @@ mod tests {
     };
     use agentpulse_protocol::{ProtocolMessage, V2_PROTOCOL_VERSION};
     use tungstenite::{ClientRequestBuilder, Message, WebSocket, client, http::Uri};
+    #[cfg(windows)]
+    use tungstenite::{client::IntoClientRequest, http::header::AUTHORIZATION};
 
     use super::*;
     use crate::{CodexProviderPort, status::snapshot};
@@ -2804,7 +3025,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[derive(Default)]
     struct ProxyTestControl {
         approval_response: Mutex<Option<String>>,
@@ -2812,14 +3032,12 @@ mod tests {
         stop: AtomicBool,
     }
 
-    #[cfg(unix)]
     struct ProxyTestRuntime {
         observer: Arc<FakeControl>,
         proxy: Arc<ProxyTestControl>,
         worker: Option<JoinHandle<()>>,
     }
 
-    #[cfg(unix)]
     impl AppServerRuntime for ProxyTestRuntime {
         fn start(
             &mut self,
@@ -2828,9 +3046,20 @@ mod tests {
             fs::create_dir_all(&config.runtime_directory).map_err(|error| {
                 CodexProviderSourceError::runtime("proxy test directory creation", error)
             })?;
-            let listener = UnixListener::bind(&config.socket_path).map_err(|error| {
+            #[cfg(unix)]
+            let binding = LocalListener::bind(&config.socket_path);
+            #[cfg(windows)]
+            let binding = LocalListener::bind((std::net::Ipv4Addr::LOCALHOST, 0));
+            let listener = binding.map_err(|error| {
                 CodexProviderSourceError::runtime("proxy test upstream bind", error)
             })?;
+            #[cfg(windows)]
+            {
+                *locked(&config.app_server_address) =
+                    Some(listener.local_addr().map_err(|error| {
+                        CodexProviderSourceError::runtime("test address", error)
+                    })?);
+            }
             listener.set_nonblocking(true).map_err(|error| {
                 CodexProviderSourceError::runtime("proxy test upstream nonblocking mode", error)
             })?;
@@ -2850,10 +3079,11 @@ mod tests {
 
         fn stop(&mut self, config: &CodexProviderConfig) -> Result<(), CodexProviderSourceError> {
             self.proxy.stop.store(true, Ordering::Release);
-            let _ = UnixStream::connect(&config.socket_path);
+
             if let Some(worker) = self.worker.take() {
                 let _ = worker.join();
             }
+            #[cfg(unix)]
             for path in [&config.proxy_socket_path, &config.socket_path] {
                 if let Err(error) = fs::remove_file(path)
                     && error.kind() != io::ErrorKind::NotFound
@@ -2884,8 +3114,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
-    fn proxy_test_upstream(listener: UnixListener, control: Arc<ProxyTestControl>) {
+    fn proxy_test_upstream(listener: LocalListener, control: Arc<ProxyTestControl>) {
         while !control.stop.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((stream, _)) => {
@@ -2907,8 +3136,10 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
-    fn proxy_test_exchange(stream: UnixStream, control: &ProxyTestControl) -> Result<(), String> {
+    fn proxy_test_exchange(stream: LocalStream, control: &ProxyTestControl) -> Result<(), String> {
+        stream
+            .set_nonblocking(false)
+            .map_err(|error| error.to_string())?;
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .map_err(|error| error.to_string())?;
@@ -3831,7 +4062,29 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
+    fn connect_desktop(
+        config: &CodexProviderConfig,
+    ) -> Result<WebSocket<LocalStream>, Box<dyn Error>> {
+        #[cfg(unix)]
+        let stream = LocalStream::connect(&config.proxy_socket_path)?;
+        #[cfg(windows)]
+        let stream = LocalStream::connect(config.proxy_address)?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        #[cfg(unix)]
+        let (socket, _) = tungstenite::client("ws://localhost/", stream)?;
+        #[cfg(windows)]
+        let (socket, _) = {
+            let mut request = config.remote_uri().into_client_request()?;
+            request.headers_mut().insert(
+                AUTHORIZATION,
+                format!("Bearer {}", config.proxy_token.expose()).parse()?,
+            );
+            tungstenite::client(request, stream)?
+        };
+        Ok(socket)
+    }
+
     #[test]
     fn client_proxy_routes_phone_approval_to_originating_connection() -> TestResult {
         let observer = Arc::new(FakeControl::default());
@@ -3840,7 +4093,7 @@ mod tests {
         let provider_id = ProviderId::new();
         let runtime_root = std::env::temp_dir().join(format!("agentpulse-proxy-{provider_id}"));
         let config = CodexProviderConfig::new(provider_id, &runtime_root, [THREAD_ID])?;
-        let proxy_socket_path = config.proxy_socket_path.clone();
+        let desktop_config = config.clone();
         let schema = ProtocolSchema::compile()?;
         let mapper = CodexEventMapper::new(provider_id, &config.threads, config.discover_threads);
         let status = Arc::new(Mutex::new(Default::default()));
@@ -3883,10 +4136,7 @@ mod tests {
         let _ = host.start()?;
         let _ = host.subscribe(channel_id, session_id)?;
 
-        let stream = UnixStream::connect(proxy_socket_path)?;
-        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-        let (mut desktop, _) = tungstenite::client("ws://localhost/", stream)?;
+        let mut desktop = connect_desktop(&desktop_config)?;
         desktop.send(Message::Text(
             r#"{"id":77,"method":"initialize","params":{}}"#.into(),
         ))?;
@@ -3963,7 +4213,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
     #[test]
     fn client_proxy_shutdown_interrupts_connected_desktop() -> TestResult {
         let observer = Arc::new(FakeControl::default());
@@ -3972,7 +4221,7 @@ mod tests {
         let provider_id = ProviderId::new();
         let runtime_root = std::env::temp_dir().join(format!("agentpulse-proxy-{provider_id}"));
         let config = CodexProviderConfig::new(provider_id, &runtime_root, [THREAD_ID])?;
-        let proxy_socket_path = config.proxy_socket_path.clone();
+        let desktop_config = config.clone();
         let schema = ProtocolSchema::compile()?;
         let mapper = CodexEventMapper::new(provider_id, &config.threads, config.discover_threads);
         let status = Arc::new(Mutex::new(Default::default()));
@@ -3997,10 +4246,7 @@ mod tests {
         host.register_provider(port, source)?;
         let _ = host.start()?;
 
-        let stream = UnixStream::connect(proxy_socket_path)?;
-        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-        let (mut desktop, _) = tungstenite::client("ws://localhost/", stream)?;
+        let mut desktop = connect_desktop(&desktop_config)?;
         desktop.send(Message::Text(
             r#"{"id":77,"method":"initialize","params":{}}"#.into(),
         ))?;
@@ -4122,7 +4368,6 @@ mod tests {
         Ok((root, executable))
     }
 
-    #[cfg(unix)]
     #[test]
     fn verified_codex_versions_are_accepted() -> TestResult {
         for version in crate::SUPPORTED_CODEX_CLI_VERSIONS {
@@ -4144,7 +4389,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
     #[test]
     fn newer_codex_versions_are_accepted_as_unverified() -> TestResult {
         for version in ["0.153.1", "0.154.0-beta.1", "1.0.0"] {
@@ -4157,7 +4401,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
     #[test]
     fn older_unknown_and_malformed_codex_versions_are_rejected() {
         for actual in [
@@ -4331,7 +4574,7 @@ mod tests {
         stream.set_read_timeout(Some(Duration::from_secs(1)))?;
         stream.set_write_timeout(Some(Duration::from_secs(1)))?;
         let (socket, _) = tungstenite::client("ws://localhost/", stream)?;
-        let mut io = UnixWebSocketIo { socket };
+        let mut io = LocalWebSocketIo { socket };
         io.write_text("request".to_owned())?;
         let response = io.read()?;
         assert!(matches!(response, ReadOutcome::Text(text) if text == "response"));
@@ -4341,14 +4584,13 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
     #[test]
-    #[ignore = "requires the exact supported Codex CLI to be installed"]
+    #[ignore = "requires installed Codex CLI and normal user home access"]
     fn installed_codex_app_server_completes_real_initialize_handshake() -> TestResult {
         let provider_id = ProviderId::new();
         let unique = provider_id.to_string();
         let suffix = unique.chars().rev().take(8).collect::<String>();
-        let root = PathBuf::from(format!("/tmp/aplive{suffix}"));
+        let root = std::env::temp_dir().join(format!("aplive{suffix}"));
         let config = CodexProviderConfig::new(provider_id, &root, [THREAD_ID])?
             .with_startup_timeout(Duration::from_secs(5));
         let mut runtime = ManagedCodexRuntime::default();
@@ -4392,5 +4634,10 @@ mod tests {
         cleanup?;
         fs::remove_dir(root)?;
         Ok(())
+    }
+    #[cfg(windows)]
+    mod windows_tests {
+        use super::*;
+        include!("runtime/windows_tests.rs");
     }
 }

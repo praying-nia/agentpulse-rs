@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "agentpulse-platform",
     "agentpulse-bridge",
     "agentpulse-channels/native",
     "agentpulse-core",

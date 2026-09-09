@@ -4,7 +4,7 @@ use std::{
     fmt, io,
     net::{IpAddr, SocketAddr, TcpListener, TcpStream},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rustls::{
@@ -282,13 +282,35 @@ impl TlsWebSocketListener {
                 });
             }
         };
-        configure_stream(&tcp, self.config.handshake_timeout)?;
-        let connection =
-            ServerConnection::new(Arc::clone(&self.server_config)).map_err(|error| {
-                LoopbackWebSocketError::Tls {
-                    message: error.to_string(),
-                }
+        eprintln!(
+            "agentpulse tls listener: tcp accepted peer_port={}",
+            peer_address.port()
+        );
+        tcp.set_nonblocking(false)
+            .map_err(|source| LoopbackWebSocketError::Io {
+                operation: "configure accepted TLS connection for handshake",
+                source,
             })?;
+        configure_stream(&tcp, self.config.handshake_timeout)?;
+        let connection = match ServerConnection::new(Arc::clone(&self.server_config)) {
+            Ok(connection) => {
+                eprintln!(
+                    "agentpulse tls listener: rustls server connection created peer_port={}",
+                    peer_address.port()
+                );
+                connection
+            }
+            Err(error) => {
+                eprintln!(
+                    "agentpulse tls listener: rustls server connection failed peer_port={} error={}",
+                    peer_address.port(),
+                    error
+                );
+                return Err(LoopbackWebSocketError::Tls {
+                    message: error.to_string(),
+                });
+            }
+        };
         let stream = StreamOwned::new(connection, tcp);
         let authenticated = Arc::new(Mutex::new(None::<(String, String)>));
         let capture = Arc::clone(&authenticated);
@@ -331,12 +353,28 @@ impl TlsWebSocketListener {
             .max_write_buffer_size(self.config.max_message_bytes.saturating_mul(2))
             .max_message_size(Some(self.config.max_message_bytes))
             .max_frame_size(Some(self.config.max_message_bytes));
-        let mut socket =
-            accept_hdr_with_config(stream, callback, Some(websocket_config)).map_err(|error| {
-                LoopbackWebSocketError::Handshake {
+        let handshake_started = Instant::now();
+        let mut socket = match accept_hdr_with_config(stream, callback, Some(websocket_config)) {
+            Ok(socket) => {
+                eprintln!(
+                    "agentpulse tls listener: TLS/WebSocket handshake succeeded peer_port={} elapsed_ms={}",
+                    peer_address.port(),
+                    handshake_started.elapsed().as_millis()
+                );
+                socket
+            }
+            Err(error) => {
+                eprintln!(
+                    "agentpulse tls listener: TLS/WebSocket handshake failed peer_port={} elapsed_ms={} error={}",
+                    peer_address.port(),
+                    handshake_started.elapsed().as_millis(),
+                    error
+                );
+                return Err(LoopbackWebSocketError::Handshake {
                     message: error.to_string(),
-                }
-            })?;
+                });
+            }
+        };
         configure_stream(&socket.get_mut().sock, self.config.io_poll_interval)?;
         let credentials = authenticated.lock().ok().and_then(|slot| slot.clone());
         Ok(Some(TlsWebSocket {
@@ -476,6 +514,7 @@ fn validate_upgrade(
     expected_subprotocol: &str,
 ) -> Result<(), tungstenite::handshake::server::ErrorResponse> {
     if request.uri().path() != expected_path || request.uri().query().is_some() {
+        eprintln!("agentpulse tls listener: WebSocket upgrade rejected reason=path");
         return Err(rejection(StatusCode::NOT_FOUND, "unknown WebSocket path"));
     }
     let offered = request
@@ -489,6 +528,7 @@ fn validate_upgrade(
                 .any(|candidate| candidate == expected_subprotocol)
         });
     if !offered {
+        eprintln!("agentpulse tls listener: WebSocket upgrade rejected reason=subprotocol");
         return Err(rejection(
             StatusCode::BAD_REQUEST,
             "required WebSocket subprotocol was not offered",

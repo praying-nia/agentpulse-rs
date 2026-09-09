@@ -45,6 +45,7 @@ dependencies = [
  "agentpulse-channel-native",
  "agentpulse-core",
  "agentpulse-pairing",
+ "agentpulse-platform",
  "agentpulse-protocol",
  "agentpulse-provider-codex",
  "agentpulse-relay",
@@ -66,6 +67,7 @@ dependencies = [
 name = "agentpulse-pairing"
 version = "0.1.0"
 dependencies = [
+ "agentpulse-platform",
  "agentpulse-transport",
  "base64",
  "fs2",
@@ -82,6 +84,16 @@ dependencies = [
  "tungstenite",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "agentpulse-platform"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+ "socket2",
+ "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -102,13 +114,17 @@ dependencies = [
  "agentpulse-bridge",
  "agentpulse-channel-native",
  "agentpulse-core",
+ "agentpulse-platform",
  "agentpulse-protocol",
  "jsonschema",
  "nix",
+ "rand",
  "semver",
  "serde_json",
+ "subtle",
  "thiserror 2.0.20",
  "tungstenite",
+ "zeroize",
 ]
 
 [[package]]

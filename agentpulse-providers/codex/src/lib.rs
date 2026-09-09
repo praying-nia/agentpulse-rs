@@ -1,6 +1,7 @@
 //! A Codex Provider with live observation and command/file approval write-back.
 //!
-//! The Provider owns a Unix-socket Codex App Server, either resumes an explicit
+//! The Provider owns a local Codex App Server (Unix socket or Windows loopback),
+//! either resumes an explicit
 //! set of threads or follows threads opened by another client of that same
 //! server, strictly validates the schema-pinned protocol, and publishes
 //! normalized live session events through `agentpulse-bridge`.
@@ -9,6 +10,7 @@ mod approval;
 mod config;
 mod control;
 mod error;
+mod executable;
 mod mapper;
 mod port;
 mod protocol;
@@ -21,6 +23,7 @@ use agentpulse_core::{NonEmptyText, ProviderCapabilities, ProviderDescriptor, Pr
 
 pub use config::CodexProviderConfig;
 pub use error::{CodexProviderBuildError, CodexProviderPortError, CodexProviderSourceError};
+pub use executable::resolve_codex_executable;
 pub use port::CodexProviderPort;
 pub use runtime::CodexProviderSource;
 pub use status::{CodexProviderHealth, CodexProviderSnapshot};
@@ -48,6 +51,8 @@ pub const BUNDLED_CODEX_SCHEMA_SHA256: &str =
 #[derive(Clone)]
 pub struct CodexProviderHandle {
     remote_uri: String,
+    #[cfg(windows)]
+    remote_auth_token: config::ProxyToken,
     status: SharedStatus,
 }
 
@@ -56,6 +61,21 @@ impl CodexProviderHandle {
     #[must_use]
     pub fn remote_uri(&self) -> &str {
         &self.remote_uri
+    }
+
+    /// Returns the bearer token required by a Windows loopback Proxy.
+    ///
+    /// Callers must pass this only through the launched Codex process environment.
+    #[must_use]
+    pub fn remote_auth_token(&self) -> Option<&str> {
+        #[cfg(windows)]
+        {
+            Some(self.remote_auth_token.expose())
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
     }
 
     /// Returns an atomic point-in-time status copy.
@@ -117,6 +137,8 @@ impl CodexProvider {
             CodexEventMapper::new(config.provider_id, &config.threads, config.discover_threads);
         let handle = CodexProviderHandle {
             remote_uri: config.remote_uri.clone(),
+            #[cfg(windows)]
+            remote_auth_token: config.proxy_token.clone(),
             status: Arc::clone(&status),
         };
         let source = CodexProviderSource::new(

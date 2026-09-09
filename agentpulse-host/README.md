@@ -1,6 +1,38 @@
 # agentpulse-host
 
-User-facing Linux/macOS Host for AgentPulse observation and approvals.
+User-facing Windows/Linux/macOS Host for AgentPulse observation and approvals.
+
+Windows uses a current-user Named Pipe for administration and protected ACLs for
+configuration and credentials. The Codex App Server and desktop proxy use IPv4
+loopback WebSockets; Codex and its descendants run in a kill-on-close Job Object.
+Use a dedicated application directory with `--data-dir`, or the default
+`ProjectDirs` location. See [platform contracts](../agentpulse-platform/README.md).
+
+```powershell
+cargo build -p agentpulse-host
+.\target\debug\agentpulse.exe init --name "Windows Host"
+.\target\debug\agentpulse.exe serve --discover-threads --bind <YOUR_PRIVATE_IPV4>
+# In another terminal, using the same --data-dir if customized:
+.\target\debug\agentpulse.exe codex
+.\target\debug\agentpulse.exe status
+.\target\debug\agentpulse.exe stop
+```
+
+The Host resolves the native `codex.exe` from PATH or the official npm package;
+PowerShell execution policy does not need to change. For a custom installation,
+pass `serve --codex 'C:\path with spaces\codex.exe'`. `agentpulse codex` defaults
+to that same executable and connects to the observing proxy reported by Host.
+On Windows, it obtains the root-only loopback URI and a separate 256-bit proxy
+token through the current-user protected admin channel, then passes the token
+only in the Codex child environment with `--remote-auth-token-env`. The token is
+not printed in status, logs, command arguments, or errors. A new Host
+configuration allocates new proxy credentials; launch through `agentpulse codex`
+instead of saving them. The Native phone port remains stable.
+
+Windows local Runtime, Proxy and Host CLI acceptance use Codex 0.153.4. This
+version still follows the best-effort compatibility policy against the bundled
+0.153.0 schema. Phone pairing, public Relay, and real model Turn acceptance on
+Windows remain a separate device test; local smoke tests do not certify them.
 
 ## Setup
 
@@ -13,7 +45,7 @@ printf '%s\n' '<RELAY_ENROLLMENT_TOKEN>' | \
 agentpulse serve --bind 127.0.0.1
 ```
 
-`serve` requires the exact supported Codex CLI version, starts the managed Codex App Server Provider, authenticated Native WSS, mDNS service, private admin socket, and foreground health loop. Omit `--bind` only when the machine has exactly one private/link-local address. Native WSS uses stable port `49320` by default so saved pairing credentials survive Host restarts even when mDNS is unavailable; use `--port` to select another stable port when necessary. In another terminal, launch Codex through the managed server:
+`serve` requires a verified Codex CLI version or a valid newer SemVer under the Provider compatibility policy, starts the managed Codex App Server Provider, authenticated Native WSS, mDNS service, private admin socket, and foreground health loop. Omit `--bind` only when the machine has exactly one private/link-local address. Native WSS uses stable port `49320` by default so saved pairing credentials survive Host restarts even when mDNS is unavailable; use `--port` to select another stable port when necessary. In another terminal, launch Codex through the managed server:
 
 ```bash
 agentpulse codex -- <additional-codex-arguments>

@@ -11,6 +11,7 @@ name = "agentpulse"
 path = "src/main.rs"
 
 [dependencies]
+agentpulse-platform = { path = "../agentpulse-platform" }
 agentpulse-bridge = { path = "../agentpulse-bridge" }
 agentpulse-channel-native = { path = "../agentpulse-channels/native" }
 agentpulse-core = { path = "../agentpulse-core" }
