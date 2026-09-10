@@ -2,6 +2,8 @@
 
 User-facing Windows/Linux/macOS Host for AgentPulse observation and approvals.
 
+For a complete walkthrough, see the [中文详细使用手册](../../docs/USER_GUIDE.zh-CN.md).
+
 Windows uses a current-user Named Pipe for administration and protected ACLs for
 configuration and credentials. The Codex App Server and desktop proxy use IPv4
 loopback WebSockets; Codex and its descendants run in a kill-on-close Job Object.
@@ -118,3 +120,57 @@ its desktop TUI can leave the local “Implement this plan?” popup open. This 
 Codex TUI lifecycle issue: a remote turn start does not dismiss that local popup.
 Dismiss the stale popup with Escape; do not confirm it again. AgentPulse does not
 patch Codex for this issue. The phone's action has already started the turn.
+
+## Public direct pairing
+
+For a public Host, configure direct access once. Phone interaction remains scan,
+then approve on the Host. Both a public IP on the local interface and a cloud/NAT
+public address mapped to a private local interface are supported:
+
+```bash
+agentpulse direct configure \
+  --bind 192.168.1.20 \
+  --native-endpoint host.example.com:44320 \
+  --pairing-endpoint host.example.com:44321
+agentpulse direct status
+# Restart an existing Host before using the new configuration:
+agentpulse stop
+agentpulse serve --discover-threads
+# In another terminal:
+agentpulse pair
+```
+
+Replace the example addresses with your actual interface and external endpoints.
+The default local ports are 49320 (Native) and 49321 (pairing); override with
+`--native-port` and `--pairing-port`. For the mapping example, forward public TCP
+44320 to local 49320 and public TCP 44321 to local 49321. Without mapping, specify
+the same local and external ports. IPv6 external endpoints use `[IPv6]:port`.
+A concrete local interface IP is required; wildcard and loopback binds are not
+direct configuration inputs. Permit both TCP ports in the applicable firewall.
+The pairing port listens only while `pair` runs, for at most the session lifetime
+plus bounded transport shutdown. Port occupation is an error, not a reason to
+choose another port. Mapping must forward TCP without terminating Host TLS.
+
+Direct configuration takes effect on `serve` startup. Explicit `serve --bind` or
+`--port` values must agree with it. The `ap` helper automatically uses configured
+direct listening settings; `ap`, `ap qrcode`, and phone scanning remain unchanged.
+Run `ap stop` and then `ap` after changing settings. A running Host continues to
+use its old effective configuration until restarted; `agentpulse status` shows
+its effective direct destinations, while `direct status` shows saved settings.
+
+With direct configured, the QR carries v2 direct discovery automatically and
+pairing requires no Relay. Without it, the existing v1 Relay flow is unchanged.
+If both are configured, existing Relay connectors stay running but new QR pairing
+uses direct. Failure never silently switches routes. Run `agentpulse direct
+disable` and restart to restore the legacy pairing choice. Existing phone
+profiles do not switch automatically; rescan to update a changed public endpoint.
+
+Upgrade Android before scanning a direct QR. The app saves the public Native
+endpoint, displays Direct, and reconnects without LAN discovery overriding it.
+TLS fingerprint/CA verification, short-lived QR secrets, terminal approval, and
+per-device revocation are retained. See [discovery v2](../../agentpulse-protocol/pairing-v2.md).
+
+Acceptance on a real public deployment must use a Host with no Relay configured
+and a phone on mobile data, then check pairing, Native traffic, disconnect /
+reconnect and app restart. Confirm connection destinations with network records.
+Local TLS tests do not certify external firewall rules, mappings or mobile reachability.

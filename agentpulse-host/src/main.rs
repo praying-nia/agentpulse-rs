@@ -1,5 +1,7 @@
 //! AgentPulse Host command-line application.
 
+mod direct;
+
 use std::{
     collections::{BTreeSet, HashMap},
     error::Error,
@@ -79,6 +81,8 @@ enum HostCommand {
     Credentials(CredentialsArgs),
     /// Configures the optional outbound public Relay path.
     Relay(RelayArgs),
+    /// Configures explicit public direct pairing and Native endpoints.
+    Direct(direct::DirectArgs),
     /// Prints current Host and endpoint health.
     Status,
     /// Gracefully stops the running Host.
@@ -110,12 +114,12 @@ enum ThreadsCommand {
 
 #[derive(Args)]
 struct ServeArgs {
-    /// Explicit private or link-local IP. Omit only when exactly one is available.
+    /// Local IP; must match direct settings when configured, otherwise private/link-local or Relay loopback.
     #[arg(long)]
     bind: Option<IpAddr>,
-    /// Stable authenticated Native WSS port advertised to paired clients.
-    #[arg(long, default_value_t = DEFAULT_NATIVE_PORT)]
-    port: u16,
+    /// Stable Native WSS port (default 49320); must match configured direct settings.
+    #[arg(long)]
+    port: Option<u16>,
     /// Codex executable to version-check and launch.
     #[arg(long, default_value = "codex")]
     codex: PathBuf,
@@ -246,6 +250,8 @@ struct RuntimeStatus {
     codex_remote_uri: String,
     provider_health: String,
     native_health: String,
+    #[serde(default)]
+    direct: Option<direct::DirectSettings>,
     relay_endpoint: Option<String>,
     relay_health: String,
     relay_last_error: Option<String>,
@@ -402,6 +408,7 @@ fn run() -> AppResult<()> {
         HostCommand::Devices(args) => devices(&paths, args.command),
         HostCommand::Credentials(args) => credentials(&paths, args.command),
         HostCommand::Relay(args) => relay(&paths, args.command),
+        HostCommand::Direct(args) => direct::run(&paths, args.command),
         HostCommand::Status => print_status(&paths),
         HostCommand::Stop => stop(&paths),
     }
@@ -467,18 +474,31 @@ fn serve(paths: &HostPaths, args: ServeArgs) -> AppResult<()> {
     if identity.thread_ids.is_empty() && !args.discover_threads {
         return Err("no Codex threads configured; run `agentpulse threads add` first".into());
     }
-    let bind_ip = match args.bind {
-        Some(address) => {
-            if address.is_loopback() {
-                if relay_settings.is_none() {
-                    return Err("loopback Native binding requires a configured Relay".into());
-                }
-            } else {
-                validate_private_ip(address)?;
-            }
-            address
+    let direct = direct::load(paths)?;
+    let native_port = direct
+        .as_ref()
+        .map_or(args.port.unwrap_or(DEFAULT_NATIVE_PORT), |v| v.native_port);
+    let bind_ip = if let Some(settings) = &direct {
+        if args.bind.is_some_and(|v| v != settings.bind)
+            || args.port.is_some_and(|v| v != settings.native_port)
+        {
+            return Err("serve --bind/--port conflict with direct configuration".into());
         }
-        None => select_private_ip()?,
+        settings.bind
+    } else {
+        match args.bind {
+            Some(address) => {
+                if address.is_loopback() {
+                    if relay_settings.is_none() {
+                        return Err("loopback Native binding requires a configured Relay".into());
+                    }
+                } else {
+                    validate_private_ip(address)?;
+                }
+                address
+            }
+            None => select_private_ip()?,
+        }
     };
     let provider_id = ProviderId::from_str(&identity.provider_id)?;
     let channel_id = ChannelId::from_str(&identity.channel_id)?;
@@ -494,9 +514,14 @@ fn serve(paths: &HostPaths, args: ServeArgs) -> AppResult<()> {
     let provider_handle = provider_parts.handle().clone();
     let (provider_port, provider_source, _) = provider_parts.into_parts();
     let authorizer = Arc::new(FileCredentialAuthorizer::new(store.clone()));
-    let native_config = NativeChannelConfig::authenticated_lan(
+    let constructor = if direct.is_some() {
+        NativeChannelConfig::authenticated_public
+    } else {
+        NativeChannelConfig::authenticated_lan
+    };
+    let native_config = constructor(
         channel_id,
-        SocketAddr::new(bind_ip, args.port),
+        SocketAddr::new(bind_ip, native_port),
         identity.tls_identity()?,
         authorizer,
     )?;
@@ -543,6 +568,7 @@ fn serve(paths: &HostPaths, args: ServeArgs) -> AppResult<()> {
         codex_remote_uri: provider_handle.remote_uri().to_owned(),
         provider_health: health_name(provider_handle.snapshot().health()).to_owned(),
         native_health: native_health_name(native_handle.snapshot().health).to_owned(),
+        direct: direct.clone(),
         relay_endpoint,
         relay_health: relay_runtime
             .as_ref()
@@ -552,7 +578,7 @@ fn serve(paths: &HostPaths, args: ServeArgs) -> AppResult<()> {
         pid: std::process::id(),
     };
     write_status(&paths.status_file, &status)?;
-    let mdns = if native_address.ip().is_loopback() {
+    let mdns = if direct.is_some() || native_address.ip().is_loopback() {
         None
     } else {
         Some(publish_mdns(
@@ -746,6 +772,35 @@ fn pair(paths: &HostPaths) -> AppResult<()> {
     let status = request_admin(paths, AdminRequest::Status)?
         .status
         .ok_or("running Host did not return status")?;
+    if let Some(settings) = &status.direct {
+        let session = PairingSession::bind_direct(
+            paths.store(),
+            settings.pairing_bind(),
+            settings.pairing_endpoint.tuple(),
+            settings.native_endpoint.tuple(),
+            NATIVE_TRANSPORT_VERSION,
+            vec![V2_PROTOCOL_VERSION],
+        )?;
+        let approval_deadline = Instant::now() + session.remaining_lifetime();
+        println!("Pairing expires in two minutes. Scan this QR code:");
+        println!("{}", terminal_qr(session.pairing_uri())?);
+        let outcome = session.serve(|request| {
+            let display_name = request.display_name.clone();
+            let client_id = request.client_id.clone();
+            let (sender, receiver) = mpsc::sync_channel(1);
+            thread::spawn(move || {
+                let _ = sender.send(approve_device(&display_name, &client_id));
+            });
+            receiver
+                .recv_timeout(approval_deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or(false)
+        })?;
+        println!(
+            "Paired '{}' ({}) successfully.",
+            outcome.display_name, outcome.client_id
+        );
+        return Ok(());
+    }
     let settings = load_relay_settings(&paths.relay_config, &status.host_id)?
         .ok_or("QR pairing requires a configured Relay; run `agentpulse relay configure` first")?;
     let session = PairingSession::bind(
@@ -1191,6 +1246,15 @@ fn print_status(paths: &HostPaths) -> AppResult<()> {
                 status.native_health, status.native_address
             );
             println!("Provider: {}", status.provider_health);
+            if let Some(direct) = &status.direct {
+                println!(
+                    "Direct pairing: {}:{}; Native: {}:{}",
+                    direct.pairing_endpoint.host,
+                    direct.pairing_endpoint.port,
+                    direct.native_endpoint.host,
+                    direct.native_endpoint.port
+                );
+            }
             match status.relay_endpoint {
                 Some(endpoint) => {
                     println!("Relay: {} at {endpoint}", status.relay_health);
@@ -1510,7 +1574,7 @@ mod tests {
             HostCommand::Serve(args) => args,
             _ => return Err("serve command was not selected".into()),
         };
-        assert_eq!(args.port, DEFAULT_NATIVE_PORT);
+        assert_eq!(args.port, None);
         Ok(())
     }
 
@@ -1528,7 +1592,7 @@ mod tests {
             HostCommand::Serve(args) => args,
             _ => return Err("serve command was not selected".into()),
         };
-        assert_eq!(args.port, 49_321);
+        assert_eq!(args.port, Some(49_321));
         Ok(())
     }
 

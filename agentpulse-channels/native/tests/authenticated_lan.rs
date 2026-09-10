@@ -136,13 +136,28 @@ fn wait_for_listening(handle: &agentpulse_channel_native::NativeChannelHandle) -
 #[test]
 #[ignore = "requires a private interface and socket access"]
 fn tls_upgrade_rejects_bad_credentials_binds_hello_and_observes_revocation() -> TestResult {
+    authenticated_case(false)
+}
+
+#[test]
+#[ignore = "requires socket access"]
+fn explicit_public_transport_retains_authentication_and_revocation() -> TestResult {
+    authenticated_case(true)
+}
+
+fn authenticated_case(public: bool) -> TestResult {
     let directory = TestDirectory::create()?;
     let store = HostCredentialStore::new(directory.0.join("credentials.json"));
     let identity = store.initialize("TLS Test Host")?;
     let client_id = Uuid::now_v7().to_string();
     let other_client_id = Uuid::now_v7().to_string();
     let token = store.issue_device(&client_id, "TLS Test Client", Some("0.1.0"))?;
-    let config = NativeChannelConfig::authenticated_lan(
+    let constructor = if public {
+        NativeChannelConfig::authenticated_public
+    } else {
+        NativeChannelConfig::authenticated_lan
+    };
+    let config = constructor(
         ChannelId::new(),
         SocketAddr::new(private_address()?, 0),
         identity.tls_identity()?,

@@ -13,3 +13,10 @@ credential issuance and before sending `Succeeded`. During this barrier the
 client stays pending. Failure returns an `internal` pairing error and revokes the
 unissued device token. `serve` remains available for transports already ready at
 issuance; no pairing wire version changes are required.
+
+Explicit direct callers use `PairingSession::bind_direct`, with independent local
+binding, advertised pairing destination and advertised Native destination. This
+emits [discovery v2](../../agentpulse-protocol/pairing-v2.md) while retaining the
+v1 WebSocket messages. The legacy `bind` remains loopback-only and emits v1 Relay
+bundles. Native destinations now support IPs and DNS names. Callers must bound
+approval by `remaining_lifetime`; the server rejects approval after expiration.

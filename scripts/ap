@@ -233,6 +233,11 @@ if host_is_running "$status"; then
 fi
 
 if ! host_is_running "$status"; then
+    direct_settings="$("$agentpulse_bin" direct status)"
+    native_bind_args=()
+    if [[ "$direct_settings" == "Direct pairing is disabled." ]]; then
+        native_bind_args=(--bind 127.0.0.1)
+    fi
     systemd_environment=()
     for name in "${proxy_variables[@]}"; do
         if [[ -v "$name" ]]; then
@@ -251,7 +256,7 @@ if ! host_is_running "$status"; then
         --property KillMode=mixed \
         --property TimeoutStopSec=30s \
         "$agentpulse_bin" serve \
-        --bind 127.0.0.1 \
+        "${native_bind_args[@]}" \
         --discover-threads \
         --codex "$codex_bin"
     wait_until_ready

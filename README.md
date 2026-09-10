@@ -4,6 +4,8 @@ Shared Rust foundation for AgentPulse.
 
 AgentPulse 的共享 Rust 基础仓库。
 
+用户入口：[中文详细使用手册](../docs/USER_GUIDE.zh-CN.md)。包含安装、启动、Relay / 公网直连、扫码配对和故障排查。
+
 This repository hosts the cross-platform domain core, local agent bridge, optional self-hosted Relay, transport abstractions, Rust protocol implementation, AI agent Providers, and user-facing Channels. It provides consistent behavior across desktop-side integrations, server components, native clients, bots, and Webhooks.
 
 本仓库承载跨平台领域核心、本地 Agent Bridge、可选的自托管 Relay、传输抽象、Rust 协议实现、AI Agent Provider 与用户交互 Channel，为电脑端集成、服务端组件、原生客户端、Bot 和 Webhook 提供一致的基础能力。

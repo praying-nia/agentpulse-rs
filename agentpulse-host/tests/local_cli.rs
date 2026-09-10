@@ -145,3 +145,76 @@ fn windows_serve_status_stop_and_restart_with_real_codex() -> Result<(), Box<dyn
     }
     Ok(())
 }
+
+#[test]
+fn direct_configuration_supports_mapping_and_rejects_invalid_endpoints() -> io::Result<()> {
+    let directory =
+        Directory(std::env::temp_dir().join(format!("ap-direct-cli-{}", uuid::Uuid::now_v7())));
+    let result = run(
+        &directory,
+        &[
+            "direct",
+            "configure",
+            "--bind",
+            "192.168.1.2",
+            "--native-endpoint",
+            "public.example.com:44320",
+            "--pairing-endpoint",
+            "[2001:db8::1]:44321",
+        ],
+    )?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let status = run(&directory, &["direct", "status"])?;
+    let value: serde_json::Value = serde_json::from_slice(&status.stdout)?;
+    assert_eq!(value["native_port"], 49320);
+    assert_eq!(value["pairing_port"], 49321);
+    assert_eq!(value["native_endpoint"]["port"], 44320);
+    assert_eq!(value["pairing_endpoint"]["host"], "2001:db8::1");
+    for invalid in [
+        "https://public.example.com:443",
+        "0.0.0.0:443",
+        "public.example.com:0",
+        "2001:db8::1:443",
+        "999.1.2.3:443",
+    ] {
+        assert!(
+            !run(
+                &directory,
+                &[
+                    "direct",
+                    "configure",
+                    "--bind",
+                    "192.168.1.2",
+                    "--native-endpoint",
+                    invalid,
+                    "--pairing-endpoint",
+                    "public.example.com:44321"
+                ]
+            )?
+            .status
+            .success()
+        );
+    }
+    assert!(
+        run(&directory, &["init", "--name", "Direct CLI"])?
+            .status
+            .success()
+    );
+    for args in [
+        vec!["serve", "--discover-threads", "--bind", "127.0.0.1"],
+        vec!["serve", "--discover-threads", "--port", "49322"],
+    ] {
+        let result = run(&directory, &args)?;
+        assert!(!result.status.success());
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("conflict with direct configuration")
+        );
+    }
+    assert!(run(&directory, &["direct", "disable"])?.status.success());
+    assert!(!directory.0.join("direct.json").exists());
+    Ok(())
+}

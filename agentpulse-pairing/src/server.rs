@@ -43,7 +43,7 @@ pub struct PairingSession {
     store: HostCredentialStore,
     bundle: PairingBundle,
     pairing_uri: String,
-    native_address: SocketAddr,
+    native_address: (String, u16),
     native_transport_version: u16,
     domain_protocol_versions: Vec<u16>,
     expires_at: Instant,
@@ -59,7 +59,55 @@ impl PairingSession {
         native_transport_version: u16,
         domain_protocol_versions: Vec<u16>,
     ) -> Result<Self, PairingError> {
-        if !bind_address.ip().is_loopback() {
+        Self::bind_inner(
+            store,
+            bind_address,
+            (native_address.ip().to_string(), native_address.port()),
+            relay_endpoint,
+            None,
+            native_transport_version,
+            domain_protocol_versions,
+        )
+    }
+
+    /// Binds a short-lived direct endpoint with separately advertised pairing and data addresses.
+    pub fn bind_direct(
+        store: HostCredentialStore,
+        bind_address: SocketAddr,
+        pairing_address: (String, u16),
+        native_address: (String, u16),
+        native_transport_version: u16,
+        domain_protocol_versions: Vec<u16>,
+    ) -> Result<Self, PairingError> {
+        crate::validate_direct_host(&pairing_address.0)?;
+        crate::validate_direct_host(&native_address.0)?;
+        if pairing_address.1 == 0 || native_address.1 == 0 {
+            return Err(PairingError::InvalidField {
+                field: "port",
+                reason: "advertised ports must be non-zero".to_owned(),
+            });
+        }
+        Self::bind_inner(
+            store,
+            bind_address,
+            native_address,
+            String::new(),
+            Some(pairing_address),
+            native_transport_version,
+            domain_protocol_versions,
+        )
+    }
+
+    fn bind_inner(
+        store: HostCredentialStore,
+        bind_address: SocketAddr,
+        native_address: (String, u16),
+        relay_endpoint: String,
+        direct: Option<(String, u16)>,
+        native_transport_version: u16,
+        domain_protocol_versions: Vec<u16>,
+    ) -> Result<Self, PairingError> {
+        if direct.is_none() && !bind_address.ip().is_loopback() {
             return Err(PairingError::InvalidField {
                 field: "bind_address",
                 reason: "QR pairing listeners must be loopback-only".to_owned(),
@@ -72,7 +120,12 @@ impl PairingSession {
             });
         }
         let identity = store.load_identity()?;
-        let config = TlsWebSocketConfig::new(
+        let constructor = if direct.is_some() {
+            TlsWebSocketConfig::new_public
+        } else {
+            TlsWebSocketConfig::new
+        };
+        let config = constructor(
             bind_address,
             PAIRING_WEBSOCKET_PATH,
             PAIRING_WEBSOCKET_SUBPROTOCOL,
@@ -88,13 +141,20 @@ impl PairingSession {
         let bootstrap_token = URL_SAFE_NO_PAD.encode(secret.as_ref());
         let leaf_sha256 = identity.leaf_sha256();
         let bundle = PairingBundle {
-            pairing_version: PAIRING_PROTOCOL_VERSION,
+            pairing_version: if direct.is_some() {
+                2
+            } else {
+                PAIRING_PROTOCOL_VERSION
+            },
             pairing_id: Uuid::now_v7().to_string(),
             host_id: identity.host_id,
             host_name: identity.host_name,
             server_name: identity.server_name,
-            address: local_address.ip().to_string(),
-            port: local_address.port(),
+            address: direct
+                .as_ref()
+                .map_or_else(|| local_address.ip().to_string(), |v| v.0.clone()),
+            port: direct.as_ref().map_or(local_address.port(), |v| v.1),
+            route: direct.as_ref().map(|_| "direct".to_owned()),
             leaf_sha256,
             bootstrap_token,
             relay_endpoint,
@@ -112,6 +172,12 @@ impl PairingSession {
             domain_protocol_versions,
             expires_at: Instant::now() + SESSION_LIFETIME,
         })
+    }
+
+    /// Remaining time for bounded terminal approval.
+    #[must_use]
+    pub fn remaining_lifetime(&self) -> Duration {
+        self.expires_at.saturating_duration_since(Instant::now())
     }
 
     /// Returns the opaque URI encoded by the terminal QR code.
@@ -218,7 +284,20 @@ impl PairingSession {
                     display_name: request.display_name.clone(),
                 },
             )?;
-            if !approve(&request) {
+            let approved = approve(&request);
+            if Instant::now() >= self.expires_at {
+                let _ = send(
+                    &mut socket,
+                    &PairingServerMessage::Error {
+                        code: PairingErrorCode::Expired,
+                        message: "pairing session expired".to_owned(),
+                        recoverable: false,
+                    },
+                );
+                finish_connection(&mut socket, CloseCode::Policy, "pairing expired");
+                return Err(PairingError::Expired);
+            }
+            if !approved {
                 send(
                     &mut socket,
                     &PairingServerMessage::Error {
@@ -273,8 +352,8 @@ impl PairingSession {
                     host_name: identity.host_name,
                     ca_certificate_der,
                     server_name: identity.server_name,
-                    native_address: self.native_address.ip().to_string(),
-                    native_port: self.native_address.port(),
+                    native_address: self.native_address.0.clone(),
+                    native_port: self.native_address.1,
                     access_token: token,
                     native_transport_version: self.native_transport_version,
                     domain_protocol_versions: self.domain_protocol_versions,
@@ -541,6 +620,189 @@ mod tests {
             assert!(matches!(outcome, Err(PairingError::Expired)));
         }
         server.join().map_err(|_| "pairing server panicked")?;
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires socket access"]
+    fn direct_pairing_delivers_public_native_endpoint_and_closes_listener() -> TestResult {
+        let directory = TestDirectory::create()?;
+        let store = HostCredentialStore::new(directory.0.join("credentials.json"));
+        let identity = store.initialize("Direct Host")?;
+        let session = PairingSession::bind_direct(
+            store.clone(),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            ("public.example.com".to_owned(), 44321),
+            ("public.example.com".to_owned(), 44320),
+            3,
+            vec![2],
+        )?;
+        let address = session.local_address();
+        let bundle = crate::decode_pairing_uri(session.pairing_uri())?;
+        assert_eq!(bundle.address, "public.example.com");
+        assert_eq!(bundle.port, 44321);
+        assert!(
+            PairingSession::bind_direct(
+                store.clone(),
+                address,
+                ("public.example.com".to_owned(), 44321),
+                ("public.example.com".to_owned(), 44320),
+                3,
+                vec![2]
+            )
+            .is_err()
+        );
+        let server = thread::spawn(move || session.serve(|_| true));
+        let mut socket = connect(address, &identity.server_name, &identity.ca_certificate_der)?;
+        let request = PairingRequest {
+            pairing_id: bundle.pairing_id,
+            bootstrap_token: bundle.bootstrap_token,
+            client_id: Uuid::now_v7().to_string(),
+            display_name: "Direct phone".to_owned(),
+            version: None,
+        };
+        socket.send(Message::text(String::from_utf8(encode_pairing_request(
+            &request,
+        )?)?))?;
+        assert!(matches!(
+            read_server(&mut socket)?,
+            PairingServerMessage::Pending { .. }
+        ));
+        match read_server(&mut socket)? {
+            PairingServerMessage::Succeeded {
+                native_address,
+                native_port,
+                ..
+            } => {
+                assert_eq!(native_address, "public.example.com");
+                assert_eq!(native_port, 44320);
+            }
+            _ => return Err("expected direct pairing success".into()),
+        }
+        assert!(matches!(socket.read()?, Message::Close(_)));
+        socket.flush()?;
+        server.join().map_err(|_| "server panicked")??;
+        assert!(TcpStream::connect(address).is_err());
+        assert_eq!(store.devices()?.len(), 1);
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires socket access"]
+    fn direct_denial_and_late_approval_never_issue_credentials() -> TestResult {
+        for late in [false, true] {
+            let directory = TestDirectory::create()?;
+            let store = HostCredentialStore::new(directory.0.join("credentials.json"));
+            let identity = store.initialize("Direct denial")?;
+            let mut session = PairingSession::bind_direct(
+                store.clone(),
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                ("public.example.com".to_owned(), 44321),
+                ("public.example.com".to_owned(), 44320),
+                3,
+                vec![2],
+            )?;
+            session.expires_at = Instant::now() + Duration::from_secs(1);
+            let deadline = session.expires_at;
+            let address = session.local_address();
+            let bundle = session.bundle().clone();
+            let server = thread::spawn(move || {
+                session.serve(|_| {
+                    if late {
+                        thread::sleep(
+                            deadline.saturating_duration_since(Instant::now())
+                                + Duration::from_millis(10),
+                        );
+                    }
+                    late
+                })
+            });
+            let mut socket = connect(address, &identity.server_name, &identity.ca_certificate_der)?;
+            let request = PairingRequest {
+                pairing_id: bundle.pairing_id,
+                bootstrap_token: bundle.bootstrap_token,
+                client_id: Uuid::now_v7().to_string(),
+                display_name: "Direct phone".to_owned(),
+                version: None,
+            };
+            socket.send(Message::text(String::from_utf8(encode_pairing_request(
+                &request,
+            )?)?))?;
+            assert!(matches!(
+                read_server(&mut socket)?,
+                PairingServerMessage::Pending { .. }
+            ));
+            match read_server(&mut socket)? {
+                PairingServerMessage::Error {
+                    code, recoverable, ..
+                } => {
+                    assert_eq!(
+                        code,
+                        if late {
+                            PairingErrorCode::Expired
+                        } else {
+                            PairingErrorCode::Denied
+                        }
+                    );
+                    assert!(!recoverable);
+                }
+                _ => return Err("expected terminal error".into()),
+            }
+            assert!(matches!(socket.read()?, Message::Close(_)));
+            socket.flush()?;
+            assert!(server.join().map_err(|_| "server panicked")?.is_err());
+            assert!(store.devices()?.is_empty());
+            assert!(TcpStream::connect(address).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires socket access"]
+    fn idle_direct_expiry_closes_fixed_port() -> TestResult {
+        let directory = TestDirectory::create()?;
+        let store = HostCredentialStore::new(directory.0.join("credentials.json"));
+        store.initialize("Direct expiry")?;
+        let mut session = PairingSession::bind_direct(
+            store.clone(),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            ("public.example.com".to_owned(), 44321),
+            ("public.example.com".to_owned(), 44320),
+            3,
+            vec![2],
+        )?;
+        let address = session.local_address();
+        session.expires_at = Instant::now() + Duration::from_millis(20);
+        assert!(matches!(
+            session.serve(|_| false),
+            Err(PairingError::Expired)
+        ));
+        assert!(TcpStream::connect(address).is_err());
+        assert!(store.devices()?.is_empty());
+        Ok(())
+    }
+    #[test]
+    fn public_tls_boundary_requires_explicit_constructor() -> TestResult {
+        let directory = TestDirectory::create()?;
+        let store = HostCredentialStore::new(directory.0.join("credentials.json"));
+        let identity = store.initialize("TLS boundary")?;
+        let address: SocketAddr = "203.0.113.1:49321".parse()?;
+        assert!(
+            TlsWebSocketConfig::new(
+                address,
+                PAIRING_WEBSOCKET_PATH,
+                PAIRING_WEBSOCKET_SUBPROTOCOL,
+                identity.tls_identity()?
+            )
+            .is_err()
+        );
+        assert!(
+            TlsWebSocketConfig::new_public(
+                address,
+                PAIRING_WEBSOCKET_PATH,
+                PAIRING_WEBSOCKET_SUBPROTOCOL,
+                identity.tls_identity()?
+            )
+            .is_ok()
+        );
         Ok(())
     }
 }

@@ -67,3 +67,41 @@ fn assert_canonical_mirror(canonical: &Path, name: &str, bytes: &[u8]) -> TestRe
     }
     Ok(())
 }
+
+#[test]
+fn direct_discovery_is_strict_and_preserves_mapped_destination() -> TestResult {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    let bytes = include_bytes!("fixtures/pairing-v2/pairing_bundle.json");
+    let canonical =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../agentpulse-protocol/fixtures/pairing-v2");
+    assert_canonical_mirror(&canonical, "pairing_bundle.json", bytes)?;
+    let bundle: PairingBundle = serde_json::from_slice(bytes)?;
+    let uri = bundle.to_uri()?;
+    assert!(uri.starts_with("agentpulse://pair/v2/"));
+    assert_eq!(decode_pairing_uri(&uri)?, bundle);
+    assert_eq!(bundle.address, "public.example.com");
+    assert_eq!(bundle.port, 44321);
+    assert!(decode_pairing_uri(&uri.replace("/v2/", "/v1/")).is_err());
+    for (key, value) in [
+        ("route", serde_json::json!("auto")),
+        ("relay_endpoint", serde_json::json!("relay.example.com:443")),
+        ("address", serde_json::json!("https://public.example.com")),
+        ("address", serde_json::json!("0.0.0.0")),
+        ("port", serde_json::json!(0)),
+        ("expires_at_unix_seconds", serde_json::json!(1)),
+    ] {
+        let mut invalid: Value = serde_json::from_slice(bytes)?;
+        invalid[key] = value;
+        let uri = format!(
+            "agentpulse://pair/v2/{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&invalid)?)
+        );
+        assert!(decode_pairing_uri(&uri).is_err(), "accepted invalid {key}");
+    }
+    for address in ["203.0.113.10", "2001:db8::1", "public.example.com"] {
+        let mut valid = bundle.clone();
+        valid.address = address.to_owned();
+        assert_eq!(decode_pairing_uri(&valid.to_uri()?)?, valid);
+    }
+    Ok(())
+}

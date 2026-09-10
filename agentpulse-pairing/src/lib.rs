@@ -15,6 +15,7 @@ pub use protocol::{
     PAIRING_PROTOCOL_VERSION, PAIRING_WEBSOCKET_PATH, PAIRING_WEBSOCKET_SUBPROTOCOL, PairingBundle,
     PairingErrorCode, PairingRequest, PairingServerMessage, decode_pairing_request,
     decode_pairing_uri, decode_server_message, encode_pairing_request, encode_server_message,
+    validate_direct_host,
 };
 pub use qr::terminal_qr;
 pub use server::{PairingOutcome, PairingSession};

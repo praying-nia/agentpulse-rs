@@ -33,6 +33,7 @@ pub(crate) enum NativeTransportConfig {
 pub struct NativeChannelConfig {
     pub(crate) channel_id: ChannelId,
     pub(crate) bind_address: SocketAddr,
+    allow_public: bool,
     pub(crate) transport: NativeTransportConfig,
     pub(crate) handshake_timeout: Duration,
     pub(crate) io_poll_interval: Duration,
@@ -51,6 +52,7 @@ impl NativeChannelConfig {
         Self {
             channel_id,
             bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            allow_public: false,
             transport: NativeTransportConfig::Loopback,
             handshake_timeout: Duration::from_secs(5),
             io_poll_interval: Duration::from_millis(100),
@@ -87,6 +89,18 @@ impl NativeChannelConfig {
             ..Self::new(channel_id)
         };
         config.validate()?;
+        Ok(config)
+    }
+
+    /// Creates an explicitly public bearer-authenticated TLS endpoint.
+    pub fn authenticated_public(
+        channel_id: ChannelId,
+        address: SocketAddr,
+        identity: TlsServerIdentity,
+        authorizer: Arc<dyn BearerTokenAuthorizer>,
+    ) -> Result<Self, NativeChannelBuildError> {
+        let mut config = Self::authenticated_lan(channel_id, address, identity, authorizer)?;
+        config.allow_public = true;
         Ok(config)
     }
 
@@ -238,7 +252,12 @@ impl NativeChannelConfig {
             return Ok(None);
         };
         self.validate()?;
-        TlsWebSocketConfig::new(
+        let constructor = if self.allow_public {
+            TlsWebSocketConfig::new_public
+        } else {
+            TlsWebSocketConfig::new
+        };
+        constructor(
             self.bind_address,
             NATIVE_WEBSOCKET_PATH,
             NATIVE_WEBSOCKET_SUBPROTOCOL,

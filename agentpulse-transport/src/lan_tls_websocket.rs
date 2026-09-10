@@ -96,6 +96,7 @@ impl fmt::Debug for TlsServerIdentity {
 #[derive(Clone)]
 pub struct TlsWebSocketConfig {
     bind_address: SocketAddr,
+    allow_public: bool,
     path: String,
     subprotocol: String,
     identity: TlsServerIdentity,
@@ -116,8 +117,29 @@ impl TlsWebSocketConfig {
         subprotocol: impl Into<String>,
         identity: TlsServerIdentity,
     ) -> Result<Self, LoopbackWebSocketError> {
+        Self::new_with_boundary(bind_address, path, subprotocol, identity, false)
+    }
+
+    /// Creates an explicitly exposed TLS endpoint (pairing or bearer-authenticated data).
+    pub fn new_public(
+        bind_address: SocketAddr,
+        path: impl Into<String>,
+        subprotocol: impl Into<String>,
+        identity: TlsServerIdentity,
+    ) -> Result<Self, LoopbackWebSocketError> {
+        Self::new_with_boundary(bind_address, path, subprotocol, identity, true)
+    }
+
+    fn new_with_boundary(
+        bind_address: SocketAddr,
+        path: impl Into<String>,
+        subprotocol: impl Into<String>,
+        identity: TlsServerIdentity,
+        allow_public: bool,
+    ) -> Result<Self, LoopbackWebSocketError> {
         let config = Self {
             bind_address,
+            allow_public,
             path: path.into(),
             subprotocol: subprotocol.into(),
             identity,
@@ -171,7 +193,9 @@ impl TlsWebSocketConfig {
     }
 
     fn validate(&self) -> Result<(), LoopbackWebSocketError> {
-        if !is_private_endpoint(self.bind_address.ip()) {
+        if (!self.allow_public && !is_private_endpoint(self.bind_address.ip()))
+            || self.bind_address.ip().is_multicast()
+        {
             return Err(LoopbackWebSocketError::NonPrivateAddress {
                 address: self.bind_address,
             });

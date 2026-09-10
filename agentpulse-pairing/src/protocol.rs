@@ -38,7 +38,11 @@ pub struct PairingBundle {
     /// Single-use 256-bit bootstrap secret.
     pub bootstrap_token: String,
     /// Public Relay authority used for QR-only bootstrap.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub relay_endpoint: String,
+    /// Explicit discovery route for v2; absent in legacy v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
     /// UTC Unix expiry in seconds.
     pub expires_at_unix_seconds: i64,
 }
@@ -48,7 +52,10 @@ impl PairingBundle {
     pub fn to_uri(&self) -> Result<String, PairingError> {
         validate_bundle(self)?;
         let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(self)?);
-        Ok(format!("{PAIRING_URI_PREFIX}{encoded}"))
+        Ok(format!(
+            "agentpulse://pair/v{}/{encoded}",
+            self.pairing_version
+        ))
     }
 }
 
@@ -189,14 +196,26 @@ enum ErrorCodeDto {
 
 /// Decodes a strict pairing URI.
 pub fn decode_pairing_uri(uri: &str) -> Result<PairingBundle, PairingError> {
-    let encoded =
-        uri.strip_prefix(PAIRING_URI_PREFIX)
-            .ok_or_else(|| PairingError::InvalidField {
-                field: "pairing_uri",
-                reason: "unsupported URI scheme or version".to_owned(),
-            })?;
+    let encoded = uri
+        .strip_prefix(PAIRING_URI_PREFIX)
+        .or_else(|| uri.strip_prefix("agentpulse://pair/v2/"))
+        .ok_or_else(|| PairingError::InvalidField {
+            field: "pairing_uri",
+            reason: "unsupported URI scheme or version".to_owned(),
+        })?;
     let bundle: PairingBundle = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?;
     validate_bundle(&bundle)?;
+    let value: serde_json::Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?;
+    if !uri.starts_with(&format!("agentpulse://pair/v{}/", bundle.pairing_version))
+        || (bundle.pairing_version == 1
+            && (value.get("route").is_some() || value.get("relay_endpoint").is_none()))
+        || (bundle.pairing_version == 2 && value.get("relay_endpoint").is_some())
+    {
+        return Err(invalid(
+            "pairing_uri",
+            "discovery fields or version mismatch",
+        ));
+    }
     if bundle.expires_at_unix_seconds <= OffsetDateTime::now_utc().unix_timestamp() {
         return Err(invalid(
             "expires_at_unix_seconds",
@@ -339,14 +358,14 @@ pub fn decode_server_message(input: &[u8]) -> Result<PairingServerMessage, Pairi
 }
 
 fn validate_bundle(bundle: &PairingBundle) -> Result<(), PairingError> {
-    if bundle.pairing_version != PAIRING_PROTOCOL_VERSION {
+    if !matches!(bundle.pairing_version, 1 | 2) {
         return Err(invalid("pairing_version", "unsupported version"));
     }
     uuid_v7("pairing_id", &bundle.pairing_id)?;
     uuid_v7("host_id", &bundle.host_id)?;
     nonblank("host_name", &bundle.host_name, 80)?;
     nonblank("server_name", &bundle.server_name, 253)?;
-    nonblank("address", &bundle.address, 64)?;
+    nonblank("address", &bundle.address, 253)?;
     if bundle.leaf_sha256.len() != 64
         || !bundle
             .leaf_sha256
@@ -359,7 +378,13 @@ fn validate_bundle(bundle: &PairingBundle) -> Result<(), PairingError> {
         ));
     }
     nonblank("bootstrap_token", &bundle.bootstrap_token, 128)?;
-    validate_relay_endpoint(&bundle.relay_endpoint)?;
+    match bundle.pairing_version {
+        1 if bundle.route.is_none() => validate_relay_endpoint(&bundle.relay_endpoint)?,
+        2 if bundle.route.as_deref() == Some("direct") && bundle.relay_endpoint.is_empty() => {
+            validate_direct_host(&bundle.address)?
+        }
+        _ => return Err(invalid("route", "invalid discovery route")),
+    }
     if bundle.port == 0 {
         return Err(invalid("port", "must be non-zero"));
     }
@@ -444,7 +469,7 @@ fn validate_server_message(message: &PairingServerMessage) -> Result<(), Pairing
             nonblank("host_name", host_name, 80)?;
             nonblank("ca_certificate_der", ca_certificate_der, 16 * 1024)?;
             nonblank("server_name", server_name, 253)?;
-            nonblank("native_address", native_address, 64)?;
+            nonblank("native_address", native_address, 253)?;
             nonblank("access_token", access_token, 128)?;
             if *native_port == 0 || *native_transport_version == 0 {
                 return Err(invalid("endpoint", "port and version must be non-zero"));
@@ -520,6 +545,30 @@ impl From<ErrorCodeDto> for PairingErrorCode {
     }
 }
 
+/// Validates an explicit direct IP or ASCII DNS destination, without scheme or port.
+pub fn validate_direct_host(host: &str) -> Result<(), PairingError> {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if !ip.is_unspecified() && !ip.is_multicast() {
+            return Ok(());
+        }
+    } else if !host.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        && host.len() <= 253
+        && host.is_ascii()
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+    {
+        return Ok(());
+    }
+    Err(invalid("address", "must be a unicast IP or ASCII DNS name"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
@@ -544,6 +593,7 @@ mod tests {
             leaf_sha256: "ab".repeat(32),
             bootstrap_token: "bootstrap-secret".to_owned(),
             relay_endpoint: "relay.example.com:2333".to_owned(),
+            route: None,
             expires_at_unix_seconds: 4_102_444_800,
         }
     }
