@@ -460,7 +460,8 @@ mod tests {
     impl TestDirectory {
         fn create() -> Result<Self, std::io::Error> {
             let path = std::env::temp_dir().join(format!("agentpulse-pairing-{}", Uuid::now_v7()));
-            fs::create_dir(&path)?;
+            // Set the current user as owner even with an elevated Windows CI token.
+            agentpulse_platform::ensure_private_dir(&path)?;
             Ok(Self(path))
         }
     }
