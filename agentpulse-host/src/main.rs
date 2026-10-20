@@ -1321,12 +1321,13 @@ fn write_status(path: &Path, status: &RuntimeStatus) -> AppResult<()> {
 }
 
 fn cleanup_runtime_files(paths: &HostPaths) {
-    for path in [&paths.status_file] {
-        if let Err(error) = fs::remove_file(path)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            eprintln!("warning: failed to remove {}: {error}", path.display());
-        }
+    if let Err(error) = fs::remove_file(&paths.status_file)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "warning: failed to remove {}: {error}",
+            paths.status_file.display()
+        );
     }
 }
 
