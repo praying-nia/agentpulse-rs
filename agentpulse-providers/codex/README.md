@@ -37,7 +37,8 @@ existing message/approval mapping. The raw Codex upstream follows Codex's local
 loopback trust model: loopback is not an ACL against other local user processes.
 
 The resolver supports a native `codex.exe` and the official npm Windows vendor
-binary behind its shell shim. It never runs `codex.ps1` or modifies execution
+binary behind its shell shim, including both nested and hoisted optional platform
+packages and the legacy bundled vendor directory. It never runs `codex.ps1` or modifies execution
 policy. Custom wrappers require an explicit native executable. Long/Unicode
 Windows runtime paths are not subject to the Unix socket length limit.
 

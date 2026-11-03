@@ -37,6 +37,8 @@ jobs:
         run: cargo +stable clippy -p agentpulse-platform -p agentpulse-provider-codex -p agentpulse-pairing -p agentpulse-host --all-targets --no-deps --locked -- -D warnings
       - name: Native storage, IPC and CLI contracts
         run: cargo +stable test -p agentpulse-platform -p agentpulse-provider-codex -p agentpulse-pairing -p agentpulse-host --locked -- --test-threads=1
+      - name: Pairing socket contracts
+        run: cargo +stable test -p agentpulse-pairing --locked -- --ignored --test-threads=1
       - name: Documentation
         env:
           RUSTDOCFLAGS: -D warnings

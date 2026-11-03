@@ -66,6 +66,8 @@ fn npm_binary(directory: &Path) -> Option<PathBuf> {
     let root = directory.join("node_modules/@openai/codex");
     for vendor in [
         root.join(format!("node_modules/@openai/{package}/vendor/{target}")),
+        // npm can hoist the optional platform package next to @openai/codex.
+        directory.join(format!("node_modules/@openai/{package}/vendor/{target}")),
         root.join(format!("vendor/{target}")),
     ] {
         for subdirectory in ["bin", "codex"] {
@@ -100,6 +102,41 @@ mod tests {
                 exe.canonicalize()?
             );
             assert!(resolve_codex_executable(&root.join("custom.ps1")).is_err());
+            Ok(())
+        })();
+        std::fs::remove_dir_all(root)?;
+        result
+    }
+
+    #[test]
+    fn npm_shims_resolve_hoisted_platform_packages() -> io::Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "ap hoisted 中文 {}",
+            agentpulse_core::ProviderId::new()
+        ));
+        #[cfg(target_arch = "x86_64")]
+        let platform = "codex-win32-x64/vendor/x86_64-pc-windows-msvc";
+        #[cfg(target_arch = "aarch64")]
+        let platform = "codex-win32-arm64/vendor/aarch64-pc-windows-msvc";
+        let vendor = root.join("node_modules/@openai").join(platform);
+        let result = (|| {
+            // Both vendor layouts have shipped. Exercise them independently so
+            // finding one cannot hide a failure to resolve the other.
+            for subdirectory in ["bin", "codex"] {
+                let directory = vendor.join(subdirectory);
+                std::fs::create_dir_all(&directory)?;
+                let exe = directory.join("codex.exe");
+                std::fs::write(&exe, b"resolver fixture; never executed")?;
+                for shim in ["codex.cmd", "codex.ps1"] {
+                    assert_eq!(
+                        resolve_codex_executable(&root.join(shim))?,
+                        exe.canonicalize()?
+                    );
+                }
+                assert!(resolve_codex_executable(&root.join("custom.ps1")).is_err());
+                std::fs::remove_file(exe)?;
+            }
+            assert!(resolve_codex_executable(&root.join("codex.cmd")).is_err());
             Ok(())
         })();
         std::fs::remove_dir_all(root)?;
