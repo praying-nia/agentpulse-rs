@@ -32,8 +32,9 @@ configuration allocates new proxy credentials; launch through `agentpulse codex`
 instead of saving them. The Native phone port remains stable.
 
 Windows local Runtime, Proxy and Host CLI acceptance use Codex 0.153.4. This
-version still follows the best-effort compatibility policy against the bundled
-0.153.0 schema. Phone pairing, public Relay, and real model Turn acceptance on
+version is historical Windows evidence. The current Provider baseline and
+bundled schema are 0.166.0; this update has Linux acceptance, with Windows
+and phone checks pending. Phone pairing, public Relay, and real model Turn acceptance on
 Windows remain a separate device test; local smoke tests do not certify them.
 
 ## Setup

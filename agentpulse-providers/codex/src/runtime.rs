@@ -49,12 +49,14 @@ const IO_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const STDERR_LIMIT: usize = 64 * 1024;
 const MAX_PROXY_CONNECTIONS: usize = 16;
-const LATEST_VERIFIED_CODEX_CLI_CORE: (u64, u64, u64) = (0, 153, 0);
+#[cfg(test)]
+const LATEST_VERIFIED_CODEX_CLI_CORE: (u64, u64, u64) = (0, 166, 0);
+const BEST_EFFORT_CODEX_CLI_FLOOR: (u64, u64, u64) = (0, 153, 0);
 
 #[derive(Debug, Eq, PartialEq)]
 enum CodexCliCompatibility {
     Verified,
-    UnverifiedNewer(Version),
+    UnverifiedVersion(Version),
 }
 
 pub(crate) enum ReadOutcome {
@@ -517,6 +519,10 @@ enum ProxyExit {
 }
 
 enum PendingControl {
+    ObserveThread {
+        session_id: SessionId,
+        thread_id: String,
+    },
     Models {
         session_id: SessionId,
         models: Vec<serde_json::Value>,
@@ -645,6 +651,27 @@ fn flush_control_commands(
     events: &ProviderEventHandle,
     pending: &mut BTreeMap<crate::protocol::RequestId, PendingControl>,
 ) -> Result<(), CodexProviderSourceError> {
+    let discovered = { lock_mapper(mapper).take_observer_resumes() };
+    for (session_id, thread_id) in discovered {
+        send_control_request(
+            io,
+            protocol,
+            ExpectedResponse::ThreadResume,
+            json!({"threadId": thread_id, "excludeTurns": true}),
+            PendingControl::ObserveThread {
+                session_id,
+                thread_id,
+            },
+            pending,
+        )?;
+    }
+    // Wait for the observer subscription before issuing phone operations.
+    if pending
+        .values()
+        .any(|kind| matches!(kind, PendingControl::ObserveThread { .. }))
+    {
+        return Ok(());
+    }
     let inflight_sessions = { lock_controls(controls).inflight_sessions() };
     for session_id in inflight_sessions {
         let active = lock_mapper(mapper)
@@ -1232,6 +1259,9 @@ fn process_control_response(
                 ),
             }
         }
+        PendingControl::ObserveThread { .. } => {
+            lock_mapper(mapper).resume_thread(&result, events, status)
+        }
         PendingControl::ResumeThread { .. } => {
             let thread_id = result
                 .get("thread")
@@ -1281,6 +1311,7 @@ fn process_control_response(
             thread_id,
             prompt,
         } => {
+            lock_mapper(mapper).retry_observer_resume(&thread_id);
             let removed = lock_controls(controls).pop_prompt(session_id);
             if removed.as_ref() != Some(&prompt) {
                 return Err(CodexProviderSourceError::protocol(
@@ -1338,6 +1369,48 @@ fn process_control_error(
         ))
     })?;
     match kind {
+        PendingControl::ObserveThread {
+            session_id,
+            thread_id,
+        } => {
+            // Codex does not persist a fresh thread until its first turn.
+            // Retry when that turn is accepted or its loaded status changes.
+            if code == -32600 && message == format!("no rollout found for thread id {thread_id}") {
+                lock_mapper(mapper).defer_observer_resume(&thread_id);
+                return Ok(());
+            }
+            // Codex 0.166 subscribes the connection before building backwards
+            // cursors. Its legacy store can then reject list_turns even with
+            // excludeTurns=true. Live events still arrive; do not falsely mark
+            // that subscription disconnected because history is unavailable.
+            if code == -32601 && message == "list_turns is not supported yet" {
+                eprintln!(
+                    "warning: Codex thread {thread_id} subscribed without history cursors: {message}"
+                );
+                return Ok(());
+            }
+            eprintln!(
+                "warning: Codex observer could not resume thread {thread_id}: {code}: {message}"
+            );
+            local::report(
+                session_id,
+                format!(
+                    "Could not subscribe to Codex thread ({code}): {message}; resume the thread to retry."
+                ),
+                mapper,
+                events,
+                status,
+            )?;
+            lock_mapper(mapper).publish_payload(
+                &thread_id,
+                Timestamp::now_utc(),
+                AgentEventPayload::ConnectionChanged(
+                    agentpulse_core::ConnectionState::Disconnected,
+                ),
+                events,
+                status,
+            )?;
+        }
         PendingControl::ImplementPlan { session_id, .. } => {
             lock_controls(controls).clear_turn_inflight(session_id);
             local::report(
@@ -2296,9 +2369,9 @@ impl ManagedCodexRuntime {
         &mut self,
         config: &CodexProviderConfig,
     ) -> Result<Box<dyn AppServerIo>, CodexProviderSourceError> {
-        if let CodexCliCompatibility::UnverifiedNewer(version) = verify_codex_version(config)? {
+        if let CodexCliCompatibility::UnverifiedVersion(version) = verify_codex_version(config)? {
             eprintln!(
-                "warning: Codex CLI {version} is newer than verified schema {}; starting best-effort",
+                "warning: Codex CLI {version} is not explicitly verified against schema {}; starting best-effort",
                 crate::SUPPORTED_CODEX_CLI_VERSION
             );
         }
@@ -2387,9 +2460,10 @@ impl AppServerRuntime for ManagedCodexRuntime {
 
         #[cfg(unix)]
         {
-            if let CodexCliCompatibility::UnverifiedNewer(version) = verify_codex_version(config)? {
+            if let CodexCliCompatibility::UnverifiedVersion(version) = verify_codex_version(config)?
+            {
                 eprintln!(
-                    "warning: Codex CLI {version} is newer than the latest verified version {}; \
+                    "warning: Codex CLI {version} is not in the explicit verified set (current baseline {}); \
                      starting best-effort with the strict {} App Server schema, and any protocol \
                      incompatibility will fail the Codex Provider",
                     crate::SUPPORTED_CODEX_CLI_VERSION,
@@ -2698,8 +2772,8 @@ fn classify_codex_version(actual: &str) -> Result<CodexCliCompatibility, CodexPr
     }
     let version = Version::parse(version_text).map_err(|_| version_mismatch(actual))?;
     let actual_core = (version.major, version.minor, version.patch);
-    if actual_core > LATEST_VERIFIED_CODEX_CLI_CORE {
-        Ok(CodexCliCompatibility::UnverifiedNewer(version))
+    if actual_core > BEST_EFFORT_CODEX_CLI_FLOOR {
+        Ok(CodexCliCompatibility::UnverifiedVersion(version))
     } else {
         Err(version_mismatch(actual))
     }
@@ -3554,6 +3628,15 @@ mod tests {
                 ..
             }
         ));
+        // Native v3 replays the initial session event before its baseline.
+        assert!(matches!(
+            native_read(socket)?,
+            NativeServerMessage::Domain {
+                context: NativeDeliveryContext::LiveEvent { .. },
+                message,
+            } if matches!(message.as_ref(), ProtocolMessage::AgentEvent(event)
+                if event.session_id() == session_id && event.sequence() == EventSequence::FIRST)
+        ));
         assert!(matches!(
             native_read(socket)?,
             NativeServerMessage::Domain {
@@ -3561,40 +3644,138 @@ mod tests {
                 message,
             } if matches!(message.as_ref(), ProtocolMessage::AgentSession(session) if session.id() == session_id)
         ));
+        assert!(matches!(
+            native_read(socket)?,
+            NativeServerMessage::SyncCompleted { ref request_id }
+                if request_id == &subscription_id
+        ));
         Ok(())
     }
 
     #[test]
     fn discovering_provider_follows_thread_started_without_saved_ids() -> TestResult {
-        let control = Arc::new(FakeControl::default());
-        let initialize = LIVE_FIXTURE
-            .lines()
-            .next()
-            .ok_or("fixture has no initialize response")?;
-        let thread_started = LIVE_FIXTURE
-            .lines()
-            .find(|line| line.contains("\"method\":\"thread/started\""))
-            .ok_or("fixture has no thread/started notification")?;
-        control.push_text(initialize);
-        let (_provider_id, port, source, status) = test_discovering_provider(Arc::clone(&control))?;
-        let session_id = SessionId::from_str(THREAD_ID)?;
-        let mut host = RuntimeHost::new();
-        host.register_provider(port, source)?;
-        let _ = host.start()?;
+        for history_cursors_unavailable in [false, true] {
+            let control = Arc::new(FakeControl::default());
+            let initialize = LIVE_FIXTURE
+                .lines()
+                .next()
+                .ok_or("fixture has no initialize response")?;
+            let thread_started = LIVE_FIXTURE
+                .lines()
+                .find(|line| line.contains("\"method\":\"thread/started\""))
+                .ok_or("fixture has no thread/started notification")?;
+            control.push_text(initialize);
+            let (_provider_id, port, source, status) =
+                test_discovering_provider(Arc::clone(&control))?;
+            let session_id = SessionId::from_str(THREAD_ID)?;
+            let mut host = RuntimeHost::new();
+            host.register_provider(port, source)?;
+            let _ = host.start()?;
 
-        assert_eq!(locked(&control.outgoing).len(), 2);
-        // Title generation is an ephemeral thread announced on the same connection.
-        let mut background: serde_json::Value = serde_json::from_str(thread_started)?;
-        let background_id = SessionId::new();
-        background["params"]["thread"]["id"] = json!(background_id.to_string());
-        background["params"]["thread"]["ephemeral"] = json!(true);
-        control.push_text(background.to_string());
-        control.push_text(thread_started);
-        wait_until(|| snapshot(&status).mapped_events() == 1)?;
-        assert!(host.inspect_bridge(|bridge| bridge.session_aggregate(background_id).is_none())?);
-        assert!(host.inspect_bridge(|bridge| bridge.session_aggregate(session_id).is_some())?);
-        assert_eq!(snapshot(&status).health(), CodexProviderHealth::Running);
-        let _ = host.stop()?;
+            assert_eq!(locked(&control.outgoing).len(), 2);
+            // Title generation is an ephemeral thread announced on the same connection.
+            let mut background: serde_json::Value = serde_json::from_str(thread_started)?;
+            let background_id = SessionId::new();
+            background["params"]["thread"]["id"] = json!(background_id.to_string());
+            background["params"]["thread"]["ephemeral"] = json!(true);
+            control.push_text(background.to_string());
+            control.push_text(thread_started);
+            wait_until(|| snapshot(&status).mapped_events() == 1)?;
+            assert!(
+                host.inspect_bridge(|bridge| bridge.session_aggregate(background_id).is_none())?
+            );
+            assert!(host.inspect_bridge(|bridge| bridge.session_aggregate(session_id).is_some())?);
+            let resume_requests = || {
+                locked(&control.outgoing)
+                    .iter()
+                    .filter_map(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                    .filter(|frame| frame["method"] == "thread/resume")
+                    .collect::<Vec<_>>()
+            };
+            wait_until(|| resume_requests().len() == 1)?;
+            let request = resume_requests().remove(0);
+            assert_eq!(request["params"]["threadId"], THREAD_ID);
+            assert_eq!(request["params"]["excludeTurns"], true);
+            // Fresh threads have no durable record before their first turn.
+            control.push_text(json!({
+            "id": request["id"],
+            "error": {"code": -32600, "message": format!("no rollout found for thread id {THREAD_ID}")}
+        }).to_string());
+            wait_until(|| snapshot(&status).validated_frames() >= 4)?;
+            assert_eq!(resume_requests().len(), 1);
+            assert_eq!(snapshot(&status).mapped_events(), 1);
+            control.push_text(
+                json!({
+                    "method": "thread/status/changed",
+                    "params": {"threadId": THREAD_ID, "status": {"type":"active", "activeFlags":[]}}
+                })
+                .to_string(),
+            );
+            wait_until(|| resume_requests().len() == 2)?;
+            let request = resume_requests().remove(1);
+            let mut resumed: serde_json::Value = serde_json::from_str(
+                LIVE_FIXTURE
+                    .lines()
+                    .nth(1)
+                    .ok_or("missing resume fixture")?,
+            )?;
+            resumed["id"] = request["id"].clone();
+            if history_cursors_unavailable {
+                control.push_text(
+                    json!({
+                        "id": request["id"],
+                        "error": {"code": -32601, "message": "list_turns is not supported yet"}
+                    })
+                    .to_string(),
+                );
+            } else {
+                control.push_text(resumed.to_string());
+            }
+            // Duplicate announcements must not cause resubscription loops.
+            control.push_text(thread_started);
+            wait_until(|| snapshot(&status).validated_frames() >= 7)?;
+            assert_eq!(resume_requests().len(), 2);
+            assert_eq!(snapshot(&status).health(), CodexProviderHealth::Running);
+            // Live replies and completion remain available with either response.
+            seed_lines(&control, LIVE_FIXTURE.lines().skip(2).take(5));
+            wait_until(|| {
+                host.inspect_bridge(|bridge| {
+                    bridge
+                        .session_aggregate(session_id)
+                        .is_some_and(|aggregate| {
+                            matches!(aggregate.latest_outcome(),
+                Some(SessionOutcome::Completed { summary: Some(summary) })
+                    if summary.as_str() == "Provider fixture completed")
+                        })
+                })
+                .unwrap_or(false)
+            })?;
+            // A slower desktop proxy can deliver an item after the observer
+            // already completed that turn. It must not block the next turn.
+            let mut late_item: serde_json::Value =
+                serde_json::from_str(LIVE_FIXTURE.lines().nth(4).ok_or("missing item fixture")?)?;
+            late_item["method"] = json!("item/started");
+            late_item["params"]
+                .as_object_mut()
+                .ok_or("missing params")?
+                .remove("completedAtMs");
+            late_item["params"]["startedAtMs"] = json!(103000);
+            control.push_text(late_item.to_string());
+            let mut next_turn: serde_json::Value =
+                serde_json::from_str(LIVE_FIXTURE.lines().nth(2).ok_or("missing turn fixture")?)?;
+            next_turn["params"]["turn"]["id"] = json!(SessionId::new().to_string());
+            control.push_text(next_turn.to_string());
+            wait_until(|| {
+                host.inspect_bridge(|bridge| {
+                    bridge
+                        .session_aggregate(session_id)
+                        .is_some_and(|aggregate| aggregate.session().state() == AgentState::Running)
+                })
+                .unwrap_or(false)
+            })?;
+            assert_eq!(snapshot(&status).health(), CodexProviderHealth::Running);
+            let _ = host.stop()?;
+        }
         Ok(())
     }
 
@@ -4518,11 +4699,18 @@ mod tests {
 
     #[test]
     fn newer_codex_versions_are_accepted_as_unverified() -> TestResult {
-        for version in ["0.153.1", "0.154.0-beta.1", "1.0.0"] {
+        for version in [
+            "0.153.1",
+            "0.165.0",
+            "0.166.0-beta.1",
+            "0.166.1",
+            "0.167.0-beta.1",
+            "1.0.0",
+        ] {
             let actual = format!("codex-cli {version}");
             assert_eq!(
                 classify_codex_version(&actual)?,
-                CodexCliCompatibility::UnverifiedNewer(Version::parse(version)?)
+                CodexCliCompatibility::UnverifiedVersion(Version::parse(version)?)
             );
         }
         Ok(())
@@ -4555,10 +4743,11 @@ mod tests {
         let runtime_directory = config.runtime_directory.clone();
         let mut runtime = ManagedCodexRuntime::default();
         let error = runtime.start(&config);
-        assert!(matches!(
-            error,
-            Err(CodexProviderSourceError::VersionMismatch { .. })
-        ));
+        assert!(
+            matches!(error, Err(CodexProviderSourceError::VersionMismatch { .. })),
+            "unexpected version probe error: {:?}",
+            error.as_ref().err()
+        );
         assert!(!runtime_directory.exists());
         fs::remove_file(executable)?;
         fs::remove_dir(root)?;
@@ -4569,7 +4758,7 @@ mod tests {
     #[test]
     fn managed_runtime_allows_newer_version_past_version_gate() -> TestResult {
         let provider_id = ProviderId::new();
-        let (root, executable) = fake_codex_script("0.153.1")?;
+        let (root, executable) = fake_codex_script("0.166.1")?;
         let config = CodexProviderConfig::new(provider_id, &root, [THREAD_ID])?
             .with_codex_executable(&executable);
         let runtime_directory = config.runtime_directory.clone();
@@ -4762,6 +4951,11 @@ mod tests {
         fs::remove_dir(root)?;
         Ok(())
     }
+    mod live_compatibility {
+        use super::*;
+        include!("runtime/tests/live_compatibility.rs");
+    }
+
     #[cfg(windows)]
     mod windows_tests {
         use super::*;

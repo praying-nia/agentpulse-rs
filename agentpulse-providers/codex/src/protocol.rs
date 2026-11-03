@@ -604,6 +604,34 @@ mod tests {
     }
 
     #[test]
+    fn accepts_new_read_state_notifications_but_rejects_malformed_payloads() -> TestResult {
+        let mut engine = engine()?;
+        let valid = json!({
+            "method": "thread/readState/changed",
+            "params": {"threadId": "thread-166", "readState": {
+                "revision": "revision-1", "firstUnread": {"type": "turn", "turnId": "turn-1"}
+            }}
+        });
+        assert!(matches!(
+            engine.parse_server_text(&valid.to_string())?,
+            ServerFrame::Notification { method, .. } if method == "thread/readState/changed"
+        ));
+        assert!(matches!(
+            engine.parse_observed_server_text(&valid.to_string())?,
+            ObservedServerFrame::Notification { .. }
+        ));
+        let mut invalid = valid;
+        invalid["params"]["readState"]["revision"] = json!(123);
+        assert!(engine.parse_server_text(&invalid.to_string()).is_err());
+        assert!(
+            engine
+                .parse_observed_server_text(&invalid.to_string())
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn observer_validates_unowned_responses_without_correlating_them() -> TestResult {
         let engine = engine()?;
         assert!(matches!(

@@ -52,10 +52,28 @@ pub(crate) struct CodexEventMapper {
     items: BTreeMap<(String, String, String), Value>,
     recent_keys: BTreeSet<String>,
     recent_order: VecDeque<String>,
+    observer_resumes: BTreeSet<String>,
+    deferred_observer_resumes: BTreeSet<String>,
     pub(crate) local_choices: BTreeMap<InteractionId, (String, bool)>,
 }
 
 impl CodexEventMapper {
+    pub(crate) fn defer_observer_resume(&mut self, thread_id: &str) {
+        self.deferred_observer_resumes.insert(thread_id.to_owned());
+    }
+
+    pub(crate) fn retry_observer_resume(&mut self, thread_id: &str) {
+        if self.deferred_observer_resumes.remove(thread_id) {
+            self.observer_resumes.insert(thread_id.to_owned());
+        }
+    }
+
+    pub(crate) fn take_observer_resumes(&mut self) -> Vec<(SessionId, String)> {
+        std::mem::take(&mut self.observer_resumes)
+            .into_iter()
+            .filter_map(|thread| self.configured.get(&thread).map(|id| (*id, thread)))
+            .collect()
+    }
     pub(crate) fn ready_plans(&self) -> Vec<(SessionId, String)> {
         self.threads
             .iter()
@@ -165,6 +183,8 @@ impl CodexEventMapper {
             items: BTreeMap::new(),
             recent_keys: BTreeSet::new(),
             recent_order: VecDeque::new(),
+            observer_resumes: BTreeSet::new(),
+            deferred_observer_resumes: BTreeSet::new(),
             local_choices: BTreeMap::new(),
         }
     }
@@ -456,6 +476,9 @@ impl CodexEventMapper {
             if !self.configured.contains_key(thread_id) {
                 self.configured
                     .insert(thread_id.to_owned(), SessionId::from_str(thread_id)?);
+                // Discovery announces a thread but does not subscribe this
+                // connection to its events or keep it loaded after TUI exit.
+                self.observer_resumes.insert(thread_id.to_owned());
             }
             self.resume_thread(params, events, status)?;
             return Ok(MappingDisposition::Mapped);
@@ -469,6 +492,26 @@ impl CodexEventMapper {
             return Ok(MappingDisposition::ValidatedUnmapped);
         };
         if !self.configured.contains_key(thread_id) || !self.threads.contains_key(thread_id) {
+            return Ok(MappingDisposition::ValidatedUnmapped);
+        }
+
+        if method == "thread/status/changed" {
+            self.retry_observer_resume(thread_id);
+        }
+
+        // The observer and desktop proxy can deliver the same turn at different
+        // speeds. A late item/started must not reactivate a completed turn and
+        // leave the next phone prompt permanently queued.
+        let turn_id = params.get("turnId").and_then(Value::as_str).or_else(|| {
+            params
+                .get("turn")
+                .and_then(|turn| turn.get("id"))
+                .and_then(Value::as_str)
+        });
+        if turn_id.is_some_and(|turn| {
+            self.recent_keys
+                .contains(&format!("turn/completed:{thread_id}:{turn}"))
+        }) {
             return Ok(MappingDisposition::ValidatedUnmapped);
         }
 
