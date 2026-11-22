@@ -36,18 +36,18 @@ use protocol::ProtocolSchema;
 use status::{SharedStatus, snapshot};
 
 /// Preferred current Codex CLI version for this Provider release.
-pub const SUPPORTED_CODEX_CLI_VERSION: &str = "0.166.0";
+pub const SUPPORTED_CODEX_CLI_VERSION: &str = "0.171.0";
 
 /// Explicit Codex CLI versions verified against the bundled schema and fixtures.
-pub const SUPPORTED_CODEX_CLI_VERSIONS: &[&str] =
-    &["0.150.1", "0.152.0", "0.152.1", "0.153.0", "0.166.0"];
+pub const SUPPORTED_CODEX_CLI_VERSIONS: &[&str] = &[
+    "0.150.1", "0.152.0", "0.152.1", "0.153.0", "0.166.0", "0.171.0",
+];
 
-pub(crate) const SUPPORTED_CODEX_CLI_VERSION_REQUIREMENT: &str =
-    "0.150.1, 0.152.0, 0.152.1, 0.153.0, 0.166.0, or a valid unverified version newer than 0.153.0";
+pub(crate) const SUPPORTED_CODEX_CLI_VERSION_REQUIREMENT: &str = "0.150.1, 0.152.0, 0.152.1, 0.153.0, 0.166.0, 0.171.0, or a valid unverified version newer than 0.153.0";
 
-/// SHA-256 of the official experimental `0.166.0` schema bundle.
+/// SHA-256 of the official experimental `0.171.0` schema bundle.
 pub const BUNDLED_CODEX_SCHEMA_SHA256: &str =
-    "8aabf260bb66e9ca9ae5d20253f443971834644fe4659c85f8b1cc9e1d22dd5c";
+    "fe3f0cc67ec5f581743c802ee6e1369c32328d24f91faf4c6f5c697935db642c";
 
 /// Thread-safe monitoring handle for a built Codex Provider.
 #[derive(Clone)]

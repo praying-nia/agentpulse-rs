@@ -40,12 +40,20 @@
         "null"
       ]
     },
+    "currentAccountOnly": {
+      "description": "Show local history visible to the current ChatGPT account. Defaults to false.",
+      "type": "boolean"
+    },
     "cursor": {
       "description": "Opaque pagination cursor returned by a previous call.",
       "type": [
         "string",
         "null"
       ]
+    },
+    "includeAttachedThreads": {
+      "description": "Include persistent threads attached to a parent in search results.",
+      "type": "boolean"
     },
     "limit": {
       "description": "Optional page size; defaults to a reasonable server-side value.",
@@ -57,7 +65,7 @@
       ]
     },
     "searchTerm": {
-      "description": "Required substring/full-text query for thread search.",
+      "description": "Required substring/full-text query. `thread/search/stream` limits this to 65,536 UTF-8 bytes after trimming surrounding whitespace.",
       "type": "string"
     },
     "sortDirection": {

@@ -33,9 +33,8 @@ instead of saving them. The Native phone port remains stable.
 
 Windows local Runtime, Proxy and Host CLI acceptance use Codex 0.153.4. This
 version is historical Windows evidence. The current Provider baseline and
-bundled schema are 0.166.0; this update has Linux acceptance, with Windows
-and phone checks pending. Phone pairing, public Relay, and real model Turn acceptance on
-Windows remain a separate device test; local smoke tests do not certify them.
+bundled schema are 0.171.0, verified with a Linux Host and Android emulator.
+Windows phone pairing, public Relay, and real model turns remain device tests.
 
 ## Setup
 

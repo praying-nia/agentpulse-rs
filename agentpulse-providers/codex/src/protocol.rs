@@ -36,6 +36,27 @@ pub(crate) struct ProtocolSchema {
 }
 
 impl ProtocolSchema {
+    fn validate_server_request(
+        &self,
+        method: &str,
+        value: &Value,
+    ) -> Result<(), CodexProviderSourceError> {
+        // Codex 0.166.0 can still send this request. The 0.171.0 bundle no
+        // longer declares it, but older servers must still receive the normal
+        // unsupported-method reply. Both callers validate the request ID.
+        if method == "currentTime/read" {
+            return value["params"]["threadId"]
+                .as_str()
+                .map(|_| ())
+                .ok_or_else(|| {
+                    CodexProviderSourceError::protocol(
+                        "currentTime/read requires params.threadId as a string",
+                    )
+                });
+        }
+        validate(&self.server_request, value, "server request")
+    }
+
     pub(crate) fn compile() -> Result<Self, CodexProviderBuildError> {
         let schema: Value = serde_json::from_str(BUNDLED_SCHEMA).map_err(|error| {
             CodexProviderBuildError::Schema {
@@ -381,7 +402,7 @@ impl ProtocolEngine {
                 .to_owned();
             let params = value.get("params").cloned().unwrap_or(Value::Null);
             if has_id {
-                validate(&self.schema.server_request, &value, "server request")?;
+                self.schema.validate_server_request(&method, &value)?;
                 Ok(ObservedServerFrame::Request {
                     id: RequestId::from_value(&value["id"])?,
                     method,
@@ -433,7 +454,7 @@ impl ProtocolEngine {
                 .ok_or_else(|| CodexProviderSourceError::protocol("method must be a string"))?
                 .to_owned();
             if has_id {
-                validate(&self.schema.server_request, &value, "server request")?;
+                self.schema.validate_server_request(&method, &value)?;
                 let id = RequestId::from_value(&value["id"])?;
                 Ok(ServerFrame::Request {
                     id,
@@ -628,6 +649,43 @@ mod tests {
                 .parse_observed_server_text(&invalid.to_string())
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn validates_legacy_clock_requests_and_new_section_notifications() -> TestResult {
+        let mut engine = engine()?;
+        let legacy = r#"{"id":7,"method":"currentTime/read","params":{"threadId":"thread-166"}}"#;
+        let ServerFrame::Request { id, method, .. } = engine.parse_server_text(legacy)? else {
+            return Err("expected legacy server request".into());
+        };
+        assert_eq!(method, "currentTime/read");
+        let reply: Value =
+            serde_json::from_str(&engine.unsupported_request_response(id, &method)?)?;
+        assert_eq!(reply["id"], 7);
+        assert_eq!(reply["error"]["code"], -32601);
+        assert!(matches!(
+            engine.parse_observed_server_text(legacy)?,
+            ObservedServerFrame::Request { .. }
+        ));
+        for invalid in [
+            r#"{"id":7,"method":"currentTime/read","params":{"threadId":1}}"#,
+            r#"{"id":true,"method":"currentTime/read","params":{"threadId":"thread-166"}}"#,
+            r#"{"id":7,"method":"unknown/read","params":{"threadId":"thread-166"}}"#,
+            r#"{"method":"thread/section/changed","params":{"threadId":"thread-171"}}"#,
+        ] {
+            assert!(engine.parse_server_text(invalid).is_err());
+            assert!(engine.parse_observed_server_text(invalid).is_err());
+        }
+        let section = r#"{"method":"thread/section/changed","params":{"threadId":"thread-171","sectionId":null}}"#;
+        assert!(matches!(
+            engine.parse_server_text(section)?,
+            ServerFrame::Notification { .. }
+        ));
+        assert!(matches!(
+            engine.parse_observed_server_text(section)?,
+            ObservedServerFrame::Notification { .. }
+        ));
         Ok(())
     }
 

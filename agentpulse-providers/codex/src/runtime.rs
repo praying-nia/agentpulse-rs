@@ -50,7 +50,7 @@ const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const STDERR_LIMIT: usize = 64 * 1024;
 const MAX_PROXY_CONNECTIONS: usize = 16;
 #[cfg(test)]
-const LATEST_VERIFIED_CODEX_CLI_CORE: (u64, u64, u64) = (0, 166, 0);
+const LATEST_VERIFIED_CODEX_CLI_CORE: (u64, u64, u64) = (0, 171, 0);
 const BEST_EFFORT_CODEX_CLI_FLOOR: (u64, u64, u64) = (0, 153, 0);
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1373,9 +1373,19 @@ fn process_control_error(
             session_id,
             thread_id,
         } => {
-            // Codex does not persist a fresh thread until its first turn.
-            // Retry when that turn is accepted or its loaded status changes.
-            if code == -32600 && message == format!("no rollout found for thread id {thread_id}") {
+            // Before the first turn, the rollout can be missing (0.166) or
+            // present but empty (0.171). Retry when that turn is accepted or
+            // its loaded status changes. Other storage errors remain visible.
+            let missing_rollout =
+                code == -32600 && message == format!("no rollout found for thread id {thread_id}");
+            let empty_rollout = code == -32603
+                && message.starts_with(
+                    "failed to read thread: thread-store internal error: failed to read session metadata ",
+                )
+                && message
+                    .rsplit_once(": rollout at ")
+                    .is_some_and(|(_, detail)| detail.ends_with(&format!("-{thread_id}.jsonl is empty")));
+            if missing_rollout || empty_rollout {
                 lock_mapper(mapper).defer_observer_resume(&thread_id);
                 return Ok(());
             }
@@ -3654,7 +3664,21 @@ mod tests {
 
     #[test]
     fn discovering_provider_follows_thread_started_without_saved_ids() -> TestResult {
-        for history_cursors_unavailable in [false, true] {
+        let empty_rollout_path = format!("/tmp/rollout-2026-11-22-{THREAD_ID}.jsonl");
+        for (code, message, history_cursors_unavailable) in [
+            (
+                -32600,
+                format!("no rollout found for thread id {THREAD_ID}"),
+                true,
+            ),
+            (
+                -32603,
+                format!(
+                    "failed to read thread: thread-store internal error: failed to read session metadata {empty_rollout_path}: rollout at {empty_rollout_path} is empty"
+                ),
+                false,
+            ),
+        ] {
             let control = Arc::new(FakeControl::default());
             let initialize = LIVE_FIXTURE
                 .lines()
@@ -3696,11 +3720,10 @@ mod tests {
             let request = resume_requests().remove(0);
             assert_eq!(request["params"]["threadId"], THREAD_ID);
             assert_eq!(request["params"]["excludeTurns"], true);
-            // Fresh threads have no durable record before their first turn.
-            control.push_text(json!({
-            "id": request["id"],
-            "error": {"code": -32600, "message": format!("no rollout found for thread id {THREAD_ID}")}
-        }).to_string());
+            control.push_text(
+                json!({"id": request["id"], "error": {"code": code, "message": message}})
+                    .to_string(),
+            );
             wait_until(|| snapshot(&status).validated_frames() >= 4)?;
             assert_eq!(resume_requests().len(), 1);
             assert_eq!(snapshot(&status).mapped_events(), 1);
@@ -4705,6 +4728,9 @@ mod tests {
             "0.166.0-beta.1",
             "0.166.1",
             "0.167.0-beta.1",
+            "0.170.0",
+            "0.171.0-beta.1",
+            "0.171.1",
             "1.0.0",
         ] {
             let actual = format!("codex-cli {version}");
@@ -4758,7 +4784,7 @@ mod tests {
     #[test]
     fn managed_runtime_allows_newer_version_past_version_gate() -> TestResult {
         let provider_id = ProviderId::new();
-        let (root, executable) = fake_codex_script("0.166.1")?;
+        let (root, executable) = fake_codex_script("0.171.1")?;
         let config = CodexProviderConfig::new(provider_id, &root, [THREAD_ID])?
             .with_codex_executable(&executable);
         let runtime_directory = config.runtime_directory.clone();
