@@ -1,6 +1,8 @@
 //! AgentPulse Host command-line application.
 
 mod direct;
+#[cfg(target_os = "macos")]
+mod macos;
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -199,9 +201,8 @@ enum RelayCommand {
 struct HostPaths {
     data_dir: PathBuf,
     credential_store: PathBuf,
-    runtime_dir: PathBuf,
     lock_file: PathBuf,
-    admin_socket: PathBuf,
+    socket_dir: PathBuf,
     status_file: PathBuf,
     relay_config: PathBuf,
 }
@@ -217,21 +218,24 @@ impl HostPaths {
                 .to_path_buf()
         };
         let runtime_dir = data_dir.join("runtime");
+        ensure_private_dir(&data_dir)?;
+        ensure_private_dir(&runtime_dir)?;
+        #[cfg(target_os = "macos")]
+        let socket_dir = macos::socket_directory(&data_dir)?;
+        #[cfg(not(target_os = "macos"))]
+        let socket_dir = runtime_dir.clone();
         Ok(Self {
             credential_store: data_dir.join("host-credentials.json"),
             lock_file: runtime_dir.join("host.lock"),
-            admin_socket: runtime_dir.join("admin.sock"),
+            socket_dir,
             status_file: runtime_dir.join("status.json"),
             relay_config: data_dir.join("relay.json"),
             data_dir,
-            runtime_dir,
         })
     }
 
-    fn ensure(&self) -> AppResult<()> {
-        ensure_private_dir(&self.data_dir)?;
-        ensure_private_dir(&self.runtime_dir)?;
-        Ok(())
+    fn admin_socket(&self) -> PathBuf {
+        self.socket_dir.join("admin.sock")
     }
 
     fn store(&self) -> HostCredentialStore {
@@ -398,7 +402,6 @@ fn main() {
 fn run() -> AppResult<()> {
     let cli = Cli::parse();
     let paths = HostPaths::resolve(cli.data_dir)?;
-    paths.ensure()?;
     match cli.command {
         HostCommand::Init(args) => initialize(&paths, &args.name),
         HostCommand::Threads(args) => threads(&paths, args.command),
@@ -503,7 +506,7 @@ fn serve(paths: &HostPaths, args: ServeArgs) -> AppResult<()> {
     let provider_id = ProviderId::from_str(&identity.provider_id)?;
     let channel_id = ChannelId::from_str(&identity.channel_id)?;
     let codex_executable = agentpulse_provider_codex::resolve_codex_executable(&args.codex)?;
-    let runtime_root = paths.runtime_dir.join("codex");
+    let runtime_root = paths.socket_dir.join("codex");
     let provider_config = if args.discover_threads {
         CodexProviderConfig::discovering(provider_id, runtime_root)?
     } else {
@@ -536,7 +539,7 @@ fn serve(paths: &HostPaths, args: ServeArgs) -> AppResult<()> {
         .snapshot()
         .local_address
         .ok_or("Native endpoint did not publish its listening address")?;
-    let mut admin = AdminListener::bind(&paths.admin_socket)?;
+    let mut admin = AdminListener::bind(&paths.admin_socket())?;
     let stop_requested = Arc::new(AtomicBool::new(false));
     let signal_stop = Arc::clone(&stop_requested);
     ctrlc::set_handler(move || signal_stop.store(true, Ordering::Release))?;
@@ -1288,7 +1291,7 @@ fn stop(paths: &HostPaths) -> AppResult<()> {
 }
 
 fn request_admin(paths: &HostPaths, request: AdminRequest) -> AppResult<AdminResponse> {
-    let mut stream = AdminStream::connect(&paths.admin_socket, Duration::from_secs(3))
+    let mut stream = AdminStream::connect(&paths.admin_socket(), Duration::from_secs(3))
         .map_err(|error| format!("cannot connect to AgentPulse Host: {error}"))?;
     stream.send(&serde_json::to_vec(&request)?, Duration::from_secs(3))?;
     let bytes = Zeroizing::new(stream.receive(Duration::from_secs(3))?);
@@ -1438,18 +1441,22 @@ mod tests {
         temporary.join(format!("aph{suffix}"))
     }
 
-    struct TestDirectory(PathBuf);
+    struct TestDirectory(PathBuf, PathBuf);
     impl TestDirectory {
         fn paths() -> AppResult<(Self, HostPaths)> {
             let root = short_test_root();
-            let paths = HostPaths::resolve(Some(root.clone()))?;
-            paths.ensure()?;
-            Ok((Self(root), paths))
+            #[cfg(target_os = "macos")]
+            let profile = root.join("含空格的工作区 ".repeat(6));
+            #[cfg(not(target_os = "macos"))]
+            let profile = root.clone();
+            let paths = HostPaths::resolve(Some(profile))?;
+            Ok((Self(root, paths.socket_dir.clone()), paths))
         }
     }
     impl Drop for TestDirectory {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+            let _ = fs::remove_dir(&self.1);
         }
     }
 
@@ -1467,7 +1474,7 @@ mod tests {
     #[test]
     fn admin_rejects_bad_json_then_serves_status_and_stop() -> AppResult<()> {
         let (_directory, paths) = TestDirectory::paths()?;
-        let mut listener = AdminListener::bind(&paths.admin_socket)?;
+        let mut listener = AdminListener::bind(&paths.admin_socket())?;
         let status: RuntimeStatus = serde_json::from_value(serde_json::json!({
             "host_id": "test", "host_name": "Windows Host", "server_name": "test.local",
             "native_address": "127.0.0.1:49320", "codex_executable": null,
@@ -1479,7 +1486,7 @@ mod tests {
         write_status(&paths.status_file, &status)?;
         let provider = CodexProvider::build(CodexProviderConfig::discovering(
             ProviderId::new(),
-            paths.runtime_dir.join("admin-test-codex"),
+            paths.socket_dir.join("test-codex"),
         )?)?
         .handle()
         .clone();
@@ -1505,7 +1512,7 @@ mod tests {
             }
             Ok(())
         });
-        let mut bad = AdminStream::connect(&paths.admin_socket, Duration::from_secs(2))?;
+        let mut bad = AdminStream::connect(&paths.admin_socket(), Duration::from_secs(2))?;
         bad.send(b"not json", Duration::from_secs(2))?;
         let response: AdminResponse =
             serde_json::from_slice(&bad.receive(Duration::from_secs(2))?)?;

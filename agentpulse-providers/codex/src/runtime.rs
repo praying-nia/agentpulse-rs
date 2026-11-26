@@ -3081,6 +3081,7 @@ mod tests {
         error::Error,
         fmt,
         net::TcpStream,
+        path::PathBuf,
         str::FromStr,
         sync::{Arc, Mutex, TryLockError},
         thread,
@@ -3094,7 +3095,6 @@ mod tests {
             fs::PermissionsExt,
             net::{UnixListener, UnixStream},
         },
-        path::PathBuf,
     };
 
     use agentpulse_bridge::{ChannelActionHandle, ChannelActionSource, ChannelPort, RuntimeHost};
@@ -4416,13 +4416,21 @@ mod tests {
         Ok(socket)
     }
 
+    fn socket_test_base() -> PathBuf {
+        // Darwin's TMPDIR can already use half the budget for a Unix socket.
+        #[cfg(unix)]
+        return PathBuf::from("/tmp");
+        #[cfg(windows)]
+        return std::env::temp_dir();
+    }
+
     #[test]
     fn client_proxy_routes_phone_approval_to_originating_connection() -> TestResult {
         let observer = Arc::new(FakeControl::default());
         seed_lines(&observer, LIVE_FIXTURE.lines().take(2));
         let proxy = Arc::new(ProxyTestControl::default());
         let provider_id = ProviderId::new();
-        let runtime_root = std::env::temp_dir().join(format!("agentpulse-proxy-{provider_id}"));
+        let runtime_root = socket_test_base().join(format!("ap-proxy-{provider_id}"));
         let config = CodexProviderConfig::new(provider_id, &runtime_root, [THREAD_ID])?;
         let desktop_config = config.clone();
         let schema = ProtocolSchema::compile()?;
@@ -4550,7 +4558,7 @@ mod tests {
         seed_lines(&observer, LIVE_FIXTURE.lines().take(2));
         let proxy = Arc::new(ProxyTestControl::default());
         let provider_id = ProviderId::new();
-        let runtime_root = std::env::temp_dir().join(format!("agentpulse-proxy-{provider_id}"));
+        let runtime_root = socket_test_base().join(format!("ap-proxy-{provider_id}"));
         let config = CodexProviderConfig::new(provider_id, &runtime_root, [THREAD_ID])?;
         let desktop_config = config.clone();
         let schema = ProtocolSchema::compile()?;
@@ -4932,7 +4940,7 @@ mod tests {
         let provider_id = ProviderId::new();
         let unique = provider_id.to_string();
         let suffix = unique.chars().rev().take(8).collect::<String>();
-        let root = std::env::temp_dir().join(format!("aplive{suffix}"));
+        let root = socket_test_base().join(format!("aplive{suffix}"));
         let config = CodexProviderConfig::new(provider_id, &root, [THREAD_ID])?
             .with_startup_timeout(Duration::from_secs(5));
         let mut runtime = ManagedCodexRuntime::default();

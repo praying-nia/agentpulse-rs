@@ -45,9 +45,11 @@ impl AdminListener {
     }
     /// Accepts one client or returns WouldBlock.
     pub fn accept(&mut self) -> io::Result<AdminStream> {
-        self.listener
-            .accept()
-            .map(|(stream, _)| AdminStream(stream))
+        let (stream, _) = self.listener.accept()?;
+        // Darwin inherits O_NONBLOCK from the listener. Reads and writes
+        // on the accepted stream use per-operation timeouts.
+        stream.set_nonblocking(false)?;
+        Ok(AdminStream(stream))
     }
 }
 impl Drop for AdminListener {
@@ -90,7 +92,18 @@ impl AdminStream {
         let mut bytes = Vec::new();
         let mut buffer = [0; 4096];
         loop {
-            self.0.set_read_timeout(Some(remaining(deadline)?))?;
+            let timeout = self.0.set_read_timeout(Some(remaining(deadline)?));
+            #[cfg(target_os = "macos")]
+            let timeout = timeout.or_else(|error| {
+                // Darwin rejects SO_RCVTIMEO once both write halves have
+                // closed. A nonblocking read still drains queued data and EOF.
+                if error.kind() == io::ErrorKind::InvalidInput {
+                    self.0.set_nonblocking(true)
+                } else {
+                    Err(error)
+                }
+            });
+            timeout?;
             match self.0.read(&mut buffer) {
                 Ok(0) => return Ok(bytes),
                 Ok(count) => {

@@ -32,6 +32,10 @@ DACL admits only that user. The first-instance flag prevents silently binding
 an occupied name. Clients check server object ownership and use identification
 level SQOS to prevent server impersonation of the client.
 
+On macOS, accepted admin streams switch to blocking I/O with bounded timeouts.
+After both peers half-close their writes, Darwin can reject a new read timeout.
+The receiver then drains the remaining bytes and EOF in nonblocking mode.
+
 Windows messages are a four-byte little-endian length followed by payload, then
 a one-byte receipt acknowledgement (1) in the reverse direction. This avoids
 discarding unread responses when the server disconnects, without an unbounded
@@ -75,7 +79,7 @@ cargo test -p agentpulse-platform -p agentpulse-pairing -p agentpulse-host --loc
 cargo clippy -p agentpulse-platform -p agentpulse-pairing -p agentpulse-host --all-targets --no-deps --locked -- -D warnings
 ```
 
-The platform workflow runs these contracts on Windows and Linux. Windows tests
+The platform workflow runs these contracts on Windows, Linux, and macOS. Windows tests
 inspect actual directory/file/pipe DACLs, malformed framing, timeouts, pipe reuse,
 sharing-violation recovery, credential rotation, and real Host CLI commands.
 ACL inspection is not a substitute for a separate-user interactive acceptance

@@ -25,7 +25,10 @@ fn live_response(
 #[test]
 #[ignore = "requires installed Codex and user home; optional inference with AGENTPULSE_CODEX_LIVE_TURN=1"]
 fn installed_codex_catalog_thread_and_optional_turn_match_schema() -> TestResult {
-    let root = std::env::temp_dir().join(format!("apcheck{}", ProviderId::new().to_string().chars().rev().take(8).collect::<String>()));
+    let root = socket_test_base().join(format!(
+        "apcheck{}",
+        ProviderId::new().to_string().chars().rev().take(8).collect::<String>()
+    ));
     let config = CodexProviderConfig::discovering(ProviderId::new(), &root)?
         .with_startup_timeout(Duration::from_secs(30));
     let mut runtime = ManagedCodexRuntime::default();
