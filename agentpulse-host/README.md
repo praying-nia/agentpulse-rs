@@ -36,6 +36,21 @@ version is historical Windows evidence. The current Provider baseline and
 bundled schema are 0.171.0, verified with a Linux Host and Android emulator.
 Windows phone pairing, public Relay, and real model turns remain device tests.
 
+## macOS
+
+Build with `cargo build -p agentpulse-host --locked` and run
+`target/debug/agentpulse`. For network setups with more than one private
+interface, use `serve --bind <PRIVATE_IPV4>` or set the bind address in
+`direct configure`. See the [Apple client guide](../../agentpulse-ios/README.md)
+for direct pairing and observation.
+
+The configuration directory keeps credentials, the instance lock and status.
+Darwin limits Unix socket path length, so macOS uses a separate mode-0700
+socket directory under `/tmp` for admin, Codex App Server, and desktop proxy
+sockets. It is namespaced by the owner and canonical configuration path.
+Use the same `--data-dir` for all commands when overriding the default.
+
+
 ## Setup
 
 ```bash

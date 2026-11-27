@@ -193,6 +193,14 @@ impl LoopbackWebSocketListener {
                 address: peer_address,
             });
         }
+        // Accepted sockets can inherit O_NONBLOCK on Darwin. The handshake
+        // must wait for the upgrade request up to the configured timeout.
+        stream
+            .set_nonblocking(false)
+            .map_err(|source| LoopbackWebSocketError::Io {
+                operation: "configure accepted loopback connection for handshake",
+                source,
+            })?;
         configure_stream(&stream, self.config.handshake_timeout)?;
         let path = self.config.path.clone();
         let subprotocol = self.config.subprotocol.clone();

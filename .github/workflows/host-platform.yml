@@ -8,6 +8,8 @@ on:
       - 'agentpulse-providers/codex/**'
       - 'agentpulse-host/**'
       - 'agentpulse-pairing/**'
+      - 'agentpulse-channels/native/**'
+      - 'agentpulse-transport/**'
       - '.github/workflows/host-platform.yml'
   pull_request:
     paths:
@@ -16,6 +18,8 @@ on:
       - 'agentpulse-providers/codex/**'
       - 'agentpulse-host/**'
       - 'agentpulse-pairing/**'
+      - 'agentpulse-channels/native/**'
+      - 'agentpulse-transport/**'
       - '.github/workflows/host-platform.yml'
   workflow_dispatch:
 
@@ -24,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     steps:
@@ -34,11 +38,11 @@ jobs:
       - name: Format
         run: cargo +stable fmt --all --check
       - name: Lint changed platform packages
-        run: cargo +stable clippy -p agentpulse-platform -p agentpulse-provider-codex -p agentpulse-pairing -p agentpulse-host --all-targets --no-deps --locked -- -D warnings
+        run: cargo +stable clippy -p agentpulse-platform -p agentpulse-provider-codex -p agentpulse-pairing -p agentpulse-host -p agentpulse-transport --all-targets --no-deps --locked -- -D warnings
       - name: Native storage, IPC and CLI contracts
         run: cargo +stable test -p agentpulse-platform -p agentpulse-provider-codex -p agentpulse-pairing -p agentpulse-host --locked -- --test-threads=1
-      - name: Pairing socket contracts
-        run: cargo +stable test -p agentpulse-pairing --locked -- --ignored --test-threads=1
+      - name: Pairing and Native socket contracts
+        run: cargo +stable test -p agentpulse-pairing -p agentpulse-channel-native --locked -- --ignored --test-threads=1
       - name: Documentation
         env:
           RUSTDOCFLAGS: -D warnings
