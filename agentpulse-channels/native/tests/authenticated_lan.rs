@@ -34,7 +34,6 @@ struct TestDirectory(PathBuf);
 impl TestDirectory {
     fn create() -> Result<Self, std::io::Error> {
         let path = std::env::temp_dir().join(format!("agentpulse-native-tls-{}", Uuid::now_v7()));
-        fs::create_dir(&path)?;
         Ok(Self(path))
     }
 }
